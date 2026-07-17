@@ -1,0 +1,4757 @@
+import base64
+import copy
+from contextlib import contextmanager
+from difflib import SequenceMatcher
+import hashlib
+from http.cookies import SimpleCookie
+import importlib.util
+from io import BytesIO
+import json
+import logging
+import math
+from multiprocessing import get_context
+import os
+from pathlib import Path
+from queue import Empty
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+from threading import BoundedSemaphore, Lock, local
+import time
+import urllib.parse
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Callable, Literal
+from urllib.parse import quote, urljoin
+
+import httpx
+import qrcode
+import qrcode.image.svg
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
+from yt_dlp import YoutubeDL
+
+from app.auth import (
+    AuthFailure,
+    SESSION_COOKIE_NAME,
+    auth_error,
+    clear_session_cookie,
+    create_session,
+    delete_session,
+    initialize_auth_db,
+    invite_configured,
+    register_user,
+    require_auth_user,
+    resolve_session,
+    authenticate_user,
+    session_ttl_seconds,
+    set_session_cookie,
+)
+
+from app.douyin import (
+    DOUYIN_ADAPTER_VERSION,
+    DouyinAdapterError,
+    DouyinVideo,
+    adapter_status as douyin_adapter_status,
+    download_douyin_media,
+    fetch_douyin_subtitle,
+    get_douyin_video,
+    is_douyin_url,
+    normalize_douyin_input,
+)
+from app.jobs import (
+    JobIdempotencyConflict,
+    JobManager,
+    JobNotFound,
+    JobQueueFull,
+    job_request_fingerprint,
+)
+from app.network import validate_public_request
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class ResultKeyLockEntry:
+    lock: Lock
+    references: int = 0
+
+
+APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2026-07-17-precision-2")
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+MAX_INPUT_LENGTH = 512
+LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+ASR_TMP_DIR = Path(os.getenv("ASR_TMP_DIR", "/opt/bili-subtitle-tool/var/tmp"))
+ASR_MODEL_DIR = Path(os.getenv("ASR_MODEL_DIR", "/opt/bili-subtitle-tool/var/models"))
+ASR_CACHE_DIR = Path(os.getenv("ASR_CACHE_DIR", "/opt/bili-subtitle-tool/var/cache"))
+RESULT_CACHE_DIR = Path(os.getenv("RESULT_CACHE_DIR", str(ASR_CACHE_DIR / "results")))
+BILI_COOKIE_PATH = Path(
+    os.getenv("BILI_COOKIE_PATH", "/opt/bili-subtitle-tool/var/auth/bili-cookie.txt")
+)
+DEFAULT_ASR_MODEL = os.getenv("ASR_MODEL", "tiny").strip() or "tiny"
+ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8").strip() or "int8"
+ASR_DEVICE = os.getenv("ASR_DEVICE", "cpu").strip() or "cpu"
+ASR_CPU_THREADS = max(1, int(os.getenv("ASR_CPU_THREADS", "2")))
+ASR_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_TIMEOUT_SECONDS", "300")))
+ACCURATE_ASR_MODEL = os.getenv("ASR_ACCURATE_MODEL", "small").strip() or "small"
+ACCURATE_ASR_COMPUTE_TYPE = os.getenv("ASR_ACCURATE_COMPUTE_TYPE", "int8").strip() or "int8"
+ACCURATE_ASR_DEVICE = os.getenv("ASR_ACCURATE_DEVICE", ASR_DEVICE).strip() or ASR_DEVICE
+ACCURATE_ASR_CPU_THREADS = max(1, int(os.getenv("ASR_ACCURATE_CPU_THREADS", "3")))
+ACCURATE_ASR_TIMEOUT_SECONDS = max(ASR_TIMEOUT_SECONDS, int(os.getenv("ASR_ACCURATE_TIMEOUT_SECONDS", "1800")))
+ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "1"))))
+ACCURATE_ASR_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_ACCURATE_BEAM_SIZE", "5"))))
+ASR_DOWNLOAD_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_DOWNLOAD_TIMEOUT_SECONDS", "300")))
+ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "900")))
+ASR_MAX_AUDIO_SECONDS = max(30, int(os.getenv("ASR_MAX_AUDIO_SECONDS", "3600")))
+BILI_MAX_DOWNLOAD_BYTES = max(10_000_000, int(os.getenv("BILI_MAX_DOWNLOAD_BYTES", "1000000000")))
+UPLOAD_MAX_BYTES = max(1_000_000, int(os.getenv("UPLOAD_MAX_BYTES", "536870912")))
+UPLOAD_STAGING_MAX_BYTES = max(
+    UPLOAD_MAX_BYTES,
+    int(os.getenv("UPLOAD_STAGING_MAX_BYTES", "2147483648")),
+)
+MEDIA_ARTIFACT_DIR = Path(
+    os.getenv("MEDIA_ARTIFACT_DIR", str(ASR_TMP_DIR / "media-artifacts"))
+)
+MEDIA_MAX_BYTES = max(10_000_000, int(os.getenv("MEDIA_MAX_BYTES", "1000000000")))
+MEDIA_STAGING_MAX_BYTES = max(
+    MEDIA_MAX_BYTES,
+    int(os.getenv("MEDIA_STAGING_MAX_BYTES", "8000000000")),
+)
+ASR_CONCURRENCY_LIMIT = max(1, int(os.getenv("ASR_CONCURRENCY_LIMIT", "1")))
+ASR_TMP_MAX_AGE_SECONDS = max(300, int(os.getenv("ASR_TMP_MAX_AGE_SECONDS", "86400")))
+RESULT_CACHE_TTL_SECONDS = max(0, int(os.getenv("RESULT_CACHE_TTL_SECONDS", "604800")))
+RESULT_CACHE_MAX_ITEMS = max(1, int(os.getenv("RESULT_CACHE_MAX_ITEMS", "100")))
+JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "8")))
+JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("JOB_RESULT_TTL_SECONDS", "3600")))
+MEDIA_ARTIFACT_TTL_SECONDS = max(
+    60,
+    int(os.getenv("MEDIA_ARTIFACT_TTL_SECONDS", str(JOB_RESULT_TTL_SECONDS))),
+)
+JOB_MAX_RECORDS = max(10, int(os.getenv("JOB_MAX_RECORDS", "100")))
+JOB_WORKER_COUNT = max(1, int(os.getenv("JOB_WORKER_COUNT", "2")))
+LEGACY_WAIT_TIMEOUT_SECONDS = max(30, int(os.getenv("LEGACY_WAIT_TIMEOUT_SECONDS", "1200")))
+OCR_TIMEOUT_SECONDS = max(60, int(os.getenv("OCR_TIMEOUT_SECONDS", "1800")))
+OCR_SAMPLE_FPS = min(5.0, max(0.5, float(os.getenv("OCR_SAMPLE_FPS", "2.5"))))
+OCR_CROP_TOP_RATIO = min(0.75, max(0.2, float(os.getenv("OCR_CROP_TOP_RATIO", "0.45"))))
+OCR_MIN_CONFIDENCE = min(0.95, max(0.1, float(os.getenv("OCR_MIN_CONFIDENCE", "0.55"))))
+OCR_CPU_THREADS = max(1, int(os.getenv("OCR_CPU_THREADS", "2")))
+OCR_MAX_FRAMES = max(100, int(os.getenv("OCR_MAX_FRAMES", "12000")))
+RESULT_CACHE_VERSION = 6
+ASR_SEMAPHORE = BoundedSemaphore(ASR_CONCURRENCY_LIMIT)
+LEGACY_REQUEST_SEMAPHORE = BoundedSemaphore(max(1, min(2, JOB_WORKER_COUNT)))
+RESULT_CACHE_LOCK = Lock()
+RESULT_KEY_LOCKS: dict[str, ResultKeyLockEntry] = {}
+ASR_WORKER_LOCK = Lock()
+ASR_WORKER_PROCESS: Any = None
+ASR_WORKER_REQUEST_QUEUE: Any = None
+ASR_WORKER_RESULT_QUEUE: Any = None
+ASR_WORKER_WARM = False
+PROGRESS_CONTEXT = local()
+UPLOAD_RESERVATION_LOCK = Lock()
+UPLOAD_RESERVATIONS: dict[str, int] = {}
+MEDIA_RESERVATION_LOCK = Lock()
+MEDIA_RESERVATIONS: dict[str, int] = {}
+os.environ.setdefault("HF_HOME", str(ASR_CACHE_DIR / "hf"))
+os.environ.setdefault("XDG_CACHE_HOME", str(ASR_CACHE_DIR))
+if os.getenv("HF_ENDPOINT"):
+    os.environ.setdefault("HF_ENDPOINT", os.getenv("HF_ENDPOINT", ""))
+if os.getenv("HF_HUB_DISABLE_XET"):
+    os.environ.setdefault("HF_HUB_DISABLE_XET", os.getenv("HF_HUB_DISABLE_XET", ""))
+
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+LOGIN_QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+LOGIN_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+LOGIN_COOKIE_NAMES = (
+    "SESSDATA",
+    "bili_jct",
+    "DedeUserID",
+    "DedeUserID__ckMd5",
+    "sid",
+    "buvid3",
+    "buvid4",
+)
+QR_LOGIN_SESSIONS: dict[str, float] = {}
+QR_LOGIN_LOCK = Lock()
+BILI_URL_RE = re.compile(
+    r"(https?://(?:www\.)?(?:bilibili\.com|b23\.tv)[^\s<>'\"]+|"
+    r"(?:www\.)?(?:bilibili\.com|b23\.tv)/[^\s<>'\"]+)",
+    re.IGNORECASE,
+)
+TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？、)]}）】》"
+SENSITIVE_PATTERNS = (
+    re.compile(r"(?i)\b(authorization|cookie)\s*:\s*[^\r\n]+"),
+    re.compile(
+        r"(?i)\b("
+        r"authorization|cookie|token|access_token|password|passwd|secret|invite_code|qrcode_key|"
+        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie"
+        r")([=:])([^;\s&]+)"
+    ),
+    re.compile(
+        r"(?i)([?&]("
+        r"authorization|cookie|token|access_token|password|passwd|secret|invite_code|qrcode_key|"
+        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie"
+        r")=)[^&\s]+"
+    ),
+)
+UPLOAD_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+MEDIA_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+UPLOAD_ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".3gp",
+        ".avi",
+        ".flv",
+        ".m2ts",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".mts",
+        ".ts",
+        ".webm",
+        ".wmv",
+    }
+)
+
+
+class ExtractRequest(BaseModel):
+    input: str = Field(..., min_length=2, max_length=MAX_INPUT_LENGTH)
+    source: Literal["auto", "official", "asr"] = "auto"
+    use_cookie: bool = False
+    format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = "txt"
+    lang: str | None = Field(
+        default=None,
+        max_length=35,
+        pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
+    )
+    allow_platform_ai: bool = True
+    quality: Literal["fast", "accurate"] = "fast"
+    embedded_subtitles: bool = False
+    force_refresh: bool = False
+
+
+class UploadJobRequest(BaseModel):
+    kind: Literal["upload"] = "upload"
+    upload_token: str = Field(..., pattern=r"^[0-9a-f]{32}$")
+    stored_name: str = Field(..., pattern=r"^source\.[A-Za-z0-9]{2,5}$", max_length=16)
+    filename: str = Field(..., min_length=1, max_length=180)
+    sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(..., gt=0)
+    format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = "txt"
+    lang: str | None = Field(
+        default=None,
+        max_length=35,
+        pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
+    )
+    quality: Literal["fast", "accurate"] = "fast"
+    embedded_subtitles: bool = False
+    force_refresh: bool = False
+
+
+class MediaRequest(BaseModel):
+    input: str = Field(..., min_length=2, max_length=MAX_INPUT_LENGTH)
+    media_type: Literal["video", "audio"]
+    use_cookie: bool = False
+    force_refresh: bool = False
+
+
+class MediaJobRequest(MediaRequest):
+    kind: Literal["media"] = "media"
+    artifact_token: str = Field(..., pattern=r"^[0-9a-f]{32}$")
+    owner_id: int = Field(..., gt=0)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=8, max_length=128)
+    invite_code: str = Field(..., min_length=4, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+@dataclass
+class SubtitleTrack:
+    source_type: str
+    language: str
+    ext: str
+    url: str
+    name: str | None = None
+    provider: str = "bilibili"
+    context: Any = None
+
+
+@dataclass
+class SubtitleEntry:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
+class ExtractionSource:
+    title: str | None
+    video_id: str | None
+    webpage_url: str
+    tracks: list[SubtitleTrack]
+    note: str | None = None
+    duration: float | None = None
+    platform: str = "bilibili"
+    author: str | None = None
+
+
+class ExtractionFailure(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        reason: str = "failed",
+        can_try_asr: bool = False,
+        terminal: bool = False,
+    ) -> None:
+        detail = redact_sensitive(detail)
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+        self.reason = reason
+        self.can_try_asr = can_try_asr
+        self.terminal = terminal
+
+
+class QuietYtdlpLogger:
+    def debug(self, msg: str) -> None:
+        return None
+
+    def warning(self, msg: str) -> None:
+        return None
+
+    def error(self, msg: str) -> None:
+        return None
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def effective_quality(quality: str, embedded_subtitles: bool = False) -> Literal["fast", "accurate"]:
+    return "accurate" if embedded_subtitles or quality == "accurate" else "fast"
+
+
+def asr_profile(quality: str) -> dict[str, Any]:
+    if quality == "accurate":
+        return {
+            "quality": "accurate",
+            "model": ACCURATE_ASR_MODEL,
+            "compute_type": ACCURATE_ASR_COMPUTE_TYPE,
+            "device": ACCURATE_ASR_DEVICE,
+            "cpu_threads": ACCURATE_ASR_CPU_THREADS,
+            "beam_size": ACCURATE_ASR_BEAM_SIZE,
+            "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
+            "timeout_seconds": ACCURATE_ASR_TIMEOUT_SECONDS,
+        }
+    return {
+        "quality": "fast",
+        "model": DEFAULT_ASR_MODEL,
+        "compute_type": ASR_COMPUTE_TYPE,
+        "device": ASR_DEVICE,
+        "cpu_threads": ASR_CPU_THREADS,
+        "beam_size": ASR_FAST_BEAM_SIZE,
+        "vad_filter": env_bool("ASR_VAD_FILTER", False),
+        "timeout_seconds": ASR_TIMEOUT_SECONDS,
+    }
+
+
+def safe_upload_filename(value: str) -> tuple[str, str]:
+    filename = re.split(r"[\\/]", value or "")[-1]
+    filename = re.sub(r"[\x00-\x1f\x7f]+", "", filename).strip().strip(".")
+    if not filename:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "invalid_upload_filename", "message": "上传文件名无效。"},
+        )
+    extension = Path(filename).suffix.lower()
+    if extension not in UPLOAD_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "reason": "unsupported_upload_format",
+                "message": "暂不支持这种视频格式。",
+            },
+        )
+    if len(filename) > 180:
+        stem = Path(filename).stem[: 180 - len(extension)].rstrip(".")
+        filename = f"{stem or 'video'}{extension}"
+    return filename, extension
+
+
+def upload_directory(upload_token: str) -> Path:
+    if not UPLOAD_TOKEN_RE.fullmatch(upload_token):
+        raise ExtractionFailure(400, "Invalid upload token.", "invalid_upload_token", terminal=True)
+    return ASR_TMP_DIR / f"asr-upload-{upload_token}"
+
+
+def reserve_upload(upload_token: str, requested_bytes: int | None) -> int:
+    reservation = requested_bytes if requested_bytes and requested_bytes > 0 else UPLOAD_MAX_BYTES
+    if reservation > UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "reason": "upload_too_large",
+                "message": f"视频文件不能超过 {UPLOAD_MAX_BYTES // (1024 * 1024)} MB。",
+            },
+        )
+    with UPLOAD_RESERVATION_LOCK:
+        if sum(UPLOAD_RESERVATIONS.values()) + reservation > UPLOAD_STAGING_MAX_BYTES:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": "upload_storage_busy",
+                    "message": "服务器正在处理其他上传视频，请稍后再试。",
+                },
+            )
+        UPLOAD_RESERVATIONS[upload_token] = reservation
+    return reservation
+
+
+def resize_upload_reservation(upload_token: str, required_bytes: int) -> None:
+    if required_bytes > UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "reason": "upload_too_large",
+                "message": f"视频文件不能超过 {UPLOAD_MAX_BYTES // (1024 * 1024)} MB。",
+            },
+        )
+    with UPLOAD_RESERVATION_LOCK:
+        current = UPLOAD_RESERVATIONS.get(upload_token)
+        if current is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "upload_expired", "message": "上传会话已失效，请重新选择视频。"},
+            )
+        if required_bytes <= current:
+            return
+        if sum(UPLOAD_RESERVATIONS.values()) - current + required_bytes > UPLOAD_STAGING_MAX_BYTES:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": "upload_storage_busy",
+                    "message": "服务器上传暂存空间已满，请稍后再试。",
+                },
+            )
+        UPLOAD_RESERVATIONS[upload_token] = required_bytes
+
+
+def release_upload_reservation(upload_token: str) -> None:
+    with UPLOAD_RESERVATION_LOCK:
+        UPLOAD_RESERVATIONS.pop(upload_token, None)
+
+
+def upload_staging_bytes() -> int:
+    with UPLOAD_RESERVATION_LOCK:
+        return sum(UPLOAD_RESERVATIONS.values())
+
+
+def discard_upload_payload(payload: dict[str, Any]) -> None:
+    if payload.get("kind") != "upload":
+        return
+    upload_token = str(payload.get("upload_token") or "")
+    if not UPLOAD_TOKEN_RE.fullmatch(upload_token):
+        return
+    directory = ASR_TMP_DIR / f"asr-upload-{upload_token}"
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        LOGGER.exception(
+            "failed to remove staged upload",
+            extra={"upload_token": upload_token},
+        )
+        return
+    release_upload_reservation(upload_token)
+
+
+def media_artifact_directory(artifact_token: str) -> Path:
+    if not MEDIA_TOKEN_RE.fullmatch(artifact_token):
+        raise ExtractionFailure(400, "Invalid media artifact token.", "invalid_artifact_token", terminal=True)
+    return MEDIA_ARTIFACT_DIR / f"media-artifact-{artifact_token}"
+
+
+def reserve_media_artifact(artifact_token: str) -> int:
+    reservation = MEDIA_MAX_BYTES
+    with MEDIA_RESERVATION_LOCK:
+        if artifact_token in MEDIA_RESERVATIONS:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "artifact_conflict", "message": "媒体任务令牌冲突，请重新提交。"},
+            )
+        if sum(MEDIA_RESERVATIONS.values()) + reservation > MEDIA_STAGING_MAX_BYTES:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": "media_storage_busy",
+                    "message": "服务器媒体暂存空间正忙，请稍后再试。",
+                },
+            )
+        MEDIA_RESERVATIONS[artifact_token] = reservation
+    return reservation
+
+
+def resize_media_reservation(artifact_token: str, required_bytes: int) -> None:
+    if required_bytes <= 0 or required_bytes > MEDIA_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "reason": "media_too_large",
+                "message": f"媒体文件不能超过 {MEDIA_MAX_BYTES // (1024 * 1024)} MB。",
+            },
+        )
+    with MEDIA_RESERVATION_LOCK:
+        current = MEDIA_RESERVATIONS.get(artifact_token)
+        if current is None:
+            raise HTTPException(
+                status_code=410,
+                detail={"reason": "artifact_expired", "message": "媒体任务已失效，请重新提交。"},
+            )
+        if sum(MEDIA_RESERVATIONS.values()) - current + required_bytes > MEDIA_STAGING_MAX_BYTES:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": "media_storage_busy",
+                    "message": "服务器媒体暂存空间正忙，请稍后再试。",
+                },
+            )
+        MEDIA_RESERVATIONS[artifact_token] = required_bytes
+
+
+def release_media_reservation(artifact_token: str) -> None:
+    with MEDIA_RESERVATION_LOCK:
+        MEDIA_RESERVATIONS.pop(artifact_token, None)
+
+
+def media_staging_bytes() -> int:
+    with MEDIA_RESERVATION_LOCK:
+        return sum(MEDIA_RESERVATIONS.values())
+
+
+def discard_media_payload(payload: dict[str, Any]) -> None:
+    if payload.get("kind") != "media":
+        return
+    artifact_token = str(payload.get("artifact_token") or "")
+    if not MEDIA_TOKEN_RE.fullmatch(artifact_token):
+        return
+    directory = MEDIA_ARTIFACT_DIR / f"media-artifact-{artifact_token}"
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        LOGGER.exception(
+            "failed to remove media artifact",
+            extra={"artifact_token": artifact_token},
+        )
+        return
+    release_media_reservation(artifact_token)
+
+
+def discard_job_payload(payload: dict[str, Any]) -> None:
+    discard_upload_payload(payload)
+    discard_media_payload(payload)
+
+
+def write_media_artifact_metadata(directory: Path, payload: dict[str, Any]) -> None:
+    path = directory / "artifact.json"
+    temporary = directory / f".artifact.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def cleanup_stale_media_artifacts(now: float | None = None, remove_all: bool = False) -> int:
+    if not MEDIA_ARTIFACT_DIR.exists():
+        return 0
+    current = time.time() if now is None else now
+    with MEDIA_RESERVATION_LOCK:
+        active_tokens = set(MEDIA_RESERVATIONS)
+    removed = 0
+    for directory in MEDIA_ARTIFACT_DIR.glob("media-artifact-*"):
+        if not directory.is_dir():
+            continue
+        artifact_token = directory.name.removeprefix("media-artifact-")
+        if not MEDIA_TOKEN_RE.fullmatch(artifact_token):
+            continue
+        if not remove_all and artifact_token in active_tokens:
+            continue
+        expired = remove_all
+        try:
+            metadata = json.loads((directory / "artifact.json").read_text(encoding="utf-8"))
+            expired = expired or float(metadata.get("expires_at") or 0) <= current
+        except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            try:
+                expired = expired or current - directory.stat().st_mtime > MEDIA_ARTIFACT_TTL_SECONDS
+            except OSError:
+                continue
+        if not expired:
+            continue
+        try:
+            shutil.rmtree(directory)
+        except OSError:
+            continue
+        release_media_reservation(artifact_token)
+        removed += 1
+    return removed
+
+
+@contextmanager
+def extraction_progress(callback: Callable[[str, int, str], None] | None):
+    previous = getattr(PROGRESS_CONTEXT, "callback", None)
+    PROGRESS_CONTEXT.callback = callback
+    try:
+        yield
+    finally:
+        PROGRESS_CONTEXT.callback = previous
+
+
+def report_progress(stage: str, progress: int, message: str) -> None:
+    callback = getattr(PROGRESS_CONTEXT, "callback", None)
+    if callback:
+        callback(stage, progress, message)
+
+
+def redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: redact_sensitive(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_sensitive(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    redacted = value
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern.groups >= 3:
+            redacted = pattern.sub(lambda match: match.group(1) + match.group(2) + "<redacted>", redacted)
+        elif pattern.groups == 2:
+            redacted = pattern.sub(lambda match: match.group(1) + "<redacted>", redacted)
+        else:
+            redacted = pattern.sub("<redacted>", redacted)
+    return redacted
+
+
+def public_reason(reason: str) -> str:
+    return {
+        "not_found": "video_not_found",
+        "timeout": "asr_timeout",
+        "audio_extract_failed": "download_failed",
+        "subtitle_download_failed": "download_failed",
+        "short_link_request_failed": "download_failed",
+        "douyin_api_failed": "platform_temporarily_unavailable",
+        "douyin_cookie_refresh_failed": "platform_temporarily_unavailable",
+        "douyin_media_missing": "download_failed",
+    }.get(reason, reason)
+
+
+def result_cache_enabled() -> bool:
+    return RESULT_CACHE_TTL_SECONDS > 0
+
+
+def result_cache_key(req: ExtractRequest, canonical_input: str) -> str:
+    effective_cookie = cookie_header(cookie_allowed(req.use_cookie))
+    cookie_fingerprint = hashlib.sha256(effective_cookie.encode("utf-8")).hexdigest()[:16] if effective_cookie else "none"
+    quality = effective_quality(req.quality, req.embedded_subtitles)
+    profile = asr_profile(quality)
+    payload = {
+        "version": RESULT_CACHE_VERSION,
+        "input": canonical_input,
+        "platform": detect_platform(canonical_input),
+        "douyin_adapter_version": DOUYIN_ADAPTER_VERSION,
+        "source": req.source,
+        "lang": (req.lang or "").strip().lower(),
+        "allow_platform_ai": req.allow_platform_ai,
+        "quality": quality,
+        "embedded_subtitles": req.embedded_subtitles,
+        "cookie": cookie_fingerprint,
+        "asr_model": profile["model"],
+        "asr_compute_type": profile["compute_type"],
+        "asr_device": profile["device"],
+        "asr_beam_size": profile["beam_size"],
+        "asr_vad_filter": profile["vad_filter"],
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower(),
+        "ocr_sample_fps": OCR_SAMPLE_FPS if req.embedded_subtitles else None,
+        "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO if req.embedded_subtitles else None,
+        "ocr_min_confidence": OCR_MIN_CONFIDENCE if req.embedded_subtitles else None,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def upload_result_cache_key(req: UploadJobRequest) -> str:
+    quality = effective_quality(req.quality, req.embedded_subtitles)
+    profile = asr_profile(quality)
+    payload = {
+        "version": RESULT_CACHE_VERSION,
+        "kind": "upload",
+        "sha256": req.sha256,
+        "lang": (req.lang or "").strip().lower(),
+        "quality": quality,
+        "embedded_subtitles": req.embedded_subtitles,
+        "asr_model": profile["model"],
+        "asr_compute_type": profile["compute_type"],
+        "asr_device": profile["device"],
+        "asr_beam_size": profile["beam_size"],
+        "asr_vad_filter": profile["vad_filter"],
+        "ocr_sample_fps": OCR_SAMPLE_FPS if req.embedded_subtitles else None,
+        "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO if req.embedded_subtitles else None,
+        "ocr_min_confidence": OCR_MIN_CONFIDENCE if req.embedded_subtitles else None,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def result_cache_path(key: str) -> Path:
+    return RESULT_CACHE_DIR / f"{key}.json"
+
+
+@contextmanager
+def result_key_guard(key: str, blocking: bool = True):
+    with RESULT_CACHE_LOCK:
+        entry = RESULT_KEY_LOCKS.get(key)
+        if entry is None:
+            entry = ResultKeyLockEntry(lock=Lock())
+            RESULT_KEY_LOCKS[key] = entry
+        entry.references += 1
+    acquired = entry.lock.acquire(blocking=blocking)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            entry.lock.release()
+        with RESULT_CACHE_LOCK:
+            entry.references -= 1
+            if entry.references == 0:
+                RESULT_KEY_LOCKS.pop(key, None)
+
+
+def deserialize_entries(items: Any) -> list[SubtitleEntry]:
+    if not isinstance(items, list):
+        return []
+    entries: list[SubtitleEntry] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            text = str(item.get("text") or "").strip()
+            if text:
+                entries.append(SubtitleEntry(float(item.get("start") or 0), float(item.get("end") or 0), text))
+        except (TypeError, ValueError):
+            continue
+    return entries
+
+
+def load_cached_result(key: str, now: float | None = None) -> tuple[list[SubtitleEntry], dict[str, Any], float] | None:
+    if not result_cache_enabled():
+        return None
+    path = result_cache_path(key)
+    current = time.time() if now is None else now
+    try:
+        stat = path.stat()
+        age = max(0.0, current - stat.st_mtime)
+        if age > RESULT_CACHE_TTL_SECONDS:
+            path.unlink(missing_ok=True)
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION:
+        path.unlink(missing_ok=True)
+        return None
+    entries = deserialize_entries(payload.get("entries"))
+    metadata = payload.get("metadata")
+    if not entries or not isinstance(metadata, dict):
+        path.unlink(missing_ok=True)
+        return None
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+    return entries, copy.deepcopy(metadata), age
+
+
+def save_cached_result(key: str, entries: list[SubtitleEntry], metadata: dict[str, Any]) -> None:
+    if not result_cache_enabled():
+        return
+    RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = result_cache_path(key)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "version": RESULT_CACHE_VERSION,
+        "created_at": int(time.time()),
+        "entries": [{"start": entry.start, "end": entry.end, "text": entry.text} for entry in entries],
+        "metadata": metadata,
+    }
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    cleanup_result_cache()
+
+
+def cleanup_result_cache(now: float | None = None) -> int:
+    if not RESULT_CACHE_DIR.exists():
+        return 0
+    current = time.time() if now is None else now
+    kept: list[tuple[float, Path]] = []
+    removed = 0
+    for path in RESULT_CACHE_DIR.glob("*.json"):
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if not result_cache_enabled() or current - modified > RESULT_CACHE_TTL_SECONDS:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+            continue
+        kept.append((modified, path))
+    kept.sort(reverse=True)
+    for _, path in kept[RESULT_CACHE_MAX_ITEMS:]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def failure_record(source: str, exc: ExtractionFailure) -> dict[str, Any]:
+    return {"source": source, "reason": public_reason(exc.reason), "detail": redact_sensitive(exc.detail)}
+
+
+def bili_page_number(value: str) -> int:
+    candidate = extract_bili_url(value) or value.strip()
+    raw_page = (urllib.parse.parse_qs(urllib.parse.urlparse(candidate).query).get("p") or ["1"])[0]
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError) as exc:
+        raise ExtractionFailure(400, "Bilibili page number must be an integer.", "invalid_page", terminal=True) from exc
+    if page < 1 or page > 10_000:
+        raise ExtractionFailure(400, "Bilibili page number is out of range.", "invalid_page", terminal=True)
+    return page
+
+
+def canonical_bili_url(bvid: str, value: str) -> str:
+    page = bili_page_number(value)
+    base = f"https://www.bilibili.com/video/{bvid}"
+    return f"{base}?p={page}" if page > 1 else base
+
+
+def normalize_input(value: str) -> str:
+    value = value.strip()
+    if len(value) > MAX_INPUT_LENGTH:
+        raise ExtractionFailure(400, "Input is too long.", "input_too_long", terminal=True)
+    bvid = extract_bvid(value)
+    if bvid:
+        return canonical_bili_url(bvid, value)
+    if is_douyin_url(value):
+        try:
+            return normalize_douyin_input(value)
+        except DouyinAdapterError as exc:
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason, terminal=exc.status_code < 500) from exc
+    url = extract_bili_url(value)
+    if not url:
+        raise ExtractionFailure(400, "请输入有效的 B站或抖音视频链接，也可以输入 BV 号。", "invalid_input", terminal=True)
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if host.endswith("b23.tv"):
+        return resolve_b23_url(url)
+    if host.endswith("bilibili.com"):
+        return url
+    raise ExtractionFailure(400, "请输入有效的 B站或抖音视频链接，也可以输入 BV 号。", "invalid_input", terminal=True)
+
+
+def detect_platform(value: str) -> str:
+    return "douyin" if is_douyin_url(value) else "bilibili"
+
+
+def extract_bvid(value: str) -> str | None:
+    match = re.search(r"(BV[0-9A-Za-z]{8,})", value)
+    return match.group(1) if match else None
+
+
+def extract_bili_url(value: str) -> str | None:
+    match = BILI_URL_RE.search(value)
+    if not match:
+        return None
+    url = match.group(1).rstrip(TRAILING_URL_PUNCTUATION)
+    if not re.match(r"https?://", url, flags=re.IGNORECASE):
+        url = f"https://{url}"
+    return url
+
+
+@lru_cache(maxsize=128)
+def resolve_b23_url(url: str) -> str:
+    try:
+        with httpx.Client(
+            timeout=10,
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"},
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            resp = client.get(url)
+    except httpx.RequestError as exc:
+        raise ExtractionFailure(502, f"Bilibili short link request failed: {exc}", "short_link_request_failed") from exc
+
+    final_url = str(resp.url)
+    bvid = extract_bvid(final_url)
+    if bvid:
+        return canonical_bili_url(bvid, final_url)
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise ExtractionFailure(502, f"Bilibili short link request failed: {exc}", "short_link_request_failed") from exc
+    raise ExtractionFailure(
+        400,
+        "Bilibili short link could not be resolved to a video BV id.",
+        "short_link_unresolved",
+        terminal=True,
+    )
+
+
+def configured_cookie_header() -> str | None:
+    try:
+        persisted = BILI_COOKIE_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        persisted = ""
+    if persisted:
+        return persisted
+    raw = os.getenv("BILI_COOKIE", "").strip()
+    if raw:
+        return raw
+    parts: list[str] = []
+    for env_name, cookie_name in (
+        ("BILI_SESSDATA", "SESSDATA"),
+        ("BILI_JCT", "bili_jct"),
+        ("BILI_BUVID3", "buvid3"),
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            parts.append(f"{cookie_name}={value}")
+    return "; ".join(parts) if parts else None
+
+
+def cookie_enabled() -> bool:
+    return env_bool("COOKIE_ENABLED", False) or (web_qr_login_enabled() and BILI_COOKIE_PATH.is_file())
+
+
+def cookie_header(allow_cookie: bool) -> str | None:
+    if not allow_cookie or not cookie_enabled():
+        return None
+    return configured_cookie_header()
+
+
+def cookie_allowed(requested: bool) -> bool:
+    return bool(requested and cookie_enabled() and configured_cookie_header())
+
+
+def web_qr_login_enabled() -> bool:
+    return env_bool("WEB_QR_LOGIN_ENABLED", False)
+
+
+def save_bili_cookie(cookie: str) -> None:
+    value = cookie.strip()
+    if not value or len(value) > 16_384 or "\n" in value or "\r" in value:
+        raise HTTPException(status_code=502, detail="Bilibili returned an invalid cookie.")
+    parent = BILI_COOKIE_PATH.parent
+    temporary = parent / f".{BILI_COOKIE_PATH.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    try:
+        with QR_LOGIN_LOCK:
+            parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(parent, 0o700)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, BILI_COOKIE_PATH)
+            os.chmod(BILI_COOKIE_PATH, 0o600)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Bilibili cookie persistence failed: {exc}") from exc
+    os.environ.update({"BILI_COOKIE": value, "BILI_SESSDATA": "", "BILI_JCT": "", "BILI_BUVID3": ""})
+
+
+def cookie_header_from_set_cookie(headers: list[str]) -> str:
+    jar = SimpleCookie()
+    for header in headers:
+        try:
+            jar.load(header)
+        except Exception:
+            continue
+    parts: list[str] = []
+    for name in LOGIN_COOKIE_NAMES:
+        morsel = jar.get(name)
+        if morsel and morsel.value:
+            parts.append(f"{name}={morsel.value}")
+    names = {part.split("=", 1)[0] for part in parts}
+    if "SESSDATA" not in names or "bili_jct" not in names:
+        raise HTTPException(status_code=502, detail="Login succeeded but Bilibili did not return the required cookies.")
+    return "; ".join(parts)
+
+
+def qr_svg_data_url(value: str) -> str:
+    image = qrcode.make(value, image_factory=qrcode.image.svg.SvgPathImage)
+    buffer = BytesIO()
+    image.save(buffer)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+def clean_qr_sessions(now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    expired = [key for key, expires_at in QR_LOGIN_SESSIONS.items() if expires_at <= current]
+    for key in expired:
+        QR_LOGIN_SESSIONS.pop(key, None)
+
+
+def headers_for(referer: str | None = None, allow_cookie: bool = False) -> dict[str, str]:
+    headers = {"User-Agent": USER_AGENT}
+    if referer:
+        headers["Referer"] = referer
+    cookie = cookie_header(allow_cookie)
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def remaining_before(deadline: float, label: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ExtractionFailure(504, f"{label} timed out.", "download_failed", can_try_asr=False)
+    return max(1.0, remaining)
+
+
+def api_get_json(url: str, referer: str, allow_cookie: bool = False) -> dict[str, Any]:
+    try:
+        with httpx.Client(
+            timeout=20,
+            follow_redirects=True,
+            headers=headers_for(referer, allow_cookie),
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        raise ExtractionFailure(502, f"Bilibili API request failed: {exc}", "api_request_failed") from exc
+    if not isinstance(data, dict):
+        raise ExtractionFailure(502, "Bilibili API returned an unexpected response.", "api_bad_response")
+    if data.get("code") != 0:
+        code = data.get("code")
+        message = data.get("message")
+        if code in {-400, -404, 62002, 62004}:
+            raise ExtractionFailure(404, f"Bilibili API error: {message}", "not_found", terminal=True)
+        raise ExtractionFailure(502, f"Bilibili API error: {message}", "api_error")
+    return data
+
+
+def extract_info(url: str, allow_cookie: bool = False, skip_download: bool = True) -> dict[str, Any]:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": skip_download,
+        "socket_timeout": 20,
+        "http_headers": headers_for(allow_cookie=allow_cookie),
+        "logger": QuietYtdlpLogger(),
+        "noplaylist": True,
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        raise ExtractionFailure(502, f"yt-dlp extraction failed: {exc}", "ytdlp_failed") from exc
+    if not isinstance(info, dict):
+        raise ExtractionFailure(502, "yt-dlp returned an unexpected response.", "ytdlp_bad_response")
+    return info
+
+
+def wbi_mixin_key(allow_cookie: bool = False) -> str | None:
+    try:
+        with httpx.Client(
+            timeout=20,
+            follow_redirects=True,
+            headers=headers_for(allow_cookie=allow_cookie),
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            resp = client.get("https://api.bilibili.com/x/web-interface/nav")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return None
+    wbi_img = ((data.get("data") or {}).get("wbi_img") or {}) if isinstance(data, dict) else {}
+    img_key = str(wbi_img.get("img_url") or "").rsplit("/", 1)[-1].split(".")[0]
+    sub_key = str(wbi_img.get("sub_url") or "").rsplit("/", 1)[-1].split(".")[0]
+    raw = img_key + sub_key
+    if len(raw) < 64:
+        return None
+    return "".join(raw[i] for i in MIXIN_KEY_ENC_TAB)[:32]
+
+
+def wbi_signed_url(base_url: str, params: dict[str, Any], allow_cookie: bool = False) -> str:
+    mixin_key = wbi_mixin_key(allow_cookie)
+    if not mixin_key:
+        return base_url + "?" + urllib.parse.urlencode(params)
+    signed = {
+        key: "".join(ch for ch in str(value) if ch not in "!'()*")
+        for key, value in params.items()
+        if value is not None and value != ""
+    }
+    signed["wts"] = str(int(time.time()))
+    query = urllib.parse.urlencode(sorted(signed.items()))
+    signed["w_rid"] = hashlib.md5(
+        (query + mixin_key).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
+    return base_url + "?" + urllib.parse.urlencode(sorted(signed.items()))
+
+
+def bili_view_context(
+    url: str,
+    allow_cookie: bool = False,
+) -> tuple[str, str, dict[str, Any], dict[str, Any] | None, Any]:
+    bvid = extract_bvid(url)
+    if not bvid:
+        raise ExtractionFailure(400, "Could not find a BV id in the input.", "invalid_bvid", terminal=True)
+    canonical_url = canonical_bili_url(bvid, url)
+    view_url = f"https://api.bilibili.com/x/web-interface/view?bvid={quote(bvid)}"
+    view = api_get_json(view_url, canonical_url, allow_cookie)
+    data = view.get("data") or {}
+    if not isinstance(data, dict):
+        raise ExtractionFailure(502, "Bilibili view API returned no data.", "api_bad_response")
+    pages = [item for item in (data.get("pages") or []) if isinstance(item, dict)]
+    page_number = bili_page_number(canonical_url)
+    if pages and page_number > len(pages):
+        raise ExtractionFailure(
+            400,
+            f"Bilibili video has {len(pages)} pages; requested P{page_number}.",
+            "invalid_page",
+            terminal=True,
+        )
+    if not pages and page_number > 1:
+        raise ExtractionFailure(400, "This Bilibili video has no requested page.", "invalid_page", terminal=True)
+    selected_page = pages[page_number - 1] if pages else None
+    cid = selected_page.get("cid") if selected_page else data.get("cid")
+    if not cid:
+        raise ExtractionFailure(502, "Bilibili API returned no cid for this video.", "api_no_cid")
+    return bvid, canonical_url, data, selected_page, cid
+
+
+def view_source(url: str, allow_cookie: bool = False) -> ExtractionSource:
+    bvid, canonical_url, data, selected_page, _ = bili_view_context(url, allow_cookie)
+    page_number = bili_page_number(canonical_url)
+    title = data.get("title")
+    if page_number > 1 and selected_page and selected_page.get("part"):
+        title = f"{title} - P{page_number} {selected_page['part']}"
+    return ExtractionSource(
+        title=title,
+        video_id=bvid,
+        webpage_url=canonical_url,
+        tracks=[],
+        duration=float((selected_page or {}).get("duration") or data.get("duration") or 0) or None,
+        platform="bilibili",
+        author=(data.get("owner") or {}).get("name") if isinstance(data.get("owner"), dict) else None,
+    )
+
+
+def bili_api_source(url: str, allow_cookie: bool = False) -> ExtractionSource:
+    bvid, canonical_url, data, selected_page, cid = bili_view_context(url, allow_cookie)
+    page_number = bili_page_number(canonical_url)
+    title = data.get("title")
+    if page_number > 1 and selected_page and selected_page.get("part"):
+        title = f"{title} - P{page_number} {selected_page['part']}"
+    aid = data.get("aid")
+    view_subtitles = ((data.get("subtitle") or {}).get("list") or []) if isinstance(data.get("subtitle"), dict) else []
+
+    player_url = wbi_signed_url(
+        "https://api.bilibili.com/x/player/wbi/v2",
+        {"aid": aid, "bvid": bvid, "cid": cid},
+        allow_cookie,
+    )
+    player = api_get_json(player_url, canonical_url, allow_cookie)
+    player_data = player.get("data") or {}
+    subtitles = ((player_data.get("subtitle") or {}).get("subtitles") or []) if isinstance(player_data, dict) else []
+    tracks: list[SubtitleTrack] = []
+    for item in subtitles:
+        if not isinstance(item, dict) or not item.get("subtitle_url"):
+            continue
+        raw_url = str(item["subtitle_url"])
+        track_url = urljoin("https:", raw_url) if raw_url.startswith("//") else raw_url
+        source_type = "platform_ai" if item.get("ai_type") else "official"
+        tracks.append(
+            SubtitleTrack(
+                source_type=source_type,
+                language=str(item.get("lan") or "unknown"),
+                ext="json",
+                url=track_url,
+                name=item.get("lan_doc") or item.get("id_str"),
+            )
+        )
+
+    note = None
+    if not tracks and view_subtitles:
+        languages = ", ".join(
+            str(item.get("lan_doc") or item.get("lan") or "unknown")
+            for item in view_subtitles
+            if isinstance(item, dict)
+        )
+        note = (
+            "Bilibili lists subtitle metadata but did not expose subtitle URLs in this mode. "
+            f"Available languages from metadata: {languages or 'unknown'}."
+        )
+    elif not tracks:
+        note = "No official subtitle track was exposed by Bilibili API."
+    return ExtractionSource(
+        title=title,
+        video_id=bvid,
+        webpage_url=canonical_url,
+        tracks=tracks,
+        note=note,
+        duration=float((selected_page or {}).get("duration") or data.get("duration") or 0) or None,
+        platform="bilibili",
+        author=(data.get("owner") or {}).get("name") if isinstance(data.get("owner"), dict) else None,
+    )
+
+
+def subtitle_tracks(info: dict[str, Any]) -> list[SubtitleTrack]:
+    tracks: list[SubtitleTrack] = []
+    for source_type, field_name in (("official", "subtitles"), ("platform_ai", "automatic_captions")):
+        group = info.get(field_name) or {}
+        if not isinstance(group, dict):
+            continue
+        for language, items in group.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not item.get("url"):
+                    continue
+                tracks.append(
+                    SubtitleTrack(
+                        source_type=source_type,
+                        language=str(language),
+                        ext=str(item.get("ext") or "json").lower(),
+                        url=str(item["url"]),
+                        name=item.get("name") or item.get("format_id"),
+                    )
+                )
+    return tracks
+
+
+def normalized_language(value: str | None) -> str:
+    tag = (value or "").strip().lower().replace("_", "-")
+    if tag in {"zh", "zh-cn", "zh-sg", "zh-hans"}:
+        return "zh-hans"
+    if tag in {"zh-tw", "zh-hk", "zh-mo", "zh-hant"}:
+        return "zh-hant"
+    return tag.split("-", 1)[0]
+
+
+def choose_track(tracks: list[SubtitleTrack], lang: str | None, allow_platform_ai: bool) -> SubtitleTrack:
+    official = [t for t in tracks if t.source_type == "official"]
+    candidates = list(official)
+    if allow_platform_ai:
+        candidates += [t for t in tracks if t.source_type == "platform_ai"]
+    if not candidates:
+        if tracks:
+            raise ExtractionFailure(
+                404,
+                "No official subtitle track found. Platform AI subtitle tracks exist, but allow_platform_ai is false.",
+                "no_official_subtitle",
+                can_try_asr=True,
+            )
+        raise ExtractionFailure(
+            404,
+            "No official subtitle track found, and no platform AI subtitle track was exposed.",
+            "no_official_subtitle",
+            can_try_asr=True,
+        )
+
+    def score(track: SubtitleTrack) -> tuple[int, int, int]:
+        track_language = normalized_language(track.language)
+        if lang:
+            lang_score = 0 if track_language == normalized_language(lang) else 5
+        elif track_language in {"zh-hans", "zh-hant"}:
+            lang_score = 0 if track_language == "zh-hans" else 1
+        else:
+            lang_score = 3
+        ext_score = {"json": 0, "srt": 1, "vtt": 2, "ass": 3}.get(track.ext, 9)
+        source_score = 0 if track.source_type == "official" else 1
+        return (lang_score, source_score, ext_score)
+
+    return sorted(candidates, key=score)[0]
+
+
+def fetch_subtitle(track: SubtitleTrack, referer: str, allow_cookie: bool = False) -> str:
+    if track.provider == "douyin":
+        try:
+            douyin_track, video = track.context
+            return fetch_douyin_subtitle(douyin_track, video)
+        except DouyinAdapterError as exc:
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+        except (TypeError, ValueError) as exc:
+            raise ExtractionFailure(502, "抖音字幕上下文无效。", "subtitle_download_failed") from exc
+    try:
+        with httpx.Client(
+            timeout=20,
+            follow_redirects=True,
+            headers=headers_for(referer, False),
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            resp = client.get(track.url)
+            resp.raise_for_status()
+            return resp.text
+    except Exception as exc:
+        raise ExtractionFailure(502, f"Subtitle download failed: {exc}", "subtitle_download_failed") from exc
+
+
+def parse_json_subtitle(text: str) -> list[SubtitleEntry]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ExtractionFailure(502, "Subtitle JSON could not be parsed.", "subtitle_parse_failed") from exc
+    body: Any = None
+    millisecond_times = False
+    if isinstance(data, dict):
+        body = data.get("body")
+        if not isinstance(body, list):
+            body = data.get("utterances")
+            millisecond_times = isinstance(body, list)
+        if not isinstance(body, list) and isinstance(data.get("data"), dict):
+            body = data["data"].get("utterances") or data["data"].get("body")
+            millisecond_times = isinstance(data["data"].get("utterances"), list)
+    elif isinstance(data, list):
+        body = data
+    if not isinstance(body, list):
+        raise ExtractionFailure(502, "字幕 JSON 中没有可识别的字幕列表。", "subtitle_parse_failed")
+    entries: list[SubtitleEntry] = []
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        start = item.get("from", item.get("start", item.get("start_time", 0)))
+        end = item.get("to", item.get("end", item.get("end_time", start)))
+        content = item.get("content", item.get("text", ""))
+        try:
+            start_value = float(start)
+            end_value = float(end)
+            if millisecond_times or "start_time" in item or "end_time" in item:
+                start_value /= 1000
+                end_value /= 1000
+            entries.append(SubtitleEntry(start_value, end_value, str(content).strip()))
+        except (TypeError, ValueError):
+            continue
+    return [e for e in entries if e.text]
+
+
+def subtitle_time_to_seconds(value: str) -> float:
+    normalized = value.strip().replace(",", ".")
+    parts = normalized.split(":")
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = "0", parts[0], parts[1]
+    else:
+        raise ValueError("invalid subtitle timecode")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+SUBTITLE_TIMING_RE = re.compile(
+    r"(?P<start>\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3})\s*-->\s*"
+    r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3})(?:\s+.*)?$"
+)
+
+
+def parse_timed_subtitle(text: str) -> list[SubtitleEntry]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    entries: list[SubtitleEntry] = []
+    for block in re.split(r"\n\s*\n", normalized):
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines or lines[0].upper().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+            continue
+        timing_index = next((index for index, line in enumerate(lines[:3]) if "-->" in line), -1)
+        if timing_index < 0:
+            continue
+        match = SUBTITLE_TIMING_RE.search(lines[timing_index])
+        if not match:
+            continue
+        caption = "\n".join(lines[timing_index + 1 :]).strip()
+        if not caption:
+            continue
+        try:
+            entries.append(
+                SubtitleEntry(
+                    subtitle_time_to_seconds(match.group("start")),
+                    subtitle_time_to_seconds(match.group("end")),
+                    caption,
+                )
+            )
+        except ValueError:
+            continue
+    if not entries:
+        raise ExtractionFailure(502, "字幕文件中没有可识别的时间轴。", "subtitle_parse_failed")
+    return entries
+
+
+def parse_subtitle_text(text: str, ext: str) -> list[SubtitleEntry]:
+    normalized_ext = (ext or "").lower()
+    if normalized_ext == "json":
+        return parse_json_subtitle(text)
+    if normalized_ext in {"srt", "vtt", "webvtt"}:
+        return parse_timed_subtitle(text)
+    raise ExtractionFailure(502, f"暂不支持转换 {normalized_ext or 'unknown'} 字幕格式。", "unsupported_subtitle_format")
+
+
+def seconds_to_srt(value: float) -> str:
+    ms_total = max(0, int(round(value * 1000)))
+    hours, rem = divmod(ms_total, 3600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, ms = divmod(rem, 1000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{ms:03}"
+
+
+def seconds_to_vtt(value: float) -> str:
+    return seconds_to_srt(value).replace(",", ".")
+
+
+def render_entries(entries: list[SubtitleEntry], output_format: str, meta: dict[str, Any]) -> str:
+    fmt = "markdown" if output_format == "md" else output_format
+    if fmt == "json":
+        payload = {
+            "metadata": meta,
+            "entries": [{"start": e.start, "end": e.end, "text": e.text} for e in entries],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    if fmt == "txt":
+        return "\n".join(e.text for e in entries) + "\n"
+    if fmt == "markdown":
+        lines = [f"# {meta.get('title') or 'Video Subtitle'}", ""]
+        note = meta.get("note") or meta.get("warning")
+        if note:
+            lines.extend([f"> {note}", ""])
+        for e in entries:
+            lines.append(f"- `{seconds_to_vtt(e.start)}` {e.text}")
+        return "\n".join(lines) + "\n"
+    if fmt == "srt":
+        blocks = []
+        for i, e in enumerate(entries, 1):
+            blocks.append(f"{i}\n{seconds_to_srt(e.start)} --> {seconds_to_srt(e.end)}\n{e.text}")
+        return "\n\n".join(blocks) + "\n"
+    if fmt == "vtt":
+        blocks = ["WEBVTT", ""]
+        for e in entries:
+            blocks.append(f"{seconds_to_vtt(e.start)} --> {seconds_to_vtt(e.end)}\n{e.text}\n")
+        return "\n".join(blocks)
+    raise ExtractionFailure(400, "Unsupported output format.", "unsupported_format", terminal=True)
+
+
+def official_subtitle(req: ExtractRequest, allow_cookie: bool, source_label: str) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    url = normalize_input(req.input)
+    platform = detect_platform(url)
+    attempts: list[str] = []
+    source: ExtractionSource | None = None
+    if platform == "douyin":
+        report_progress("platform", 18, "正在建立抖音匿名会话")
+        try:
+            video = get_douyin_video(url, force_refresh=req.force_refresh)
+        except DouyinAdapterError as exc:
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason, can_try_asr=False) from exc
+        tracks = [
+            SubtitleTrack(
+                source_type="platform_ai",
+                language=track.language,
+                ext=track.ext,
+                url=track.url,
+                name=track.name,
+                provider="douyin",
+                context=(track, video),
+            )
+            for track in video.tracks
+        ]
+        source = ExtractionSource(
+            title=video.title,
+            video_id=video.video_id,
+            webpage_url=video.webpage_url,
+            tracks=tracks,
+            note="抖音没有提供可用的平台字幕。" if not tracks else None,
+            duration=video.duration,
+            platform="douyin",
+            author=video.author,
+        )
+        attempts.append("douyin_signed_api")
+    else:
+        try:
+            report_progress("platform", 18, "正在查询 B站字幕")
+            info = extract_info(url, allow_cookie=allow_cookie)
+            tracks = subtitle_tracks(info)
+            source = ExtractionSource(
+                title=info.get("title"),
+                video_id=info.get("id") or extract_bvid(url),
+                webpage_url=info.get("webpage_url") or url,
+                tracks=tracks,
+                duration=float(info.get("duration") or 0) or None,
+                platform="bilibili",
+                author=info.get("uploader"),
+            )
+            attempts.append("yt-dlp")
+        except ExtractionFailure as exc:
+            attempts.append(f"yt-dlp_failed:{exc.reason}")
+
+        if source is None or not source.tracks:
+            try:
+                source = bili_api_source(url, allow_cookie=allow_cookie)
+                attempts.append("bilibili_api")
+            except ExtractionFailure as exc:
+                if exc.terminal:
+                    raise exc
+                if source is None:
+                    raise exc
+                attempts.append(f"bilibili_api_failed:{exc.reason}")
+
+    tracks = source.tracks if source else []
+    if not tracks and source and source.note:
+        raise ExtractionFailure(404, source.note, "no_official_subtitle", can_try_asr=True)
+    track = choose_track(tracks, req.lang, req.allow_platform_ai)
+    report_progress("subtitle", 48, "正在下载并整理字幕轨道")
+    raw = fetch_subtitle(track, source.webpage_url if source else url, allow_cookie=allow_cookie)
+    entries = parse_subtitle_text(raw, track.ext)
+    if not entries:
+        raise ExtractionFailure(404, "Subtitle track was found but contained no entries.", "empty_subtitle", can_try_asr=True)
+    warning = None
+    if track.source_type != "official":
+        warning = f"本次使用了{'抖音' if platform == 'douyin' else 'B站'}平台自动字幕。"
+    meta = {
+        "title": source.title,
+        "id": source.video_id,
+        "webpage_url": source.webpage_url,
+        "source": source_label,
+        "track_source_type": track.source_type,
+        "cookie_used": allow_cookie and bool(cookie_header(True)),
+        "language": track.language,
+        "subtitle_format": track.ext,
+        "warning": warning,
+        "note": warning,
+        "attempts": attempts,
+        "duration": source.duration,
+        "platform": source.platform,
+        "author": source.author,
+        "session_mode": "anonymous_browser" if platform == "douyin" else ("bilibili_cookie" if allow_cookie else "anonymous"),
+        "available_tracks": [
+            {"source_type": t.source_type, "language": t.language, "ext": t.ext, "name": t.name}
+            for t in tracks
+        ],
+    }
+    return entries, meta
+
+
+def ensure_asr_ready() -> None:
+    if not env_bool("ASR_ENABLED", True):
+        raise ExtractionFailure(503, "Local ASR is disabled by ASR_ENABLED=false.", "asr_disabled")
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise ExtractionFailure(503, "Local ASR requires ffmpeg and ffprobe.", "ffmpeg_missing")
+    ASR_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    ASR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    ASR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_stale_asr_tmp(now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    if not ASR_TMP_DIR.exists():
+        return 0
+    removed = 0
+    for path in ASR_TMP_DIR.iterdir():
+        if not path.is_dir() or not path.name.startswith("asr-"):
+            continue
+        is_upload = path.name.startswith("asr-upload-")
+        try:
+            age = current - path.stat().st_mtime
+        except OSError:
+            continue
+        if not is_upload and age < ASR_TMP_MAX_AGE_SECONDS:
+            continue
+        try:
+            shutil.rmtree(path)
+            removed += 1
+            if is_upload:
+                release_upload_reservation(path.name.removeprefix("asr-upload-"))
+        except OSError:
+            continue
+    return removed
+
+
+def uploaded_media_path(req: UploadJobRequest) -> Path:
+    directory = upload_directory(req.upload_token)
+    expected_name = f"source{Path(req.stored_name).suffix.lower()}"
+    if req.stored_name != expected_name or Path(req.stored_name).suffix.lower() not in UPLOAD_ALLOWED_EXTENSIONS:
+        raise ExtractionFailure(400, "Invalid staged upload name.", "invalid_upload_path", terminal=True)
+    path = directory / expected_name
+    try:
+        stat = path.lstat()
+    except OSError as exc:
+        raise ExtractionFailure(410, "Uploaded video is no longer available.", "upload_expired", terminal=True) from exc
+    if path.is_symlink() or not path.is_file() or stat.st_size != req.size:
+        raise ExtractionFailure(400, "Uploaded video failed staging validation.", "invalid_upload_path", terminal=True)
+    return path
+
+
+def probe_uploaded_media(path: Path, require_audio: bool = True) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise ExtractionFailure(503, "Local ASR requires ffprobe.", "ffmpeg_missing")
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-protocol_whitelist",
+                LOCAL_MEDIA_PROTOCOL_WHITELIST,
+                "-probesize",
+                "50000000",
+                "-analyzeduration",
+                "30000000",
+                "-show_entries",
+                "format=duration,format_name:stream=index,codec_type,codec_name,duration:stream_tags=language,title",
+                "-of",
+                "json",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=min(60, ASR_DOWNLOAD_TIMEOUT_SECONDS),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExtractionFailure(408, "Uploaded video inspection timed out.", "upload_probe_timeout") from exc
+    if proc.returncode != 0:
+        raise ExtractionFailure(400, "The uploaded file is not a readable video.", "invalid_upload_media")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ExtractionFailure(400, "The uploaded file has invalid media metadata.", "invalid_upload_media") from exc
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    streams = streams if isinstance(streams, list) else []
+    stream_types = {str(item.get("codec_type") or "") for item in streams if isinstance(item, dict)}
+    if "video" not in stream_types:
+        raise ExtractionFailure(400, "The uploaded file does not contain a video stream.", "upload_video_missing")
+    if require_audio and "audio" not in stream_types:
+        raise ExtractionFailure(422, "The uploaded video does not contain an audio track.", "upload_audio_missing")
+    format_info = payload.get("format") if isinstance(payload, dict) else None
+    duration_values = []
+    if isinstance(format_info, dict):
+        duration_values.append(format_info.get("duration"))
+    duration_values.extend(item.get("duration") for item in streams if isinstance(item, dict))
+    duration = 0.0
+    for value in duration_values:
+        try:
+            candidate = float(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate) and candidate > duration:
+            duration = candidate
+    if duration <= 0:
+        raise ExtractionFailure(400, "The uploaded video duration could not be determined.", "invalid_upload_media")
+    return {
+        "duration": duration,
+        "format_name": str((format_info or {}).get("format_name") or "")
+        if isinstance(format_info, dict)
+        else "",
+        "has_audio": "audio" in stream_types,
+        "subtitle_streams": [
+            {
+                "index": int(item.get("index")),
+                "codec_name": str(item.get("codec_name") or "").lower(),
+                "language": str((item.get("tags") or {}).get("language") or ""),
+                "title": str((item.get("tags") or {}).get("title") or ""),
+            }
+            for item in streams
+            if isinstance(item, dict)
+            and item.get("codec_type") == "subtitle"
+            and isinstance(item.get("index"), int)
+        ],
+    }
+
+
+def normalize_audio_for_asr(
+    input_path: Path,
+    tmp_dir: Path,
+    stem: str,
+    timeout_seconds: float | None = None,
+) -> Path:
+    normalized_path = tmp_dir / f"{stem}.asr.wav"
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ExtractionFailure(503, "Local ASR requires ffmpeg.", "ffmpeg_missing")
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-protocol_whitelist",
+                LOCAL_MEDIA_PROTOCOL_WHITELIST,
+                "-i",
+                str(input_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-sample_fmt",
+                "s16",
+                str(normalized_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(1.0, timeout_seconds or ASR_DOWNLOAD_TIMEOUT_SECONDS),
+        )
+    except subprocess.TimeoutExpired as exc:
+        normalized_path.unlink(missing_ok=True)
+        raise ExtractionFailure(504, "ffmpeg audio normalization timed out.", "download_failed") from exc
+    if proc.returncode != 0 or not normalized_path.exists():
+        raise ExtractionFailure(502, f"ffmpeg audio normalization failed: {proc.stderr[:300]}", "audio_extract_failed")
+    return normalized_path
+
+
+TEXT_SUBTITLE_CODECS = frozenset({"ass", "mov_text", "ssa", "srt", "subrip", "text", "ttml", "webvtt"})
+
+
+def extract_embedded_text_subtitle(
+    media_path: Path,
+    media_info: dict[str, Any],
+    tmp_dir: Path,
+    lang: str | None,
+) -> tuple[list[SubtitleEntry], dict[str, Any]] | None:
+    streams = [
+        item
+        for item in media_info.get("subtitle_streams", [])
+        if isinstance(item, dict) and item.get("codec_name") in TEXT_SUBTITLE_CODECS
+    ]
+    if not streams:
+        return None
+    requested_language = normalized_language(lang)
+    streams.sort(
+        key=lambda item: (
+            0 if requested_language and normalized_language(item.get("language")) == requested_language else 1,
+            int(item.get("index") or 0),
+        )
+    )
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ExtractionFailure(503, "Embedded subtitle extraction requires ffmpeg.", "ffmpeg_missing")
+    for stream in streams:
+        target = tmp_dir / f"embedded-{int(stream['index'])}.srt"
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-protocol_whitelist",
+                    LOCAL_MEDIA_PROTOCOL_WHITELIST,
+                    "-i",
+                    str(media_path),
+                    "-map",
+                    f"0:{int(stream['index'])}",
+                    "-c:s",
+                    "srt",
+                    "-f",
+                    "srt",
+                    str(target),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=min(120, OCR_TIMEOUT_SECONDS),
+            )
+        except subprocess.TimeoutExpired:
+            target.unlink(missing_ok=True)
+            continue
+        if completed.returncode != 0 or not target.is_file():
+            target.unlink(missing_ok=True)
+            continue
+        try:
+            entries = parse_subtitle_text(target.read_text(encoding="utf-8", errors="replace"), "srt")
+        finally:
+            target.unlink(missing_ok=True)
+        if entries:
+            return entries, {
+                "subtitle_source": "embedded_text_track",
+                "subtitle_stream_index": int(stream["index"]),
+                "subtitle_stream_codec": stream.get("codec_name"),
+                "subtitle_stream_language": stream.get("language") or None,
+            }
+    return None
+
+
+def normalized_ocr_key(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.lower(), flags=re.UNICODE)
+
+
+def ocr_text_similarity(first: str, second: str) -> float:
+    if not first or not second:
+        return 0.0
+    if first == second:
+        return 1.0
+    return SequenceMatcher(None, first, second).ratio()
+
+
+def ocr_lines_from_result(result: Any) -> list[dict[str, Any]]:
+    raw_texts = getattr(result, "txts", None)
+    raw_scores = getattr(result, "scores", None)
+    raw_boxes = getattr(result, "boxes", None)
+    texts = list(raw_texts) if raw_texts is not None else []
+    scores = list(raw_scores) if raw_scores is not None else []
+    boxes = list(raw_boxes) if raw_boxes is not None else []
+    lines: list[dict[str, Any]] = []
+    for index, raw_text in enumerate(texts):
+        text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+        if not text or not normalized_ocr_key(text):
+            continue
+        try:
+            score = float(scores[index])
+        except (IndexError, TypeError, ValueError):
+            score = 0.0
+        if score < OCR_MIN_CONFIDENCE:
+            continue
+        x = 0.0
+        y = float(index)
+        height = 0.0
+        try:
+            raw_box = boxes[index]
+            points = raw_box.tolist() if hasattr(raw_box, "tolist") else raw_box
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            x = min(xs)
+            y = min(ys)
+            height = max(ys) - min(ys)
+        except (IndexError, TypeError, ValueError):
+            pass
+        if boxes and height and height < 12:
+            continue
+        lines.append({"text": text, "score": score, "x": x, "y": y})
+    lines.sort(key=lambda item: (round(float(item["y"]) / 18), float(item["x"])))
+    return lines
+
+
+def filter_static_ocr_lines(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(frames) < 12:
+        return frames
+    occurrences: dict[str, list[float]] = {}
+    for frame in frames:
+        seen: set[str] = set()
+        for line in frame.get("lines", []):
+            key = normalized_ocr_key(str(line.get("text") or ""))
+            if key and key not in seen:
+                occurrences.setdefault(key, []).append(float(frame["time"]))
+                seen.add(key)
+    duration = max(float(frame["time"]) for frame in frames) - min(float(frame["time"]) for frame in frames)
+    threshold = max(12, int(len(frames) * 0.55))
+    static_keys = {
+        key
+        for key, times in occurrences.items()
+        if len(times) >= threshold and (duration <= 0 or max(times) - min(times) >= duration * 0.6)
+    }
+    if not static_keys:
+        return frames
+    filtered = [
+        {
+            **frame,
+            "lines": [
+                line
+                for line in frame.get("lines", [])
+                if normalized_ocr_key(str(line.get("text") or "")) not in static_keys
+            ],
+        }
+        for frame in frames
+    ]
+    if any(frame.get("lines") for frame in filtered):
+        return filtered
+    return frames
+
+
+def select_ocr_variant(variants: list[tuple[str, float]]) -> str:
+    weighted: dict[str, float] = {}
+    originals: dict[str, list[tuple[str, float]]] = {}
+    for text, score in variants:
+        key = normalized_ocr_key(text)
+        if not key:
+            continue
+        weighted[key] = weighted.get(key, 0.0) + max(0.1, score)
+        originals.setdefault(key, []).append((text, score))
+    if not weighted:
+        return ""
+    winner = max(weighted, key=lambda key: (weighted[key], len(key)))
+    return max(originals[winner], key=lambda item: (item[1], len(item[0])))[0]
+
+
+def build_ocr_entries(frames: list[dict[str, Any]], sample_fps: float) -> list[SubtitleEntry]:
+    interval = 1.0 / max(0.1, sample_fps)
+    cleaned = filter_static_ocr_lines(frames)
+    groups: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    def close_current() -> None:
+        nonlocal current
+        if current is not None:
+            groups.append(current)
+            current = None
+
+    for frame in cleaned:
+        lines = frame.get("lines", [])
+        text = "\n".join(str(line.get("text") or "").strip() for line in lines if line.get("text")).strip()
+        score_values = [float(line.get("score") or 0) for line in lines]
+        score = sum(score_values) / len(score_values) if score_values else 0.0
+        key = normalized_ocr_key(text)
+        timestamp = float(frame["time"])
+        if not key:
+            if current is not None and timestamp - float(current["last_time"]) > interval * 1.6:
+                close_current()
+            continue
+        if current is not None and ocr_text_similarity(str(current["last_key"]), key) >= 0.92:
+            current["last_time"] = timestamp
+            current["last_key"] = key
+            current["variants"].append((text, score))
+            continue
+        close_current()
+        current = {
+            "start_time": timestamp,
+            "last_time": timestamp,
+            "last_key": key,
+            "variants": [(text, score)],
+        }
+    close_current()
+
+    entries: list[SubtitleEntry] = []
+    for group in groups:
+        text = select_ocr_variant(group["variants"])
+        if not text:
+            continue
+        start = max(0.0, float(group["start_time"]) - interval / 2)
+        end = max(start + 0.35, float(group["last_time"]) + interval / 2)
+        if entries and ocr_text_similarity(normalized_ocr_key(entries[-1].text), normalized_ocr_key(text)) >= 0.94:
+            if start - entries[-1].end <= interval * 2:
+                entries[-1].end = end
+                continue
+        if entries and start < entries[-1].end:
+            start = entries[-1].end
+        entries.append(SubtitleEntry(start, max(start + 0.35, end), text))
+    return entries
+
+
+def iter_mjpeg_images(stream: Any):
+    buffer = bytearray()
+    while True:
+        chunk = stream.read(64 * 1024)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while True:
+            start = buffer.find(b"\xff\xd8")
+            if start < 0:
+                if len(buffer) > 1:
+                    del buffer[:-1]
+                break
+            end = buffer.find(b"\xff\xd9", start + 2)
+            if end < 0:
+                if start:
+                    del buffer[:start]
+                if len(buffer) > 20 * 1024 * 1024:
+                    raise RuntimeError("OCR frame exceeded the safety limit")
+                break
+            yield bytes(buffer[start : end + 2])
+            del buffer[: end + 2]
+
+
+def burned_subtitle_ocr_worker(
+    media_path: str,
+    duration: float,
+    result_queue: Any,
+) -> None:
+    ffmpeg_process: subprocess.Popen[bytes] | None = None
+    try:
+        from rapidocr import RapidOCR
+
+        engine = RapidOCR(
+            params={
+                "Global.text_score": OCR_MIN_CONFIDENCE,
+                "Global.log_level": "error",
+                "Global.use_cls": False,
+                "EngineConfig.onnxruntime.intra_op_num_threads": OCR_CPU_THREADS,
+                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            }
+        )
+        crop_height = 1.0 - OCR_CROP_TOP_RATIO
+        video_filter = (
+            f"fps={OCR_SAMPLE_FPS:g},"
+            f"crop=iw:trunc(ih*{crop_height:.4f}/2)*2:0:trunc(ih*{OCR_CROP_TOP_RATIO:.4f}/2)*2"
+        )
+        total_frames = min(OCR_MAX_FRAMES, max(1, int(math.ceil(duration * OCR_SAMPLE_FPS))))
+        ffmpeg_process = subprocess.Popen(
+            [
+                shutil.which("ffmpeg") or "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-protocol_whitelist",
+                LOCAL_MEDIA_PROTOCOL_WHITELIST,
+                "-i",
+                media_path,
+                "-an",
+                "-vf",
+                video_filter,
+                "-frames:v",
+                str(total_frames),
+                "-q:v",
+                "3",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        result_queue.put({"kind": "started", "ffmpeg_pid": ffmpeg_process.pid})
+        frames: list[dict[str, Any]] = []
+        if ffmpeg_process.stdout is None:
+            raise RuntimeError("ffmpeg did not expose an OCR frame stream")
+        for index, image in enumerate(iter_mjpeg_images(ffmpeg_process.stdout)):
+            if index >= OCR_MAX_FRAMES:
+                break
+            try:
+                result = engine(image)
+                lines = ocr_lines_from_result(result)
+            except Exception:
+                lines = []
+            frames.append({"time": index / OCR_SAMPLE_FPS, "lines": lines})
+            if index % 20 == 0:
+                result_queue.put({"kind": "progress", "processed": index + 1, "total": total_frames})
+        try:
+            return_code = ffmpeg_process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            ffmpeg_process.kill()
+            return_code = ffmpeg_process.wait(timeout=5)
+        if return_code != 0 and not frames:
+            raise RuntimeError(f"ffmpeg frame extraction failed with exit code {return_code}")
+        entries = build_ocr_entries(frames, OCR_SAMPLE_FPS)
+        result_queue.put(
+            {
+                "kind": "result",
+                "ok": True,
+                "entries": [(entry.start, entry.end, entry.text) for entry in entries],
+                "meta": {
+                    "ocr_frames": len(frames),
+                    "ocr_sample_fps": OCR_SAMPLE_FPS,
+                    "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO,
+                    "ocr_engine": "RapidOCR PP-OCRv6",
+                },
+            }
+        )
+    except Exception as exc:
+        result_queue.put({"kind": "result", "ok": False, "error": redact_sensitive(str(exc))})
+    finally:
+        if ffmpeg_process is not None and ffmpeg_process.poll() is None:
+            ffmpeg_process.kill()
+            try:
+                ffmpeg_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def extract_burned_subtitles(media_path: Path, duration: float) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    if not shutil.which("ffmpeg"):
+        raise ExtractionFailure(503, "Video subtitle OCR requires ffmpeg.", "ffmpeg_missing")
+    if importlib.util.find_spec("rapidocr") is None or importlib.util.find_spec("onnxruntime") is None:
+        raise ExtractionFailure(503, "Video subtitle OCR is not installed.", "ocr_missing")
+    acquired = ASR_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        report_progress("ocr_wait", 28, "正在等待精确解析资源")
+        acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+    if not acquired:
+        raise ExtractionFailure(429, "OCR wait exceeded the queue timeout.", "asr_busy")
+    result_queue: Any = None
+    process: Any = None
+    ffmpeg_pid: int | None = None
+    try:
+        ctx = get_context("spawn")
+        result_queue = ctx.Queue(maxsize=64)
+        process = ctx.Process(
+            target=burned_subtitle_ocr_worker,
+            args=(str(media_path), duration, result_queue),
+            name="video-subtitle-ocr",
+        )
+        process.start()
+        deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if ffmpeg_pid:
+                    try:
+                        os.kill(ffmpeg_pid, 9)
+                    except OSError:
+                        pass
+                process.kill()
+                process.join(5)
+                raise ExtractionFailure(504, f"Video subtitle OCR timed out after {OCR_TIMEOUT_SECONDS} seconds.", "ocr_timeout")
+            try:
+                message = result_queue.get(timeout=min(1.0, remaining))
+            except Empty:
+                if not process.is_alive():
+                    raise ExtractionFailure(502, f"Video subtitle OCR exited without a result. exit_code={process.exitcode}", "ocr_failed")
+                continue
+            if message.get("kind") == "started":
+                ffmpeg_pid = int(message.get("ffmpeg_pid") or 0) or None
+                continue
+            if message.get("kind") == "progress":
+                processed = int(message.get("processed") or 0)
+                total = max(1, int(message.get("total") or 1))
+                progress = min(88, 42 + int(processed / total * 46))
+                report_progress("ocr", progress, f"正在识别画面字幕 {processed}/{total}")
+                continue
+            if message.get("kind") != "result":
+                continue
+            process.join(5)
+            if not message.get("ok"):
+                raise ExtractionFailure(502, f"Video subtitle OCR failed: {message.get('error') or 'unknown error'}", "ocr_failed")
+            entries = [
+                SubtitleEntry(float(start), float(end), str(text))
+                for start, end, text in message.get("entries", [])
+                if str(text).strip()
+            ]
+            meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+            return entries, meta
+    finally:
+        if process is not None and process.is_alive():
+            process.kill()
+            process.join(5)
+        if result_queue is not None:
+            try:
+                result_queue.close()
+            except Exception:
+                pass
+        ASR_SEMAPHORE.release()
+
+
+def extract_video_subtitle_pixels(
+    media_path: Path,
+    media_info: dict[str, Any],
+    tmp_dir: Path,
+    lang: str | None,
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    report_progress("embedded_subtitle", 36, "正在检查视频内嵌字幕轨")
+    embedded = extract_embedded_text_subtitle(media_path, media_info, tmp_dir, lang)
+    if embedded is not None:
+        return embedded
+    report_progress("ocr", 42, "正在准备画面字幕识别")
+    try:
+        entries, meta = extract_burned_subtitles(media_path, float(media_info.get("duration") or 0))
+    except ExtractionFailure as exc:
+        if media_info.get("has_audio") and exc.reason in {"ocr_missing", "ocr_failed", "ocr_timeout"}:
+            return [], {
+                "subtitle_source": "burned_in_ocr",
+                "ocr_failed": True,
+                "ocr_failure_reason": public_reason(exc.reason),
+            }
+        raise
+    meta["subtitle_source"] = "burned_in_ocr"
+    return entries, meta
+
+
+def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple[Path, dict[str, Any]]:
+    def do_api_download() -> tuple[Path, dict[str, Any]]:
+        deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
+        attempt_dir = tmp_dir / "bilibili-api"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        bvid, canonical_url, data, selected_page, cid = bili_view_context(url, allow_cookie)
+        play = api_get_json(
+            "https://api.bilibili.com/x/player/playurl?"
+            + urllib.parse.urlencode({"bvid": bvid, "cid": cid, "fnval": 16, "qn": 64}),
+            canonical_url,
+            allow_cookie,
+        )
+        play_data = play.get("data") or {}
+        audio_items = ((play_data.get("dash") or {}).get("audio") or []) if isinstance(play_data, dict) else []
+        if not audio_items:
+            raise ExtractionFailure(502, "Bilibili playurl API returned no audio stream.", "audio_extract_failed")
+        audio_items = [
+            item
+            for item in audio_items
+            if isinstance(item, dict) and (item.get("baseUrl") or item.get("base_url"))
+        ]
+        if not audio_items:
+            raise ExtractionFailure(502, "Bilibili playurl API returned no usable audio stream.", "audio_extract_failed")
+        audio_items.sort(key=lambda item: int(item.get("bandwidth") or 0))
+        audio_quality = os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower()
+        if audio_quality == "best":
+            selected_audio = audio_items[-1]
+        elif audio_quality == "smallest":
+            selected_audio = audio_items[0]
+        else:
+            speech_items = [item for item in audio_items if int(item.get("bandwidth") or 0) >= 80_000]
+            selected_audio = speech_items[0] if speech_items else audio_items[-1]
+        audio_url = str(selected_audio.get("baseUrl") or selected_audio.get("base_url") or "")
+        if not audio_url:
+            raise ExtractionFailure(502, "Bilibili playurl API returned an empty audio URL.", "audio_extract_failed")
+        raw_path = attempt_dir / f"{bvid}.m4s"
+        headers = headers_for(canonical_url, False)
+        headers["Range"] = "bytes=0-"
+        downloaded = 0
+        with httpx.Client(
+            timeout=remaining_before(deadline, "Bilibili API audio download"),
+            follow_redirects=True,
+            headers=headers,
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            with client.stream("GET", audio_url) as resp:
+                resp.raise_for_status()
+                try:
+                    content_length = int(resp.headers.get("content-length") or 0)
+                except ValueError:
+                    content_length = 0
+                if content_length > BILI_MAX_DOWNLOAD_BYTES:
+                    raise ExtractionFailure(413, "Bilibili audio exceeds the download size limit.", "download_too_large")
+                with raw_path.open("wb") as handle:
+                    for chunk in resp.iter_bytes(1024 * 1024):
+                        if chunk:
+                            remaining_before(deadline, "Bilibili API audio download")
+                            downloaded += len(chunk)
+                            if downloaded > BILI_MAX_DOWNLOAD_BYTES:
+                                raise ExtractionFailure(
+                                    413,
+                                    "Bilibili audio exceeds the download size limit.",
+                                    "download_too_large",
+                                )
+                            handle.write(chunk)
+        normalized_path = normalize_audio_for_asr(
+            raw_path,
+            tmp_dir,
+            bvid,
+            remaining_before(deadline, "Bilibili audio normalization"),
+        )
+        raw_path.unlink(missing_ok=True)
+        page_number = bili_page_number(canonical_url)
+        title = data.get("title")
+        if page_number > 1 and selected_page and selected_page.get("part"):
+            title = f"{title} - P{page_number} {selected_page['part']}"
+        return normalized_path, {
+            "id": bvid,
+            "title": title,
+            "duration": (selected_page or {}).get("duration") or data.get("duration"),
+            "webpage_url": canonical_url,
+            "audio_download": "bilibili_playurl",
+            "audio_bytes": downloaded,
+            "audio_bandwidth": int(selected_audio.get("bandwidth") or 0) or None,
+            "audio_quality_strategy": audio_quality,
+            "audio_normalized_for_asr": True,
+        }
+
+    def do_download() -> tuple[Path, dict[str, Any]]:
+        deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
+        attempt_dir = tmp_dir / "yt-dlp"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        timed_out = False
+
+        def progress_hook(_: dict[str, Any]) -> None:
+            nonlocal timed_out
+            if deadline - time.monotonic() <= 0:
+                timed_out = True
+                raise RuntimeError("yt-dlp download deadline exceeded")
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": str(attempt_dir / "%(id)s.%(ext)s"),
+            "socket_timeout": 30,
+            "http_headers": headers_for(allow_cookie=allow_cookie),
+            "logger": QuietYtdlpLogger(),
+            "noplaylist": True,
+            "max_filesize": BILI_MAX_DOWNLOAD_BYTES,
+            "progress_hooks": [progress_hook],
+        }
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as exc:
+            if timed_out:
+                raise ExtractionFailure(504, "yt-dlp audio download timed out.", "download_failed") from exc
+            raise
+        candidates = sorted(
+            (
+                path
+                for path in attempt_dir.iterdir()
+                if path.is_file() and path.suffix not in {".part", ".ytdl"}
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise ExtractionFailure(502, "Audio download did not produce a media file.", "audio_extract_failed")
+        source_path = candidates[0]
+        if source_path.stat().st_size > BILI_MAX_DOWNLOAD_BYTES:
+            raise ExtractionFailure(413, "Bilibili audio exceeds the download size limit.", "download_too_large")
+        normalized = normalize_audio_for_asr(
+            source_path,
+            tmp_dir,
+            f"{source_path.stem}.normalized",
+            remaining_before(deadline, "yt-dlp audio normalization"),
+        )
+        source_path.unlink(missing_ok=True)
+        if isinstance(info, dict):
+            info["audio_normalized_for_asr"] = True
+            info["audio_download"] = "yt-dlp_fallback"
+        return normalized, info if isinstance(info, dict) else {"audio_normalized_for_asr": True}
+
+    try:
+        return do_api_download()
+    except ExtractionFailure as first:
+        if first.terminal:
+            raise
+        try:
+            return do_download()
+        except Exception as raw_second:
+            second = raw_second if isinstance(raw_second, ExtractionFailure) else ExtractionFailure(
+                502,
+                f"yt-dlp audio download failed: {raw_second}",
+                "audio_extract_failed",
+            )
+            raise ExtractionFailure(
+                second.status_code,
+                f"{second.detail} Bilibili API reason: {first.detail}",
+                second.reason,
+            ) from second
+    except Exception as exc:
+        try:
+            return do_download()
+        except Exception as raw_second:
+            second = raw_second if isinstance(raw_second, ExtractionFailure) else ExtractionFailure(
+                502,
+                f"yt-dlp audio download failed: {raw_second}",
+                "audio_extract_failed",
+            )
+            raise ExtractionFailure(
+                second.status_code,
+                f"{second.detail} Bilibili API reason: {exc}",
+                second.reason,
+            ) from second
+
+
+def probe_downloaded_media(path: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise ExtractionFailure(503, "Media extraction requires ffprobe.", "ffmpeg_missing")
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=codec_type",
+                "-of",
+                "json",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ExtractionFailure(504, "Media inspection timed out.", "media_probe_timeout") from exc
+    if completed.returncode != 0:
+        raise ExtractionFailure(502, "Downloaded file is not readable media.", "invalid_downloaded_media")
+    try:
+        payload = json.loads(completed.stdout)
+        streams = payload.get("streams") or []
+        duration = float((payload.get("format") or {}).get("duration") or 0) or None
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExtractionFailure(502, "Downloaded media metadata is invalid.", "invalid_downloaded_media") from exc
+    return {
+        "has_video": any(item.get("codec_type") == "video" for item in streams if isinstance(item, dict)),
+        "has_audio": any(item.get("codec_type") == "audio" for item in streams if isinstance(item, dict)),
+        "duration": duration,
+    }
+
+
+def select_downloaded_media(directory: Path, media_type: Literal["video", "audio"]) -> tuple[Path, dict[str, Any]]:
+    candidates: list[tuple[tuple[int, int, int], Path, dict[str, Any]]] = []
+    ignored_suffixes = {".part", ".ytdl", ".json", ".jpg", ".jpeg", ".png", ".webp"}
+    for path in directory.iterdir():
+        if not path.is_file() or path.suffix.lower() in ignored_suffixes:
+            continue
+        try:
+            stat = path.lstat()
+            if path.is_symlink() or stat.st_size <= 0:
+                continue
+            probe = probe_downloaded_media(path)
+        except (OSError, ExtractionFailure):
+            continue
+        if media_type == "video" and not probe["has_video"]:
+            continue
+        if media_type == "audio" and not probe["has_audio"]:
+            continue
+        rank = (
+            int(bool(probe["has_video"])),
+            int(bool(probe["has_audio"])),
+            stat.st_size,
+        )
+        candidates.append((rank, path, probe))
+    if not candidates:
+        reason = "video_stream_missing" if media_type == "video" else "audio_stream_missing"
+        raise ExtractionFailure(502, "Media download did not produce the requested stream.", reason)
+    _, path, probe = max(candidates, key=lambda item: item[0])
+    if path.stat().st_size > MEDIA_MAX_BYTES:
+        raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
+    return path, probe
+
+
+def download_bilibili_media_ytdlp(
+    req: MediaJobRequest,
+    target_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
+    timed_out = False
+    too_large = False
+    last_progress = -1
+
+    def progress_hook(status: dict[str, Any]) -> None:
+        nonlocal timed_out, too_large, last_progress
+        if time.monotonic() >= deadline:
+            timed_out = True
+            raise RuntimeError("media download deadline exceeded")
+        downloaded = int(status.get("downloaded_bytes") or 0)
+        total = int(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
+        if downloaded > MEDIA_MAX_BYTES or total > MEDIA_MAX_BYTES:
+            too_large = True
+            raise RuntimeError("media download size limit exceeded")
+        if status.get("status") != "downloading" or total <= 0:
+            return
+        percent = min(78, 20 + int(downloaded / total * 58))
+        if percent >= last_progress + 2:
+            last_progress = percent
+            report_progress("media_download", percent, "正在下载媒体文件")
+
+    options: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": str(target_dir / "source.%(ext)s"),
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": max(
+            1,
+            min(8, int(os.getenv("MEDIA_FRAGMENT_CONCURRENCY", "4"))),
+        ),
+        "http_headers": headers_for(allow_cookie=cookie_allowed(req.use_cookie)),
+        "logger": QuietYtdlpLogger(),
+        "noplaylist": True,
+        "cachedir": False,
+        "continuedl": False,
+        "overwrites": True,
+        "max_filesize": MEDIA_MAX_BYTES,
+        "progress_hooks": [progress_hook],
+    }
+    if req.media_type == "video":
+        options.update(
+            {
+                "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                "merge_output_format": "mp4",
+            }
+        )
+    else:
+        options["format"] = "bestaudio/best"
+    try:
+        with YoutubeDL(options) as ydl:
+            raw_info = ydl.extract_info(req.input, download=True)
+    except Exception as exc:
+        if timed_out:
+            raise ExtractionFailure(504, "Media download timed out.", "download_failed") from exc
+        if too_large:
+            raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large") from exc
+        raise ExtractionFailure(502, "Bilibili media download failed.", "download_failed") from exc
+    source_path, probe = select_downloaded_media(target_dir, req.media_type)
+    info = raw_info if isinstance(raw_info, dict) else {}
+    return source_path, {
+        "id": info.get("id"),
+        "title": info.get("title"),
+        "author": info.get("uploader") or info.get("channel"),
+        "duration": info.get("duration") or probe.get("duration"),
+        "webpage_url": info.get("webpage_url") or req.input,
+        "source_container": source_path.suffix.lower().lstrip("."),
+    }
+
+
+def bili_stream_urls(item: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for value in (item.get("baseUrl"), item.get("base_url")):
+        if isinstance(value, str) and value:
+            candidates.append(value)
+    for key in ("backupUrl", "backup_url"):
+        values = item.get(key) or []
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list):
+            candidates.extend(str(value) for value in values if isinstance(value, str) and value)
+    return list(dict.fromkeys(candidates))
+
+
+def download_bilibili_stream(
+    urls: list[str],
+    target: Path,
+    referer: str,
+    deadline: float,
+    remaining_limit: int,
+    progress_start: int,
+    progress_span: int,
+    message: str,
+) -> int:
+    if not urls:
+        raise ExtractionFailure(502, "Bilibili returned an empty media URL.", "download_failed")
+    last_error: Exception | None = None
+    for url in urls:
+        downloaded = 0
+        target.unlink(missing_ok=True)
+        try:
+            headers = headers_for(referer, False)
+            headers["Range"] = "bytes=0-"
+            with httpx.Client(
+                timeout=remaining_before(deadline, message),
+                follow_redirects=True,
+                headers=headers,
+                event_hooks={"request": [validate_public_request]},
+            ) as client:
+                with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    try:
+                        content_length = int(response.headers.get("content-length") or 0)
+                    except ValueError:
+                        content_length = 0
+                    if content_length > remaining_limit:
+                        raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
+                    with target.open("xb") as handle:
+                        for chunk in response.iter_bytes(1024 * 1024):
+                            if not chunk:
+                                continue
+                            remaining_before(deadline, message)
+                            downloaded += len(chunk)
+                            if downloaded > remaining_limit:
+                                raise ExtractionFailure(
+                                    413,
+                                    "Downloaded media exceeds the size limit.",
+                                    "media_too_large",
+                                )
+                            handle.write(chunk)
+                            if content_length:
+                                progress = progress_start + int(downloaded / content_length * progress_span)
+                                report_progress(
+                                    "media_download",
+                                    min(progress_start + progress_span, progress),
+                                    message,
+                                )
+            if downloaded <= 0:
+                raise ExtractionFailure(502, "Bilibili media stream was empty.", "download_failed")
+            return downloaded
+        except ExtractionFailure as exc:
+            target.unlink(missing_ok=True)
+            if exc.status_code == 413:
+                raise
+            last_error = exc
+        except Exception as exc:
+            target.unlink(missing_ok=True)
+            last_error = exc
+    raise ExtractionFailure(502, "Bilibili media stream download failed.", "download_failed") from last_error
+
+
+def merge_bilibili_dash(
+    video_path: Path,
+    audio_path: Path | None,
+    target: Path,
+    deadline: float,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ExtractionFailure(503, "Video extraction requires ffmpeg.", "ffmpeg_missing")
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(video_path),
+    ]
+    if audio_path is not None:
+        command.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0"])
+    else:
+        command.extend(["-map", "0:v:0"])
+    command.extend(["-c", "copy", "-movflags", "+faststart", str(target)])
+    report_progress("media_convert", 82, "正在合并视频和音频")
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=remaining_before(deadline, "Bilibili media merge"),
+        )
+    except subprocess.TimeoutExpired as exc:
+        target.unlink(missing_ok=True)
+        raise ExtractionFailure(504, "Bilibili media merge timed out.", "media_convert_failed") from exc
+    if completed.returncode != 0 or not target.is_file():
+        target.unlink(missing_ok=True)
+        raise ExtractionFailure(502, "Bilibili media merge failed.", "media_convert_failed")
+
+
+def download_bilibili_media_api(
+    req: MediaJobRequest,
+    target_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
+    allow_cookie = cookie_allowed(req.use_cookie)
+    bvid, canonical_url, data, selected_page, cid = bili_view_context(req.input, allow_cookie)
+    play = api_get_json(
+        "https://api.bilibili.com/x/player/playurl?"
+        + urllib.parse.urlencode(
+            {
+                "bvid": bvid,
+                "cid": cid,
+                "fnval": 16,
+                "fnver": 0,
+                "qn": 80,
+                "fourk": 0,
+            }
+        ),
+        canonical_url,
+        allow_cookie,
+    )
+    play_data = play.get("data") or {}
+    dash = play_data.get("dash") or {}
+    audio_items = [
+        item
+        for item in (dash.get("audio") or [])
+        if isinstance(item, dict) and bili_stream_urls(item)
+    ]
+    audio_items.sort(key=lambda item: int(item.get("bandwidth") or 0), reverse=True)
+    if req.media_type == "audio":
+        if not audio_items:
+            raise ExtractionFailure(502, "Bilibili returned no audio stream.", "audio_stream_missing")
+        source_path = target_dir / "source.m4s"
+        downloaded = download_bilibili_stream(
+            bili_stream_urls(audio_items[0]),
+            source_path,
+            canonical_url,
+            deadline,
+            MEDIA_MAX_BYTES,
+            20,
+            58,
+            "正在下载 B站音频",
+        )
+    else:
+        video_items = [
+            item
+            for item in (dash.get("video") or [])
+            if isinstance(item, dict) and bili_stream_urls(item)
+        ]
+        within_limit = [item for item in video_items if int(item.get("height") or 0) <= 1080]
+        if within_limit:
+            video_items = within_limit
+        video_items.sort(
+            key=lambda item: (
+                int(item.get("height") or 0),
+                int(item.get("codecid") == 7 or str(item.get("codecs") or "").startswith("avc")),
+                int(item.get("bandwidth") or 0),
+            ),
+            reverse=True,
+        )
+        if not video_items:
+            raise ExtractionFailure(502, "Bilibili returned no video stream.", "video_stream_missing")
+        raw_audio: Path | None = None
+        audio_bytes = 0
+        if audio_items:
+            raw_audio = target_dir / "source.audio.m4s"
+            audio_bytes = download_bilibili_stream(
+                bili_stream_urls(audio_items[0]),
+                raw_audio,
+                canonical_url,
+                deadline,
+                MEDIA_MAX_BYTES,
+                20,
+                8,
+                "正在下载 B站音频",
+            )
+        source_path = target_dir / "source.mp4"
+        raw_video = target_dir / "source.video.m4s"
+        last_size_error: ExtractionFailure | None = None
+        for video_item in video_items:
+            raw_video.unlink(missing_ok=True)
+            source_path.unlink(missing_ok=True)
+            try:
+                download_bilibili_stream(
+                    bili_stream_urls(video_item),
+                    raw_video,
+                    canonical_url,
+                    deadline,
+                    MEDIA_MAX_BYTES - audio_bytes,
+                    28,
+                    50,
+                    "正在下载 B站视频",
+                )
+                merge_bilibili_dash(raw_video, raw_audio, source_path, deadline)
+                if source_path.stat().st_size > MEDIA_MAX_BYTES:
+                    raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
+                last_size_error = None
+                break
+            except ExtractionFailure as exc:
+                raw_video.unlink(missing_ok=True)
+                source_path.unlink(missing_ok=True)
+                if exc.status_code != 413:
+                    raise
+                last_size_error = exc
+        if last_size_error is not None or not source_path.is_file():
+            raise last_size_error or ExtractionFailure(
+                413,
+                "Downloaded media exceeds the size limit.",
+                "media_too_large",
+            )
+        raw_video.unlink(missing_ok=True)
+        if raw_audio is not None:
+            raw_audio.unlink(missing_ok=True)
+        downloaded = source_path.stat().st_size
+    page_number = bili_page_number(canonical_url)
+    title = data.get("title")
+    if page_number > 1 and selected_page and selected_page.get("part"):
+        title = f"{title} - P{page_number} {selected_page['part']}"
+    return source_path, {
+        "id": bvid,
+        "title": title,
+        "author": (data.get("owner") or {}).get("name"),
+        "duration": (selected_page or {}).get("duration") or data.get("duration"),
+        "webpage_url": canonical_url,
+        "source_container": source_path.suffix.lower().lstrip("."),
+        "media_bytes": downloaded,
+        "media_download": "bilibili_playurl",
+    }
+
+
+def download_bilibili_media(
+    req: MediaJobRequest,
+    target_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
+    try:
+        return download_bilibili_media_api(req, target_dir)
+    except ExtractionFailure as first:
+        if first.terminal or first.status_code in {404, 413}:
+            raise
+        LOGGER.warning(
+            "Bilibili playurl media path failed; trying yt-dlp",
+            extra={"reason": first.reason, "media_type": req.media_type},
+        )
+        try:
+            return download_bilibili_media_ytdlp(req, target_dir)
+        except ExtractionFailure as second:
+            raise ExtractionFailure(
+                second.status_code,
+                "Bilibili media download failed.",
+                second.reason,
+            ) from second
+
+
+def prepare_media_output(
+    source_path: Path,
+    media_type: Literal["video", "audio"],
+    artifact_dir: Path,
+) -> tuple[Path, str]:
+    probe = probe_downloaded_media(source_path)
+    if media_type == "audio":
+        if not probe["has_audio"]:
+            raise ExtractionFailure(422, "Downloaded media has no audio stream.", "audio_stream_missing")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise ExtractionFailure(503, "Audio extraction requires ffmpeg.", "ffmpeg_missing")
+        final_path = artifact_dir / "artifact.mp3"
+        report_progress("media_convert", 86, "正在生成 MP3 音频")
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-i",
+                    str(source_path),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    "-id3v2_version",
+                    "3",
+                    str(final_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=ASR_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            final_path.unlink(missing_ok=True)
+            raise ExtractionFailure(504, "Audio conversion timed out.", "media_convert_failed") from exc
+        if completed.returncode != 0 or not final_path.is_file():
+            final_path.unlink(missing_ok=True)
+            raise ExtractionFailure(502, "Audio conversion failed.", "media_convert_failed")
+        source_path.unlink(missing_ok=True)
+        return final_path, "audio/mpeg"
+
+    if not probe["has_video"]:
+        raise ExtractionFailure(422, "Downloaded media has no video stream.", "video_stream_missing")
+    content_types = {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".mov": "video/quicktime",
+    }
+    suffix = source_path.suffix.lower()
+    if suffix not in content_types:
+        suffix = ".mp4"
+    final_path = artifact_dir / f"artifact{suffix}"
+    os.replace(source_path, final_path)
+    return final_path, content_types.get(suffix, "video/mp4")
+
+
+def finalize_media_artifact(
+    req: MediaJobRequest,
+    final_path: Path,
+    content_type: str,
+    info: dict[str, Any],
+    started: float,
+) -> dict[str, Any]:
+    try:
+        stat = final_path.lstat()
+    except OSError as exc:
+        raise ExtractionFailure(502, "Media artifact was not created.", "artifact_missing") from exc
+    if final_path.is_symlink() or not final_path.is_file() or stat.st_size <= 0:
+        raise ExtractionFailure(502, "Media artifact is invalid.", "invalid_artifact")
+    resize_media_reservation(req.artifact_token, stat.st_size)
+    extension = final_path.suffix.lower().lstrip(".") or ("mp3" if req.media_type == "audio" else "mp4")
+    title = str(info.get("title") or info.get("id") or "video").strip()[:160]
+    filename = safe_filename(title, extension)
+    now = time.time()
+    expires_at = now + MEDIA_ARTIFACT_TTL_SECONDS
+    metadata = {
+        "version": 1,
+        "artifact_token": req.artifact_token,
+        "owner_id": req.owner_id,
+        "stored_name": final_path.name,
+        "filename": filename,
+        "content_type": content_type,
+        "size": stat.st_size,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+    write_media_artifact_metadata(final_path.parent, metadata)
+    platform = detect_platform(req.input)
+    result_metadata = {
+        "title": title,
+        "id": info.get("id"),
+        "author": info.get("author"),
+        "duration": info.get("duration"),
+        "webpage_url": info.get("webpage_url") or req.input,
+        "platform": platform,
+        "source": "direct_media",
+        "media_type": req.media_type,
+        "media_bytes": stat.st_size,
+        "source_container": info.get("source_container"),
+        "cookie_used": platform == "bilibili" and cookie_allowed(req.use_cookie),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "artifact_ttl_seconds": MEDIA_ARTIFACT_TTL_SECONDS,
+    }
+    report_progress("media_finalize", 97, "正在准备下载文件")
+    return {
+        "ok": True,
+        "kind": "media",
+        "media_type": req.media_type,
+        "filename": filename,
+        "content_type": content_type,
+        "size": stat.st_size,
+        "download_url": f"/api/artifacts/{req.artifact_token}",
+        "metadata": result_metadata,
+    }
+
+
+def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
+    started = time.monotonic()
+    artifact_dir = media_artifact_directory(req.artifact_token)
+    source_dir = artifact_dir / "source"
+    MEDIA_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MEDIA_ARTIFACT_DIR, 0o700)
+    artifact_dir.mkdir(mode=0o700)
+    source_dir.mkdir(mode=0o700)
+    platform = detect_platform(req.input)
+    report_progress("platform", 12, f"正在解析{'抖音' if platform == 'douyin' else 'B站'}视频信息")
+    if platform == "douyin":
+        try:
+            video = get_douyin_video(req.input, force_refresh=req.force_refresh)
+            report_progress("media_download", 20, "正在下载抖音媒体文件")
+            source_path, info = download_douyin_media(
+                video,
+                source_dir,
+                require_video=req.media_type == "video",
+            )
+        except DouyinAdapterError as exc:
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+        info["source_container"] = source_path.suffix.lower().lstrip(".")
+    else:
+        report_progress("media_download", 20, "正在下载 B站媒体文件")
+        source_path, info = download_bilibili_media(req, source_dir)
+    if source_path.stat().st_size > MEDIA_MAX_BYTES:
+        raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
+    final_path, content_type = prepare_media_output(source_path, req.media_type, artifact_dir)
+    shutil.rmtree(source_dir)
+    return finalize_media_artifact(req, final_path, content_type, info, started)
+
+
+@lru_cache(maxsize=4)
+def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: int) -> Any:
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+        download_root=str(ASR_MODEL_DIR),
+    )
+
+
+def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "fast") -> dict[str, Any]:
+    try:
+        profile = asr_profile(quality)
+        model = whisper_model(
+            profile["model"],
+            profile["compute_type"],
+            profile["device"],
+            profile["cpu_threads"],
+        )
+        segments, info = model.transcribe(
+            audio_path,
+            language=lang or None,
+            beam_size=profile["beam_size"],
+            vad_filter=profile["vad_filter"],
+            condition_on_previous_text=False,
+        )
+        entries = []
+        for segment in segments:
+            text = str(segment.text or "").strip()
+            if text:
+                entries.append((float(segment.start), float(segment.end), text))
+        return {
+            "ok": True,
+            "entries": entries,
+            "meta": {
+                "detected_language": getattr(info, "language", None),
+                "language_probability": getattr(info, "language_probability", None),
+                "quality": profile["quality"],
+                "model": profile["model"],
+                "compute_type": profile["compute_type"],
+                "device": profile["device"],
+                "cpu_threads": profile["cpu_threads"],
+                "beam_size": profile["beam_size"],
+                "vad_filter": profile["vad_filter"],
+            },
+        }
+    except Exception as exc:
+        return {"ok": False, "error": redact_sensitive(str(exc))}
+
+
+def transcribe_audio_worker(audio_path: str, lang: str | None, quality: str, result_queue: Any) -> None:
+    result_queue.put(transcribe_audio_payload(audio_path, lang, quality))
+
+
+def persistent_asr_worker(request_queue: Any, result_queue: Any) -> None:
+    whisper_model(DEFAULT_ASR_MODEL, ASR_COMPUTE_TYPE, ASR_DEVICE, ASR_CPU_THREADS)
+    while True:
+        task = request_queue.get()
+        if task is None:
+            return
+        task_id = str(task.get("task_id") or "")
+        result = transcribe_audio_payload(
+            str(task.get("audio_path") or ""),
+            task.get("lang"),
+            str(task.get("quality") or "fast"),
+        )
+        result["task_id"] = task_id
+        result_queue.put(result)
+
+
+def asr_worker_alive() -> bool:
+    return bool(ASR_WORKER_PROCESS is not None and ASR_WORKER_PROCESS.is_alive())
+
+
+def stop_asr_worker_locked(graceful: bool = True) -> None:
+    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_WARM
+    process = ASR_WORKER_PROCESS
+    request_queue = ASR_WORKER_REQUEST_QUEUE
+    if process is not None and process.is_alive() and graceful and request_queue is not None:
+        try:
+            request_queue.put_nowait(None)
+            process.join(3)
+        except Exception:
+            pass
+    if process is not None and process.is_alive():
+        process.kill()
+        process.join(5)
+    for queue in (ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE):
+        if queue is None:
+            continue
+        try:
+            queue.cancel_join_thread()
+            queue.close()
+        except Exception:
+            pass
+    ASR_WORKER_PROCESS = None
+    ASR_WORKER_REQUEST_QUEUE = None
+    ASR_WORKER_RESULT_QUEUE = None
+    ASR_WORKER_WARM = False
+
+
+def stop_asr_worker() -> None:
+    with ASR_WORKER_LOCK:
+        stop_asr_worker_locked()
+
+
+def ensure_persistent_asr_worker_locked() -> None:
+    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE
+    if asr_worker_alive():
+        return
+    stop_asr_worker_locked(graceful=False)
+    ctx = get_context("spawn")
+    ASR_WORKER_REQUEST_QUEUE = ctx.Queue(maxsize=1)
+    ASR_WORKER_RESULT_QUEUE = ctx.Queue(maxsize=1)
+    ASR_WORKER_PROCESS = ctx.Process(
+        target=persistent_asr_worker,
+        args=(ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE),
+        name="bili-subtitle-asr",
+        daemon=True,
+    )
+    ASR_WORKER_PROCESS.start()
+
+
+def parse_transcription_result(result: dict[str, Any]) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    if not result.get("ok"):
+        raise ExtractionFailure(502, f"Local ASR failed: {result.get('error') or 'unknown error'}", "asr_failed")
+    entries = [
+        SubtitleEntry(float(start), float(end), str(text))
+        for start, end, text in result.get("entries", [])
+        if str(text).strip()
+    ]
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    return entries, meta
+
+
+def transcribe_audio_once(
+    audio_path: Path,
+    lang: str | None,
+    quality: str = "fast",
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    profile = asr_profile(quality)
+    ctx = get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    process: Any = None
+    try:
+        process = ctx.Process(
+            target=transcribe_audio_worker,
+            args=(str(audio_path), lang, profile["quality"], result_queue),
+        )
+        process.start()
+        deadline = time.monotonic() + profile["timeout_seconds"]
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ExtractionFailure(
+                    504,
+                    f"Local ASR timed out after {profile['timeout_seconds']} seconds.",
+                    "asr_timeout",
+                )
+            try:
+                result = result_queue.get(timeout=min(1.0, remaining))
+                break
+            except Empty:
+                if not process.is_alive():
+                    process.join(1)
+                    raise ExtractionFailure(
+                        502,
+                        f"Local ASR exited without a result. exit_code={process.exitcode}",
+                        "asr_failed",
+                    )
+        process.join(5)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        if not isinstance(result, dict):
+            raise ExtractionFailure(502, "Local ASR returned an invalid result.", "asr_failed")
+        entries, meta = parse_transcription_result(result)
+        meta["asr_worker_reused"] = False
+        return entries, meta
+    finally:
+        if process is not None and process.is_alive():
+            process.kill()
+            process.join(5)
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+
+
+def transcribe_audio(
+    audio_path: Path,
+    lang: str | None,
+    quality: str = "fast",
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    global ASR_WORKER_WARM
+    profile = asr_profile(quality)
+    if not env_bool("ASR_PERSISTENT_WORKER", True):
+        return transcribe_audio_once(audio_path, lang, profile["quality"])
+
+    with ASR_WORKER_LOCK:
+        worker_reused = asr_worker_alive()
+        ensure_persistent_asr_worker_locked()
+        process = ASR_WORKER_PROCESS
+        request_queue = ASR_WORKER_REQUEST_QUEUE
+        result_queue = ASR_WORKER_RESULT_QUEUE
+        reused = ASR_WORKER_WARM or worker_reused
+        task_id = f"{os.getpid()}-{time.time_ns()}"
+        request_queue.put(
+            {
+                "task_id": task_id,
+                "audio_path": str(audio_path),
+                "lang": lang,
+                "quality": profile["quality"],
+            }
+        )
+        deadline = time.monotonic() + profile["timeout_seconds"]
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_asr_worker_locked(graceful=False)
+                raise ExtractionFailure(
+                    504,
+                    f"Local ASR timed out after {profile['timeout_seconds']} seconds.",
+                    "asr_timeout",
+                )
+            if process is None or not process.is_alive():
+                exit_code = process.exitcode if process is not None else None
+                stop_asr_worker_locked(graceful=False)
+                raise ExtractionFailure(502, f"Local ASR worker exited without a result. exit_code={exit_code}", "asr_failed")
+            try:
+                result = result_queue.get(timeout=min(1.0, remaining))
+            except Empty:
+                continue
+            if result.get("task_id") != task_id:
+                continue
+            entries, meta = parse_transcription_result(result)
+            ASR_WORKER_WARM = True
+            meta["asr_worker_reused"] = reused
+            return entries, meta
+
+
+def video_pixel_subtitle(
+    req: ExtractRequest,
+    allow_cookie: bool,
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    url = normalize_input(req.input)
+    platform = detect_platform(url)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="ocr-", dir=str(ASR_TMP_DIR)) as tmp:
+        tmp_path = Path(tmp)
+        report_progress("platform", 16, "正在解析视频画面与字幕信息")
+        if platform == "douyin":
+            try:
+                video = get_douyin_video(url, force_refresh=req.force_refresh)
+                report_progress("media_download", 24, "正在下载抖音视频画面")
+                media_path, info = download_douyin_media(video, tmp_path, require_video=True)
+            except DouyinAdapterError as exc:
+                raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+            info.setdefault("id", video.video_id)
+            info.setdefault("title", video.title)
+            info.setdefault("author", video.author)
+            info.setdefault("webpage_url", video.webpage_url)
+            info.setdefault("duration", video.duration)
+        else:
+            report_progress("media_download", 24, "正在下载 B站视频画面")
+            media_request = MediaRequest(
+                input=url,
+                media_type="video",
+                use_cookie=allow_cookie,
+                force_refresh=req.force_refresh,
+            )
+            media_path, info = download_bilibili_media(media_request, tmp_path)
+
+        media_info = probe_uploaded_media(media_path, require_audio=False)
+        duration = float(media_info.get("duration") or info.get("duration") or 0)
+        if duration > ASR_MAX_AUDIO_SECONDS:
+            raise ExtractionFailure(
+                413,
+                f"Video duration {int(duration)}s exceeds the precise extraction limit.",
+                "asr_duration_too_long",
+            )
+        entries, subtitle_info = extract_video_subtitle_pixels(media_path, media_info, tmp_path, req.lang)
+        fallback_asr_info: dict[str, Any] = {}
+        if not entries and media_info.get("has_audio"):
+            report_progress("ocr_fallback", 70, "画面字幕不足，正在使用精确语音识别补救")
+            ensure_asr_ready()
+            audio_path = normalize_audio_for_asr(media_path, tmp_path, "ocr-fallback")
+            acquired = ASR_SEMAPHORE.acquire(blocking=False)
+            if not acquired:
+                report_progress("asr_wait", 72, "正在等待精确语音识别资源")
+                acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+            if not acquired:
+                raise ExtractionFailure(429, "Local ASR wait exceeded the queue timeout.", "asr_busy")
+            try:
+                entries, fallback_asr_info = transcribe_audio(audio_path, req.lang, "accurate")
+            finally:
+                ASR_SEMAPHORE.release()
+        if not entries:
+            raise ExtractionFailure(404, "No readable embedded or burned-in subtitles were found.", "ocr_empty")
+
+    subtitle_source = str(subtitle_info.get("subtitle_source") or "burned_in_ocr")
+    used_asr_fallback = bool(fallback_asr_info)
+    if used_asr_fallback:
+        source = "asr_local"
+        track_source_type = "asr_local"
+        subtitle_format = "asr"
+        note = "未识别到稳定的画面字幕，已自动改用精确语音识别。"
+    elif subtitle_source == "embedded_text_track":
+        source = "embedded_text"
+        track_source_type = "embedded_text"
+        subtitle_format = "srt"
+        note = "已从视频文件内嵌字幕轨提取字幕。"
+    else:
+        source = "ocr_video"
+        track_source_type = "burned_in_ocr"
+        subtitle_format = "ocr"
+        note = "已通过画面文字识别提取视频中的烧录字幕。"
+    profile = asr_profile("accurate")
+    meta = {
+        "title": info.get("title"),
+        "id": info.get("id"),
+        "webpage_url": info.get("webpage_url") or url,
+        "source": source,
+        "track_source_type": track_source_type,
+        "cookie_used": allow_cookie and bool(cookie_header(True)),
+        "language": fallback_asr_info.get("detected_language") or subtitle_info.get("subtitle_stream_language") or req.lang,
+        "subtitle_format": subtitle_format,
+        "warning": note,
+        "note": note,
+        "duration": duration,
+        "platform": platform,
+        "author": info.get("author"),
+        "session_mode": "anonymous_browser" if platform == "douyin" else ("bilibili_cookie" if allow_cookie else "anonymous"),
+        "quality": "accurate",
+        "embedded_subtitles_requested": True,
+        "ocr_fallback_to_asr": used_asr_fallback,
+        "processing_seconds": round(time.monotonic() - started, 3),
+        "available_tracks": [],
+        **subtitle_info,
+    }
+    if used_asr_fallback:
+        meta.update(
+            {
+                "asr_model": fallback_asr_info.get("model") or profile["model"],
+                "asr_compute_type": fallback_asr_info.get("compute_type") or profile["compute_type"],
+                "asr_device": fallback_asr_info.get("device") or profile["device"],
+                "asr_cpu_threads": fallback_asr_info.get("cpu_threads") or profile["cpu_threads"],
+                "asr_beam_size": fallback_asr_info.get("beam_size") or profile["beam_size"],
+                "asr_vad_filter": fallback_asr_info.get("vad_filter", profile["vad_filter"]),
+                "asr_worker_reused": bool(fallback_asr_info.get("asr_worker_reused")),
+                "asr_language_probability": fallback_asr_info.get("language_probability"),
+            }
+        )
+    return entries, meta
+
+
+def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None = None) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    ensure_asr_ready()
+    quality = effective_quality(req.quality, req.embedded_subtitles)
+    profile = asr_profile(quality)
+    url = normalize_input(req.input)
+    platform = detect_platform(url)
+    douyin_video: DouyinVideo | None = None
+    if platform == "douyin":
+        report_progress("platform", 18, "正在解析抖音视频信息")
+        try:
+            douyin_video = get_douyin_video(url, force_refresh=req.force_refresh and req.source == "asr")
+        except DouyinAdapterError as exc:
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+        view = ExtractionSource(
+            title=douyin_video.title,
+            video_id=douyin_video.video_id,
+            webpage_url=douyin_video.webpage_url,
+            tracks=[],
+            duration=douyin_video.duration,
+            platform="douyin",
+            author=douyin_video.author,
+        )
+    else:
+        report_progress("platform", 18, "正在解析 B站视频信息")
+        view = view_source(url, allow_cookie=allow_cookie)
+    duration = view.duration or 0
+    if duration and duration > ASR_MAX_AUDIO_SECONDS:
+        raise ExtractionFailure(
+            413,
+            f"Video duration {int(duration)}s exceeds ASR_MAX_AUDIO_SECONDS={ASR_MAX_AUDIO_SECONDS}.",
+            "asr_duration_too_long",
+        )
+    acquired_asr = ASR_SEMAPHORE.acquire(blocking=False)
+    if not acquired_asr:
+        report_progress("asr_wait", 28, "正在等待语音识别资源")
+        acquired_asr = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+    if not acquired_asr:
+        raise ExtractionFailure(
+            429,
+            f"Local ASR wait exceeded {ASR_QUEUE_WAIT_SECONDS} seconds. Retry later.",
+            "asr_busy",
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="asr-", dir=str(ASR_TMP_DIR)) as tmp:
+            tmp_path = Path(tmp)
+            report_progress("download", 35, "正在下载并准备音频")
+            if platform == "douyin" and douyin_video is not None:
+                try:
+                    media_path, info = download_douyin_media(douyin_video, tmp_path)
+                except DouyinAdapterError as exc:
+                    raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+                audio_path = normalize_audio_for_asr(media_path, tmp_path, douyin_video.video_id)
+                media_path.unlink(missing_ok=True)
+                info["audio_normalized_for_asr"] = True
+            else:
+                audio_path, info = download_audio_for_asr(url, allow_cookie=allow_cookie, tmp_dir=tmp_path)
+            report_progress(
+                "transcribe",
+                68,
+                "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
+            )
+            entries, asr_info = transcribe_audio(audio_path, req.lang, quality)
+    finally:
+        ASR_SEMAPHORE.release()
+    if not entries:
+        raise ExtractionFailure(404, "Local ASR completed but returned no text.", "asr_empty")
+    note = "未找到可用的平台字幕，本次使用本地语音识别。"
+    if prior_note:
+        note = f"{redact_sensitive(prior_note)} 已改用本地语音识别。"
+    meta = {
+        "title": view.title or info.get("title"),
+        "id": view.video_id or info.get("id"),
+        "webpage_url": view.webpage_url,
+        "source": "asr_local",
+        "track_source_type": "asr_local",
+        "cookie_used": allow_cookie and bool(cookie_header(True)),
+        "language": asr_info.get("detected_language") or req.lang,
+        "subtitle_format": "asr",
+        "warning": note,
+        "note": note,
+        "duration": duration or info.get("duration"),
+        "platform": platform,
+        "author": view.author or info.get("author"),
+        "session_mode": "anonymous_browser" if platform == "douyin" else ("bilibili_cookie" if allow_cookie else "anonymous"),
+        "quality": quality,
+        "embedded_subtitles_requested": req.embedded_subtitles,
+        "asr_model": asr_info.get("model") or profile["model"],
+        "asr_compute_type": asr_info.get("compute_type") or profile["compute_type"],
+        "asr_device": asr_info.get("device") or profile["device"],
+        "asr_cpu_threads": asr_info.get("cpu_threads") or profile["cpu_threads"],
+        "asr_beam_size": asr_info.get("beam_size") or profile["beam_size"],
+        "asr_vad_filter": asr_info.get("vad_filter", profile["vad_filter"]),
+        "asr_timeout_seconds": profile["timeout_seconds"],
+        "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
+        "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
+        "asr_worker_reused": bool(asr_info.get("asr_worker_reused")),
+        "audio_normalized_for_asr": bool(info.get("audio_normalized_for_asr")),
+        "audio_download": info.get("audio_download"),
+        "audio_bandwidth": info.get("audio_bandwidth"),
+        "audio_quality_strategy": info.get("audio_quality_strategy"),
+        "asr_language_probability": asr_info.get("language_probability"),
+        "available_tracks": [],
+    }
+    return entries, meta
+
+
+def upload_display_title(filename: str) -> str:
+    title = Path(filename).stem.strip()
+    return title[:120] or "uploaded_video"
+
+
+def apply_upload_metadata(meta: dict[str, Any], req: UploadJobRequest) -> None:
+    meta["title"] = upload_display_title(req.filename)
+    meta["id"] = f"upload-{req.sha256[:12]}"
+    meta["original_filename"] = req.filename
+    meta["uploaded_bytes"] = req.size
+    meta["platform"] = "upload"
+    meta["input_type"] = "upload"
+    meta["requested_source"] = "embedded" if req.embedded_subtitles else "asr"
+    meta["requested_use_cookie"] = False
+    meta["requested_quality"] = req.quality
+    meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
+    meta["embedded_subtitles_requested"] = req.embedded_subtitles
+    meta["cookie_enabled"] = cookie_enabled()
+
+
+def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    started = time.monotonic()
+    report_progress("validating", 7, "正在校验上传视频")
+    key = upload_result_cache_key(req)
+
+    with result_key_guard(key):
+        report_progress("cache", 10, "正在检查已有识别结果")
+        cached = None if req.force_refresh else load_cached_result(key)
+        if cached is not None:
+            entries, meta, cache_age = cached
+            meta["cache_hit"] = True
+            meta["cache_age_seconds"] = round(cache_age, 1)
+            report_progress("cache_hit", 92, "已找到相同视频的字幕")
+        else:
+            media_path = uploaded_media_path(req)
+            report_progress("platform", 18, "正在检查视频与音轨")
+            media_info = probe_uploaded_media(media_path, require_audio=not req.embedded_subtitles)
+            duration = float(media_info["duration"])
+            if duration > ASR_MAX_AUDIO_SECONDS:
+                raise ExtractionFailure(
+                    413,
+                    f"Video duration {int(duration)}s exceeds ASR_MAX_AUDIO_SECONDS={ASR_MAX_AUDIO_SECONDS}.",
+                    "asr_duration_too_long",
+                )
+
+            processing_started = time.monotonic()
+            quality = effective_quality(req.quality, req.embedded_subtitles)
+            profile = asr_profile(quality)
+            asr_info: dict[str, Any] = {}
+            subtitle_info: dict[str, Any] = {}
+
+            def transcribe_uploaded_video() -> tuple[list[SubtitleEntry], dict[str, Any]]:
+                ensure_asr_ready()
+                acquired_asr = ASR_SEMAPHORE.acquire(blocking=False)
+                if not acquired_asr:
+                    report_progress("asr_wait", 28, "正在等待语音识别资源")
+                    acquired_asr = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+                if not acquired_asr:
+                    raise ExtractionFailure(
+                        429,
+                        f"Local ASR wait exceeded {ASR_QUEUE_WAIT_SECONDS} seconds. Retry later.",
+                        "asr_busy",
+                    )
+                try:
+                    report_progress("download", 38, "正在提取并标准化音轨")
+                    normalized_path = normalize_audio_for_asr(
+                        media_path,
+                        media_path.parent,
+                        "upload",
+                        ASR_DOWNLOAD_TIMEOUT_SECONDS,
+                    )
+                    report_progress(
+                        "transcribe",
+                        68,
+                        "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
+                    )
+                    return transcribe_audio(normalized_path, req.lang, quality)
+                finally:
+                    ASR_SEMAPHORE.release()
+
+            if req.embedded_subtitles:
+                entries, subtitle_info = extract_video_subtitle_pixels(
+                    media_path,
+                    media_info,
+                    media_path.parent,
+                    req.lang,
+                )
+                if not entries and media_info.get("has_audio"):
+                    report_progress("ocr_fallback", 70, "画面字幕不足，正在使用精确语音识别补救")
+                    entries, asr_info = transcribe_uploaded_video()
+            else:
+                entries, asr_info = transcribe_uploaded_video()
+            if not entries:
+                reason = "ocr_empty" if req.embedded_subtitles else "asr_empty"
+                raise ExtractionFailure(404, "The video did not produce readable subtitles.", reason)
+
+            if asr_info:
+                source = "asr_local"
+                track_source_type = "asr_local"
+                subtitle_format = "asr"
+                note = (
+                    "未识别到稳定的画面字幕，已自动改用精确语音识别。"
+                    if req.embedded_subtitles
+                    else "本地上传视频已使用服务器语音识别生成字幕。"
+                )
+            elif subtitle_info.get("subtitle_source") == "embedded_text_track":
+                source = "embedded_text"
+                track_source_type = "embedded_text"
+                subtitle_format = "srt"
+                note = "已从上传视频的内嵌字幕轨提取字幕。"
+            else:
+                source = "ocr_video"
+                track_source_type = "burned_in_ocr"
+                subtitle_format = "ocr"
+                note = "已通过画面文字识别提取上传视频中的烧录字幕。"
+            meta = {
+                "title": upload_display_title(req.filename),
+                "id": f"upload-{req.sha256[:12]}",
+                "webpage_url": None,
+                "source": source,
+                "track_source_type": track_source_type,
+                "cookie_used": False,
+                "language": asr_info.get("detected_language") or subtitle_info.get("subtitle_stream_language") or req.lang,
+                "subtitle_format": subtitle_format,
+                "warning": note,
+                "note": note,
+                "duration": duration,
+                "platform": "upload",
+                "author": None,
+                "session_mode": "local_upload",
+                "quality": quality,
+                "embedded_subtitles_requested": req.embedded_subtitles,
+                "ocr_fallback_to_asr": bool(req.embedded_subtitles and asr_info),
+                "asr_model": asr_info.get("model") or (profile["model"] if asr_info else None),
+                "asr_compute_type": asr_info.get("compute_type") or (profile["compute_type"] if asr_info else None),
+                "asr_device": asr_info.get("device") or (profile["device"] if asr_info else None),
+                "asr_cpu_threads": asr_info.get("cpu_threads") or (profile["cpu_threads"] if asr_info else None),
+                "asr_beam_size": asr_info.get("beam_size") or (profile["beam_size"] if asr_info else None),
+                "asr_vad_filter": asr_info.get("vad_filter", profile["vad_filter"] if asr_info else None),
+                "asr_timeout_seconds": profile["timeout_seconds"] if asr_info else None,
+                "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
+                "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
+                "asr_worker_reused": bool(asr_info.get("asr_worker_reused")),
+                "asr_language_probability": asr_info.get("language_probability"),
+                "audio_normalized_for_asr": bool(asr_info),
+                "media_format": media_info.get("format_name"),
+                "available_tracks": [],
+                "processing_seconds": round(time.monotonic() - processing_started, 3),
+                "cache_hit": False,
+                "cache_age_seconds": 0,
+                **subtitle_info,
+            }
+            apply_upload_metadata(meta, req)
+            meta["entry_count"] = len(entries)
+            meta["character_count"] = sum(len(entry.text) for entry in entries)
+            save_cached_result(key, entries, meta)
+
+    apply_upload_metadata(meta, req)
+    meta["entry_count"] = len(entries)
+    meta["character_count"] = sum(len(entry.text) for entry in entries)
+    meta["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    meta["force_refresh"] = req.force_refresh
+    report_progress("render", 96, "正在生成字幕文件")
+    return entries, meta
+
+
+def upload_extraction_payload(req: UploadJobRequest) -> dict[str, Any]:
+    entries, meta = extract_uploaded_subtitle_data(req)
+    content = render_entries(entries, req.format, meta)
+    return {
+        "ok": True,
+        "format": req.format,
+        "filename": safe_filename(meta.get("title"), req.format),
+        "content_type": content_type_for(req.format),
+        "metadata": meta,
+        "content": content,
+    }
+
+
+def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
+    if req.force_refresh or not result_cache_enabled():
+        return None
+    started = time.monotonic()
+    key = upload_result_cache_key(req)
+    with result_key_guard(key, blocking=False) as acquired:
+        if not acquired:
+            return None
+        cached = load_cached_result(key)
+    if cached is None:
+        return None
+    entries, meta, cache_age = cached
+    meta["cache_hit"] = True
+    meta["cache_age_seconds"] = round(cache_age, 1)
+    meta["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    meta["force_refresh"] = False
+    apply_upload_metadata(meta, req)
+    meta["entry_count"] = len(entries)
+    meta["character_count"] = sum(len(entry.text) for entry in entries)
+    return {
+        "ok": True,
+        "format": req.format,
+        "filename": safe_filename(meta.get("title"), req.format),
+        "content_type": content_type_for(req.format),
+        "metadata": meta,
+        "content": render_entries(entries, req.format, meta),
+    }
+
+
+def extraction_http_error(req: ExtractRequest, exc: ExtractionFailure, failures: list[dict[str, Any]]) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={
+            "source": "failed",
+            "reason": public_reason(exc.reason),
+            "message": redact_sensitive(exc.detail),
+            "attempts": redact_sensitive(failures),
+            "cookie_enabled": cookie_enabled(),
+            "cookie_requested": req.use_cookie,
+            "cookie_used": False,
+        },
+    )
+
+
+def extract_subtitle_uncached(req: ExtractRequest) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    allow_cookie = cookie_allowed(req.use_cookie)
+    failures: list[dict[str, Any]] = []
+    report_progress("discover", 12, "正在查找可用字幕来源")
+
+    try:
+        if req.embedded_subtitles:
+            entries, meta = video_pixel_subtitle(req, allow_cookie=allow_cookie)
+        elif req.source == "official":
+            source_label = "official_with_cookie" if allow_cookie else "official_no_cookie"
+            entries, meta = official_subtitle(req, allow_cookie=allow_cookie, source_label=source_label)
+        elif req.source == "asr":
+            entries, meta = asr_subtitle(req, allow_cookie=allow_cookie)
+        else:
+            try:
+                entries, meta = official_subtitle(req, allow_cookie=False, source_label="official_no_cookie")
+            except ExtractionFailure as first:
+                failures.append(failure_record("official_no_cookie", first))
+                if first.terminal:
+                    raise first
+                if allow_cookie:
+                    try:
+                        entries, meta = official_subtitle(req, allow_cookie=True, source_label="official_with_cookie")
+                    except ExtractionFailure as second:
+                        failures.append(failure_record("official_with_cookie", second))
+                        if second.terminal:
+                            raise second
+                        entries, meta = asr_subtitle(
+                            req,
+                            allow_cookie=allow_cookie,
+                            prior_note=second.detail,
+                        )
+                else:
+                    entries, meta = asr_subtitle(req, allow_cookie=False, prior_note=first.detail)
+    except ExtractionFailure as exc:
+        raise extraction_http_error(req, exc, failures) from exc
+
+    meta["requested_source"] = req.source
+    meta["requested_use_cookie"] = req.use_cookie
+    meta["requested_quality"] = req.quality
+    meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
+    meta["embedded_subtitles_requested"] = req.embedded_subtitles
+    meta["cookie_enabled"] = cookie_enabled()
+    meta["attempts"] = meta.get("attempts", []) + failures
+    meta.setdefault("platform", detect_platform(req.input))
+    return entries, meta
+
+
+def extract_subtitle_data(req: ExtractRequest) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    start = time.monotonic()
+    report_progress("validating", 7, "正在校验视频链接")
+    try:
+        canonical_input = normalize_input(req.input)
+    except ExtractionFailure as exc:
+        raise extraction_http_error(req, exc, []) from exc
+    canonical_req = req.model_copy(update={"input": canonical_input})
+    key = result_cache_key(canonical_req, canonical_input)
+
+    with result_key_guard(key):
+        report_progress("cache", 10, "正在检查已有结果")
+        cached = None if req.force_refresh else load_cached_result(key)
+        if cached is not None:
+            entries, meta, cache_age = cached
+            meta["cache_hit"] = True
+            meta["cache_age_seconds"] = round(cache_age, 1)
+            report_progress("cache_hit", 92, "已找到缓存结果")
+        else:
+            processing_start = time.monotonic()
+            entries, meta = extract_subtitle_uncached(canonical_req)
+            meta["processing_seconds"] = round(time.monotonic() - processing_start, 3)
+            meta["cache_hit"] = False
+            meta["cache_age_seconds"] = 0
+            meta["entry_count"] = len(entries)
+            meta["character_count"] = sum(len(entry.text) for entry in entries)
+            save_cached_result(key, entries, meta)
+
+    meta["entry_count"] = len(entries)
+    meta["character_count"] = sum(len(entry.text) for entry in entries)
+    meta["requested_source"] = req.source
+    meta["requested_use_cookie"] = req.use_cookie
+    meta["requested_quality"] = req.quality
+    meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
+    meta["embedded_subtitles_requested"] = req.embedded_subtitles
+    meta["cookie_enabled"] = cookie_enabled()
+    meta["elapsed_seconds"] = round(time.monotonic() - start, 3)
+    meta["force_refresh"] = req.force_refresh
+    meta.setdefault("platform", detect_platform(canonical_input))
+    report_progress("render", 96, "正在生成字幕文件")
+    return entries, meta
+
+
+def extract_subtitle(req: ExtractRequest) -> tuple[str, dict[str, Any], str]:
+    entries, meta = extract_subtitle_data(req)
+    return render_entries(entries, req.format, meta), meta, req.format
+
+
+def content_type_for(fmt: str) -> str:
+    return {
+        "txt": "text/plain; charset=utf-8",
+        "srt": "application/x-subrip; charset=utf-8",
+        "vtt": "text/vtt; charset=utf-8",
+        "markdown": "text/markdown; charset=utf-8",
+        "md": "text/markdown; charset=utf-8",
+        "json": "application/json; charset=utf-8",
+    }.get(fmt, "text/plain; charset=utf-8")
+
+
+def safe_filename(title: str | None, fmt: str) -> str:
+    ext = "md" if fmt == "markdown" else fmt
+    base = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", title or "video_subtitle")
+    base = re.sub(r"\s+", "_", base).strip("._")
+    return f"{base[:80] or 'video_subtitle'}.{ext}"
+
+
+def extraction_payload(req: ExtractRequest) -> dict[str, Any]:
+    content, meta, fmt = extract_subtitle(req)
+    return {
+        "ok": True,
+        "format": fmt,
+        "filename": safe_filename(meta.get("title"), fmt),
+        "content_type": content_type_for(fmt),
+        "metadata": meta,
+        "content": content,
+    }
+
+
+def cached_extraction_payload(
+    req: ExtractRequest,
+    canonical_input: str | None = None,
+) -> dict[str, Any] | None:
+    if req.force_refresh or not result_cache_enabled():
+        return None
+    started = time.monotonic()
+    canonical = canonical_input or normalize_input(req.input)
+    canonical_req = req.model_copy(update={"input": canonical})
+    key = result_cache_key(canonical_req, canonical)
+    with result_key_guard(key, blocking=False) as acquired:
+        if not acquired:
+            return None
+        cached = load_cached_result(key)
+    if cached is None:
+        return None
+
+    entries, meta, cache_age = cached
+    meta["cache_hit"] = True
+    meta["cache_age_seconds"] = round(cache_age, 1)
+    meta["entry_count"] = len(entries)
+    meta["character_count"] = sum(len(entry.text) for entry in entries)
+    meta["requested_source"] = req.source
+    meta["requested_use_cookie"] = req.use_cookie
+    meta["requested_quality"] = req.quality
+    meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
+    meta["embedded_subtitles_requested"] = req.embedded_subtitles
+    meta["cookie_enabled"] = cookie_enabled()
+    meta["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    meta["force_refresh"] = False
+    meta.setdefault("platform", detect_platform(canonical))
+    content = render_entries(entries, req.format, meta)
+    return {
+        "ok": True,
+        "format": req.format,
+        "filename": safe_filename(meta.get("title"), req.format),
+        "content_type": content_type_for(req.format),
+        "metadata": meta,
+        "content": content,
+    }
+
+
+def process_queued_job(
+    payload: dict[str, Any],
+    update: Callable[[str, int, str], None],
+) -> dict[str, Any]:
+    if payload.get("kind") == "upload":
+        try:
+            req = UploadJobRequest.model_validate(payload)
+            with extraction_progress(update):
+                return upload_extraction_payload(req)
+        except ExtractionFailure as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={
+                    "source": "upload",
+                    "reason": public_reason(exc.reason),
+                    "message": redact_sensitive(exc.detail),
+                },
+            ) from exc
+        finally:
+            discard_upload_payload(payload)
+    if payload.get("kind") == "media":
+        completed = False
+        try:
+            req = MediaJobRequest.model_validate(payload)
+            with extraction_progress(update):
+                result = media_extraction_payload(req)
+            completed = True
+            return result
+        except ExtractionFailure as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={
+                    "source": "media",
+                    "reason": public_reason(exc.reason),
+                    "message": redact_sensitive(exc.detail),
+                },
+            ) from exc
+        finally:
+            if not completed:
+                discard_media_payload(payload)
+    req = ExtractRequest.model_validate(payload)
+    with extraction_progress(update):
+        return extraction_payload(req)
+
+
+JOB_MANAGER = JobManager(
+    process_queued_job,
+    max_pending=JOB_QUEUE_MAX_PENDING,
+    result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+    max_records=JOB_MAX_RECORDS,
+    worker_count=JOB_WORKER_COUNT,
+    discarder=discard_job_payload,
+)
+
+
+def request_idempotency_key(request: Request) -> str | None:
+    value = request.headers.get("idempotency-key", "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", value):
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "invalid_idempotency_key", "message": "Idempotency-Key 格式无效。"},
+        )
+    return value
+
+
+def idempotency_conflict_error() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "source": "queue",
+            "reason": "idempotency_conflict",
+            "message": "这个 Idempotency-Key 已用于另一个请求，请更换后重试。",
+        },
+    )
+
+
+def submit_extraction_job(req: ExtractRequest, owner_id: int, idempotency_key: str | None) -> dict[str, Any]:
+    try:
+        canonical_input = normalize_input(req.input)
+    except ExtractionFailure as exc:
+        raise extraction_http_error(req, exc, []) from exc
+    canonical_req = req.model_copy(update={"input": canonical_input})
+    cached_payload = cached_extraction_payload(canonical_req, canonical_input)
+    try:
+        if cached_payload is not None:
+            job = JOB_MANAGER.submit_completed(
+                canonical_req.model_dump(mode="json"),
+                cached_payload,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            job = JOB_MANAGER.submit(
+                canonical_req.model_dump(mode="json"),
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+            )
+    except JobIdempotencyConflict as exc:
+        raise idempotency_conflict_error() from exc
+    except JobQueueFull as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "source": "queue",
+                "reason": "queue_full",
+                "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+            },
+        ) from exc
+    job["platform"] = detect_platform(canonical_input)
+    return job
+
+
+def request_content_length(request: Request) -> int | None:
+    raw = request.headers.get("content-length")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "invalid_content_length", "message": "上传文件大小无效。"},
+        ) from exc
+    if value < 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason": "invalid_content_length", "message": "上传文件大小无效。"},
+        )
+    return value
+
+
+def upload_idempotency_fingerprint(
+    filename: str,
+    output_format: str,
+    lang: str | None,
+    quality: str,
+    embedded_subtitles: bool,
+    force_refresh: bool,
+    content_length: int | None,
+) -> str:
+    safe_name, _ = safe_upload_filename(filename)
+    return job_request_fingerprint(
+        {
+            "kind": "upload",
+            "filename": safe_name,
+            "format": output_format,
+            "lang": (lang or "").lower().replace("_", "-"),
+            "quality": quality,
+            "embedded_subtitles": embedded_subtitles,
+            "force_refresh": force_refresh,
+            "content_length": content_length,
+        }
+    )
+
+
+def media_idempotency_fingerprint(req: MediaRequest, canonical_input: str) -> str:
+    return job_request_fingerprint(
+        {
+            "kind": "media",
+            "input": canonical_input,
+            "media_type": req.media_type,
+            "use_cookie": req.use_cookie,
+            "force_refresh": req.force_refresh,
+        }
+    )
+
+
+def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | None) -> dict[str, Any]:
+    try:
+        canonical_input = normalize_input(req.input)
+    except ExtractionFailure as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "source": "media",
+                "reason": public_reason(exc.reason),
+                "message": redact_sensitive(exc.detail),
+            },
+        ) from exc
+    canonical_req = req.model_copy(update={"input": canonical_input})
+    fingerprint = media_idempotency_fingerprint(canonical_req, canonical_input) if idempotency_key else None
+    try:
+        existing = JOB_MANAGER.get_by_idempotency(
+            owner_id,
+            idempotency_key,
+            idempotency_fingerprint=fingerprint,
+        )
+    except JobIdempotencyConflict as exc:
+        raise idempotency_conflict_error() from exc
+    if existing is not None:
+        existing["platform"] = detect_platform(canonical_input)
+        existing["media_type"] = req.media_type
+        return existing
+    if JOB_MANAGER.stats()["queued"] >= JOB_QUEUE_MAX_PENDING:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "source": "queue",
+                "reason": "queue_full",
+                "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+            },
+        )
+
+    artifact_token = secrets.token_hex(16)
+    reserve_media_artifact(artifact_token)
+    media_req = MediaJobRequest(
+        **canonical_req.model_dump(mode="json"),
+        artifact_token=artifact_token,
+        owner_id=owner_id,
+    )
+    payload = media_req.model_dump(mode="json")
+    transferred = False
+    try:
+        try:
+            job = JOB_MANAGER.submit(
+                payload,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+                idempotency_fingerprint=fingerprint,
+            )
+        except JobQueueFull as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "source": "queue",
+                    "reason": "queue_full",
+                    "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                },
+            ) from exc
+        transferred = not bool(job.get("reused"))
+        job["platform"] = detect_platform(canonical_input)
+        job["media_type"] = req.media_type
+        return job
+    except JobIdempotencyConflict as exc:
+        raise idempotency_conflict_error() from exc
+    finally:
+        if not transferred:
+            discard_media_payload(payload)
+
+
+async def stage_uploaded_video(
+    request: Request,
+    filename: str,
+    output_format: Literal["txt", "srt", "json", "markdown", "md", "vtt"],
+    lang: str | None,
+    quality: Literal["fast", "accurate"],
+    embedded_subtitles: bool,
+    force_refresh: bool,
+) -> UploadJobRequest:
+    safe_name, extension = safe_upload_filename(filename)
+    content_length = request_content_length(request)
+    upload_token = secrets.token_hex(16)
+    reserve_upload(upload_token, content_length)
+    directory = ASR_TMP_DIR / f"asr-upload-{upload_token}"
+    stored_name = f"source{extension}"
+    target = directory / stored_name
+    payload: dict[str, Any] = {"kind": "upload", "upload_token": upload_token}
+    try:
+        ASR_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700)
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            with target.open("xb") as handle:
+                os.chmod(target, 0o600)
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    next_size = written + len(chunk)
+                    resize_upload_reservation(upload_token, next_size)
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    written = next_size
+        except ClientDisconnect as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "upload_interrupted", "message": "视频上传中断，请重试。"},
+            ) from exc
+        if written <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "empty_upload", "message": "上传的视频文件为空。"},
+            )
+        if content_length is not None and written != content_length:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason": "upload_interrupted", "message": "视频上传不完整，请重试。"},
+            )
+        return UploadJobRequest(
+            upload_token=upload_token,
+            stored_name=stored_name,
+            filename=safe_name,
+            sha256=digest.hexdigest(),
+            size=written,
+            format=output_format,
+            lang=lang,
+            quality=quality,
+            embedded_subtitles=embedded_subtitles,
+            force_refresh=force_refresh,
+        )
+    except Exception:
+        discard_upload_payload(payload)
+        raise
+
+
+def load_media_artifact(
+    artifact_token: str,
+    owner_id: int,
+) -> tuple[Path, dict[str, Any]]:
+    if not MEDIA_TOKEN_RE.fullmatch(artifact_token):
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "artifact_not_found", "message": "下载文件不存在或已过期。"},
+        )
+    directory = MEDIA_ARTIFACT_DIR / f"media-artifact-{artifact_token}"
+    metadata_path = directory / "artifact.json"
+    try:
+        metadata_stat = metadata_path.lstat()
+        if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_stat.st_size > 64 * 1024:
+            raise OSError("invalid artifact metadata")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "artifact_expired", "message": "下载文件不存在或已过期。"},
+        )
+    if not isinstance(metadata, dict) or metadata.get("artifact_token") != artifact_token:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "artifact_expired", "message": "下载文件不存在或已过期。"},
+        )
+    try:
+        stored_owner_id = int(metadata.get("owner_id"))
+    except (TypeError, ValueError):
+        stored_owner_id = -1
+    if stored_owner_id != owner_id:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "artifact_not_found", "message": "下载文件不存在或已过期。"},
+        )
+    try:
+        expires_at = float(metadata.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at <= time.time():
+        discard_media_payload({"kind": "media", "artifact_token": artifact_token})
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "artifact_expired", "message": "下载文件已过期，请重新提取。"},
+        )
+    stored_name = str(metadata.get("stored_name") or "")
+    if not re.fullmatch(r"artifact\.(?:mp3|mp4|webm|mkv|mov)", stored_name):
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "artifact_expired", "message": "下载文件不存在或已过期。"},
+        )
+    path = directory / stored_name
+    try:
+        stat = path.lstat()
+        expected_size = int(metadata.get("size") or 0)
+    except (OSError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "artifact_expired", "message": "下载文件不存在或已过期。"},
+        )
+    if path.is_symlink() or not path.is_file() or stat.st_size <= 0 or stat.st_size != expected_size:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "artifact_expired", "message": "下载文件不存在或已过期。"},
+        )
+    return path, metadata
+
+
+def wait_for_legacy_result(job: dict[str, Any], owner_id: int) -> dict[str, Any]:
+    if job["status"] not in {"completed", "failed", "cancelled"}:
+        job = JOB_MANAGER.wait(job["id"], owner_id=owner_id, timeout=LEGACY_WAIT_TIMEOUT_SECONDS)
+    if job["status"] == "completed":
+        return job["result"]
+    if job["status"] == "failed":
+        raise HTTPException(status_code=int(job.get("error_status") or 500), detail=job.get("error"))
+    if job["status"] == "cancelled":
+        raise HTTPException(status_code=409, detail={"reason": "job_cancelled", "message": "任务已取消。"})
+    raise HTTPException(
+        status_code=504,
+        detail={
+            "reason": "legacy_wait_timeout",
+            "message": "同步接口等待超时，任务仍在后台处理。",
+            "job_id": job["id"],
+        },
+    )
+
+
+def run_legacy_extraction(req: ExtractRequest, request: Request) -> dict[str, Any]:
+    user = require_auth_user(request)
+    if not LEGACY_REQUEST_SEMAPHORE.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail={"reason": "legacy_busy", "message": "同步接口正忙，请使用任务接口。"},
+        )
+    try:
+        job = submit_extraction_job(req, user.user_id, request_idempotency_key(request))
+        return wait_for_legacy_result(job, user.user_id)
+    finally:
+        LEGACY_REQUEST_SEMAPHORE.release()
+
+
+app = FastAPI(title=APP_TITLE)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+PUBLIC_PATHS = {
+    "/login",
+    "/register",
+    "/api/health",
+    "/api/auth/config",
+    "/api/auth/login",
+    "/api/auth/register",
+}
+
+
+def request_origin_allowed(request: Request) -> bool:
+    origin = request.headers.get("origin", "").rstrip("/")
+    if not origin:
+        return True
+    expected = f"{request.url.scheme}://{request.headers.get('host', '')}".rstrip("/")
+    return secrets.compare_digest(origin, expected)
+
+
+@app.middleware("http")
+async def account_session_middleware(request: Request, call_next: Callable[[Request], Any]) -> Response:
+    path = request.url.path
+    is_static = path.startswith("/static/")
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    user = None
+    if session_token and not is_static:
+        user = await run_in_threadpool(resolve_session, session_token)
+    request.state.auth_user = user
+
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not request_origin_allowed(request):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": {"reason": "invalid_origin", "message": "请求来源校验失败。"}},
+        )
+
+    if path in {"/login", "/register"} and user is not None:
+        return RedirectResponse(url="/", status_code=303)
+    if path not in PUBLIC_PATHS and not is_static and user is None:
+        if path.startswith("/api/"):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": {"reason": "authentication_required", "message": "请先登录。"}},
+                headers={"Cache-Control": "no-store"},
+            )
+        return RedirectResponse(url="/login", status_code=303)
+    return await call_next(request)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    initialize_auth_db()
+    with UPLOAD_RESERVATION_LOCK:
+        UPLOAD_RESERVATIONS.clear()
+    with MEDIA_RESERVATION_LOCK:
+        MEDIA_RESERVATIONS.clear()
+    ASR_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    ASR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ASR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    MEDIA_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MEDIA_ARTIFACT_DIR, 0o700)
+    cleanup_stale_asr_tmp()
+    cleanup_stale_media_artifacts(remove_all=True)
+    cleanup_result_cache()
+    JOB_MANAGER.start()
+    if (
+        env_bool("ASR_ENABLED", True)
+        and env_bool("ASR_PERSISTENT_WORKER", True)
+        and env_bool("ASR_PREWARM", True)
+    ):
+        with ASR_WORKER_LOCK:
+            ensure_persistent_asr_worker_locked()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    JOB_MANAGER.stop()
+    stop_asr_worker()
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    JOB_MANAGER.cleanup()
+    cleanup_stale_media_artifacts()
+    douyin = douyin_adapter_status()
+    return {
+        "status": "ok",
+        "service_version": SERVICE_VERSION,
+        "cookie_enabled": cookie_enabled(),
+        "cookie_configured": bool(configured_cookie_header()),
+        "web_qr_login_enabled": web_qr_login_enabled(),
+        "asr_enabled": env_bool("ASR_ENABLED", True),
+        "asr_model": DEFAULT_ASR_MODEL,
+        "asr_accurate_model": ACCURATE_ASR_MODEL,
+        "asr_persistent_worker": env_bool("ASR_PERSISTENT_WORKER", True),
+        "asr_prewarm": env_bool("ASR_PREWARM", True),
+        "asr_worker_alive": asr_worker_alive(),
+        "asr_worker_warm": ASR_WORKER_WARM and asr_worker_alive(),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower(),
+        "max_audio_seconds": ASR_MAX_AUDIO_SECONDS,
+        "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
+        "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
+        "extraction_modes": {
+            "fast": {
+                "model": DEFAULT_ASR_MODEL,
+                "beam_size": ASR_FAST_BEAM_SIZE,
+                "vad_filter": env_bool("ASR_VAD_FILTER", False),
+            },
+            "accurate": {
+                "model": ACCURATE_ASR_MODEL,
+                "beam_size": ACCURATE_ASR_BEAM_SIZE,
+                "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
+            },
+        },
+        "ocr": {
+            "enabled": bool(
+                shutil.which("ffmpeg")
+                and importlib.util.find_spec("rapidocr") is not None
+                and importlib.util.find_spec("onnxruntime") is not None
+            ),
+            "engine": "RapidOCR PP-OCRv6",
+            "embedded_tracks_enabled": bool(shutil.which("ffmpeg")),
+            "sample_fps": OCR_SAMPLE_FPS,
+            "max_frames": OCR_MAX_FRAMES,
+        },
+        "uploads": {
+            "enabled": env_bool("ASR_ENABLED", True),
+            "max_bytes": UPLOAD_MAX_BYTES,
+            "staging_max_bytes": UPLOAD_STAGING_MAX_BYTES,
+            "staging_reserved_bytes": upload_staging_bytes(),
+            "allowed_extensions": sorted(UPLOAD_ALLOWED_EXTENSIONS),
+        },
+        "media": {
+            "enabled": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
+            "max_bytes": MEDIA_MAX_BYTES,
+            "staging_max_bytes": MEDIA_STAGING_MAX_BYTES,
+            "staging_reserved_bytes": media_staging_bytes(),
+            "artifact_ttl_seconds": MEDIA_ARTIFACT_TTL_SECONDS,
+            "audio_format": "mp3",
+            "video_max_height": 1080,
+        },
+        "result_cache_enabled": result_cache_enabled(),
+        "result_cache_ttl_seconds": RESULT_CACHE_TTL_SECONDS,
+        "result_cache_items": len(list(RESULT_CACHE_DIR.glob("*.json"))) if RESULT_CACHE_DIR.exists() else 0,
+        "platforms": {
+            "bilibili": {"enabled": True, "status": "ready"},
+            "douyin": {
+                "enabled": douyin["enabled"],
+                "status": "disabled"
+                if not douyin["enabled"]
+                else (
+                    "ready"
+                    if douyin["api_adapter_ready"] and douyin["playwright_ready"] and douyin["chromium_ready"]
+                    else "setup_required"
+                ),
+                "cookie_cached": douyin["cookie_cached"],
+            },
+        },
+        "jobs": JOB_MANAGER.stats(),
+        "auth": {
+            "enabled": True,
+            "registration_enabled": invite_configured(),
+            "session_ttl_days": session_ttl_seconds() // 86400,
+        },
+    }
+
+
+@app.get("/api/auth/config")
+def api_auth_config() -> dict[str, Any]:
+    return {
+        "registration_enabled": invite_configured(),
+        "username_pattern": "[A-Za-z0-9_.-]{3,32}",
+        "password_min_length": 8,
+    }
+
+
+@app.post("/api/auth/register")
+def api_auth_register(req: RegisterRequest) -> JSONResponse:
+    try:
+        user = register_user(req.username, req.password, req.invite_code)
+        token, expires_at = create_session(user)
+    except AuthFailure as exc:
+        raise auth_error(exc) from exc
+    response = JSONResponse(
+        {"ok": True, "user": {"id": user.user_id, "username": user.username}},
+        headers={"Cache-Control": "no-store"},
+    )
+    set_session_cookie(response, token, expires_at)
+    return response
+
+
+@app.post("/api/auth/login")
+def api_auth_login(req: LoginRequest) -> JSONResponse:
+    try:
+        user = authenticate_user(req.username, req.password)
+        token, expires_at = create_session(user)
+    except AuthFailure as exc:
+        raise auth_error(exc) from exc
+    response = JSONResponse(
+        {"ok": True, "user": {"id": user.user_id, "username": user.username}},
+        headers={"Cache-Control": "no-store"},
+    )
+    set_session_cookie(response, token, expires_at)
+    return response
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request) -> dict[str, Any]:
+    user = require_auth_user(request)
+    return {"ok": True, "user": {"id": user.user_id, "username": user.username}}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request) -> JSONResponse:
+    delete_session(request.cookies.get(SESSION_COOKIE_NAME))
+    response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    clear_session_cookie(response)
+    return response
+
+
+@app.get("/login", response_class=FileResponse)
+def login_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "auth.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/register", response_class=FileResponse)
+def register_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "auth.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/login/qrcode")
+@app.post("/api/login/qrcode")
+def api_login_qrcode() -> dict[str, Any]:
+    if not web_qr_login_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Web QR login is disabled. Use sudo /usr/local/sbin/bili-subtitle-qr-login "
+                "on the server for optional Cookie refresh."
+            ),
+        )
+    headers = {"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"}
+    try:
+        with httpx.Client(
+            timeout=10,
+            follow_redirects=True,
+            headers=headers,
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            resp = client.get(LOGIN_QR_GENERATE_URL)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:
+        LOGGER.warning("Bilibili QR login request failed: %s", redact_sensitive(str(exc)))
+        raise HTTPException(status_code=502, detail="Bilibili QR login request failed.") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("qrcode_key") or not data.get("url"):
+        raise HTTPException(status_code=502, detail="Bilibili QR login returned an unexpected response.")
+    key = str(data["qrcode_key"])
+    url = str(data["url"])
+    with QR_LOGIN_LOCK:
+        clean_qr_sessions()
+        QR_LOGIN_SESSIONS[key] = time.time() + 180
+    return {
+        "ok": True,
+        "qrcode_key": key,
+        "url": url,
+        "expires_in": 180,
+        "qr_svg_data_url": qr_svg_data_url(url),
+    }
+
+
+@app.get("/api/login/poll")
+def api_login_poll(qrcode_key: str = Query(..., min_length=8, max_length=128)) -> dict[str, Any]:
+    if not web_qr_login_enabled():
+        raise HTTPException(status_code=403, detail="Web QR login is disabled.")
+    with QR_LOGIN_LOCK:
+        clean_qr_sessions()
+        expires_at = QR_LOGIN_SESSIONS.get(qrcode_key)
+    if not expires_at:
+        raise HTTPException(status_code=410, detail="QR login session expired. Generate a new QR code.")
+
+    headers = {"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"}
+    try:
+        with httpx.Client(
+            timeout=10,
+            follow_redirects=False,
+            headers=headers,
+            event_hooks={"request": [validate_public_request]},
+        ) as client:
+            resp = client.get(LOGIN_QR_POLL_URL, params={"qrcode_key": qrcode_key})
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:
+        LOGGER.warning("Bilibili QR login polling failed: %s", redact_sensitive(str(exc)))
+        raise HTTPException(status_code=502, detail="Bilibili QR login polling failed.") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Bilibili QR login polling returned an unexpected response.")
+
+    code = data.get("code")
+    if code == 0:
+        cookie = cookie_header_from_set_cookie(resp.headers.get_list("set-cookie"))
+        save_bili_cookie(cookie)
+        with QR_LOGIN_LOCK:
+            QR_LOGIN_SESSIONS.pop(qrcode_key, None)
+        return {"ok": True, "status": "success", "cookie_saved": True, "cookie_enabled": cookie_enabled()}
+    if code == 86101:
+        return {"ok": True, "status": "waiting_scan", "message": "Waiting for scan."}
+    if code == 86090:
+        return {"ok": True, "status": "waiting_confirm", "message": "Waiting for confirmation in the Bilibili app."}
+    if code == 86038:
+        with QR_LOGIN_LOCK:
+            QR_LOGIN_SESSIONS.pop(qrcode_key, None)
+        return {"ok": False, "status": "expired", "message": "QR code expired."}
+    return {"ok": False, "status": "failed", "message": str(data.get("message") or payload.get("message") or code)}
+
+
+@app.post("/api/extract")
+def api_extract(req: ExtractRequest, request: Request) -> JSONResponse:
+    return JSONResponse(
+        run_legacy_extraction(req, request),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/jobs", status_code=202)
+def api_create_job(req: ExtractRequest, request: Request) -> JSONResponse:
+    user = require_auth_user(request)
+    job = submit_extraction_job(req, user.user_id, request_idempotency_key(request))
+    return JSONResponse(job, status_code=202, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/media-jobs", status_code=202)
+def api_create_media_job(req: MediaRequest, request: Request) -> JSONResponse:
+    user = require_auth_user(request)
+    job = submit_media_job(req, user.user_id, request_idempotency_key(request))
+    return JSONResponse(job, status_code=202, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/upload-jobs", status_code=202)
+async def api_create_upload_job(
+    request: Request,
+    filename: str = Query(..., min_length=1, max_length=255),
+    output_format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = Query(
+        "txt",
+        alias="format",
+    ),
+    lang: str | None = Query(
+        default=None,
+        max_length=35,
+        pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
+    ),
+    quality: Literal["fast", "accurate"] = Query("fast"),
+    embedded_subtitles: bool = Query(False),
+    force_refresh: bool = Query(False),
+) -> JSONResponse:
+    user = require_auth_user(request)
+    idempotency_key = request_idempotency_key(request)
+    content_length = request_content_length(request)
+    idempotency_fingerprint = (
+        upload_idempotency_fingerprint(
+            filename,
+            output_format,
+            lang,
+            quality,
+            embedded_subtitles,
+            force_refresh,
+            content_length,
+        )
+        if idempotency_key
+        else None
+    )
+    try:
+        existing = JOB_MANAGER.get_by_idempotency(
+            user.user_id,
+            idempotency_key,
+            idempotency_fingerprint=idempotency_fingerprint,
+        )
+    except JobIdempotencyConflict as exc:
+        raise idempotency_conflict_error() from exc
+    if existing is not None:
+        existing["platform"] = "upload"
+        return JSONResponse(existing, status_code=202, headers={"Cache-Control": "no-store"})
+    if JOB_MANAGER.stats()["queued"] >= JOB_QUEUE_MAX_PENDING:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "source": "queue",
+                "reason": "queue_full",
+                "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+            },
+        )
+
+    upload_req = await stage_uploaded_video(
+        request,
+        filename=filename,
+        output_format=output_format,
+        lang=lang,
+        quality=quality,
+        embedded_subtitles=embedded_subtitles,
+        force_refresh=force_refresh,
+    )
+    transferred = False
+    payload = upload_req.model_dump(mode="json")
+    try:
+        cached_payload = cached_upload_payload(upload_req)
+        if cached_payload is not None:
+            job = JOB_MANAGER.submit_completed(
+                payload,
+                cached_payload,
+                owner_id=user.user_id,
+                idempotency_key=idempotency_key,
+                idempotency_fingerprint=idempotency_fingerprint,
+            )
+        else:
+            try:
+                job = JOB_MANAGER.submit(
+                    payload,
+                    owner_id=user.user_id,
+                    idempotency_key=idempotency_key,
+                    idempotency_fingerprint=idempotency_fingerprint,
+                )
+            except JobQueueFull as exc:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "source": "queue",
+                        "reason": "queue_full",
+                        "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                    },
+                ) from exc
+            transferred = not bool(job.get("reused"))
+        job["platform"] = "upload"
+        return JSONResponse(job, status_code=202, headers={"Cache-Control": "no-store"})
+    except JobIdempotencyConflict as exc:
+        raise idempotency_conflict_error() from exc
+    finally:
+        if not transferred:
+            discard_upload_payload(payload)
+
+
+@app.get("/api/jobs/{job_id}")
+def api_get_job(job_id: str, request: Request) -> JSONResponse:
+    user = require_auth_user(request)
+    try:
+        job = JOB_MANAGER.get(job_id, owner_id=user.user_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail={"reason": "job_not_found", "message": "任务不存在或已过期。"}) from exc
+    return JSONResponse(job, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/artifacts/{artifact_token}")
+def api_download_artifact(artifact_token: str, request: Request) -> FileResponse:
+    user = require_auth_user(request)
+    path, metadata = load_media_artifact(artifact_token, user.user_id)
+    filename = str(metadata.get("filename") or path.name)
+    content_type = str(metadata.get("content_type") or "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=content_type,
+        filename=filename,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.delete("/api/jobs/{job_id}")
+def api_cancel_job(job_id: str, request: Request) -> JSONResponse:
+    user = require_auth_user(request)
+    try:
+        job = JOB_MANAGER.cancel(job_id, owner_id=user.user_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail={"reason": "job_not_found", "message": "任务不存在或已过期。"}) from exc
+    if job["status"] == "running":
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": "job_running", "message": "任务已经开始处理，暂时无法安全取消。"},
+        )
+    return JSONResponse(job, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/download")
+def api_download(req: ExtractRequest, request: Request) -> Response:
+    payload = run_legacy_extraction(req, request)
+    filename = str(payload["filename"])
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+        "Cache-Control": "no-store",
+    }
+    return Response(payload["content"], media_type=payload["content_type"], headers=headers)
+
+
+@app.get("/api/download")
+def api_download_get_disabled() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "reason": "download_get_retired",
+            "message": "GET 下载接口已停用，请改用 POST /api/download 或网页任务流。",
+        },
+    )
+
+
+@app.get("/", response_class=FileResponse)
+def index() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-cache"},
+    )

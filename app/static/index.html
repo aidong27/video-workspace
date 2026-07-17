@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#ffffff">
+  <title>视频内容提取</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260717-3">
+  <script src="/static/app.js?v=20260717-3" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="视频内容提取首页">
+        <span class="brand-mark" aria-hidden="true">CC</span>
+        <span class="brand-copy">
+          <strong>视频提取工具</strong>
+          <span>Video Workspace</span>
+        </span>
+      </a>
+      <div class="topbar-status">
+        <span class="platform-chip bilibili" id="bilibili-chip"><i></i>B站</span>
+        <span class="platform-chip douyin" id="douyin-chip"><i></i>抖音</span>
+        <span class="platform-chip upload" id="upload-chip"><i></i>本地视频</span>
+        <div class="service-state" id="service-state" role="status" aria-live="polite">
+          <span class="state-dot" aria-hidden="true"></span>
+          <span id="service-label">正在连接</span>
+        </div>
+        <div class="account-area" id="account-area" aria-busy="true">
+          <span class="account-avatar" id="account-avatar" aria-hidden="true">?</span>
+          <span class="account-name" id="account-name">账号</span>
+          <button class="logout-button" id="logout-account" type="button" title="退出登录" disabled>退出</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <aside class="control-pane" aria-label="任务设置">
+      <form id="extract-form" novalidate>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">新建任务</p>
+            <h1 id="task-heading">提取字幕</h1>
+          </div>
+          <button class="icon-button" id="clear-input" type="button" title="清空输入" aria-label="清空输入">&times;</button>
+        </div>
+
+        <fieldset class="field-group operation-group">
+          <legend>提取内容</legend>
+          <div class="segmented-control operation-control">
+            <label>
+              <input type="radio" name="operation" value="subtitle" checked>
+              <span>字幕</span>
+            </label>
+            <label>
+              <input type="radio" name="operation" value="video">
+              <span>视频</span>
+            </label>
+            <label>
+              <input type="radio" name="operation" value="audio">
+              <span>音频</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field-group input-mode-group" id="input-mode-group">
+          <legend>视频来源</legend>
+          <div class="segmented-control input-mode-control">
+            <label>
+              <input type="radio" name="input-mode" value="link" checked>
+              <span>视频链接</span>
+            </label>
+            <label>
+              <input type="radio" name="input-mode" value="upload">
+              <span>上传视频</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div id="link-input-panel">
+          <label class="field-label" for="video-input">视频链接或 BV 号</label>
+          <div class="input-combo">
+            <textarea id="video-input" name="input" rows="3" maxlength="512" required autocomplete="off" spellcheck="false" placeholder="粘贴 B站或抖音视频链接"></textarea>
+            <button class="paste-button" id="paste-input" type="button">粘贴</button>
+          </div>
+          <div class="input-feedback">
+            <p class="field-error" id="input-error" role="alert"></p>
+            <span class="platform-detect" id="platform-detect"><i></i><span>等待识别平台</span></span>
+          </div>
+        </div>
+
+        <div class="upload-panel" id="upload-input-panel" hidden>
+          <label class="field-label" for="video-file">视频文件</label>
+          <input class="visually-hidden" id="video-file" type="file" accept="video/*,.mkv,.flv,.ts,.mts,.m2ts,.wmv">
+          <label class="upload-dropzone" id="upload-dropzone" for="video-file">
+            <span class="upload-symbol" aria-hidden="true">&#8593;</span>
+            <strong id="upload-file-title">选择视频</strong>
+            <span id="upload-file-detail">或拖放到这里</span>
+          </label>
+          <div class="input-feedback upload-feedback">
+            <p class="field-error" id="upload-error" role="alert"></p>
+            <span class="upload-limit" id="upload-limit">最大 512 MB</span>
+          </div>
+        </div>
+
+        <fieldset class="field-group" id="source-field-group">
+          <legend>字幕来源</legend>
+          <div class="segmented-control">
+            <label>
+              <input type="radio" name="source" value="auto" checked>
+              <span>智能提取</span>
+            </label>
+            <label>
+              <input type="radio" name="source" value="official">
+              <span>平台字幕</span>
+            </label>
+            <label>
+              <input type="radio" name="source" value="asr">
+              <span>语音识别</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field-group precision-group" id="quality-field-group">
+          <legend>解析精度</legend>
+          <div class="segmented-control quality-control">
+            <label>
+              <input type="radio" name="quality" value="fast" checked>
+              <span>快速</span>
+            </label>
+            <label>
+              <input type="radio" name="quality" value="accurate">
+              <span>精确</span>
+            </label>
+          </div>
+          <p class="mode-caption" id="quality-caption">适合吐字清晰的视频，优先缩短等待时间</p>
+        </fieldset>
+
+        <label class="toggle-row embedded-subtitle-row" id="embedded-subtitle-row">
+          <span>
+            <strong>视频画面中有字幕</strong>
+            <small>识别内嵌字幕轨或烧录在画面中的文字</small>
+          </span>
+          <input id="embedded-subtitles" type="checkbox" role="switch">
+        </label>
+
+        <div class="field-grid" id="subtitle-format-grid">
+          <div>
+            <label class="field-label" for="format-select">输出格式</label>
+            <select id="format-select" name="format">
+              <option value="txt">纯文本 (.txt)</option>
+              <option value="srt">SRT 字幕 (.srt)</option>
+              <option value="vtt">WebVTT (.vtt)</option>
+              <option value="markdown">Markdown (.md)</option>
+              <option value="json">JSON (.json)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="lang-select">语言提示</label>
+            <select id="lang-select" name="lang">
+              <option value="">自动识别</option>
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+            </select>
+          </div>
+        </div>
+
+        <details class="advanced" id="advanced-options">
+          <summary>
+            <span>更多选项</span>
+            <span class="chevron" aria-hidden="true"></span>
+          </summary>
+          <div class="advanced-body">
+            <label class="toggle-row" id="platform-ai-row">
+              <span>
+                <strong>优先使用平台自动字幕</strong>
+                <small>不可用时再进行本地语音识别</small>
+              </span>
+              <input id="allow-platform-ai" type="checkbox" role="switch" checked>
+            </label>
+            <label class="toggle-row" id="cookie-row" hidden>
+              <span>
+                <strong>允许使用 B站登录态</strong>
+                <small id="cookie-hint">服务端登录态已配置</small>
+              </span>
+              <input id="use-cookie" type="checkbox" role="switch">
+            </label>
+            <label class="toggle-row" id="force-refresh-row">
+              <span>
+                <strong id="force-refresh-label">忽略已有结果</strong>
+                <small id="force-refresh-hint">重新下载并处理视频</small>
+              </span>
+              <input id="force-refresh" type="checkbox" role="switch">
+            </label>
+          </div>
+        </details>
+
+        <button class="primary-button" id="extract-button" type="submit">
+          <span class="button-icon" aria-hidden="true">&#9654;</span>
+          <span id="extract-button-label">开始提取</span>
+        </button>
+      </form>
+
+      <section class="recent-section" id="recent-section" hidden aria-labelledby="recent-title">
+        <div class="recent-heading">
+          <h2 id="recent-title">最近任务</h2>
+          <button class="text-button" id="clear-history" type="button">清空</button>
+        </div>
+        <div class="recent-list" id="recent-list"></div>
+      </section>
+
+      <section class="login-section" id="login-section" hidden aria-labelledby="login-title">
+        <h2 id="login-title">B站登录态</h2>
+        <button class="secondary-button" id="login-start" type="button">生成二维码</button>
+        <p id="login-status" class="login-status" role="status"></p>
+        <img id="qr-image" alt="B站登录二维码">
+      </section>
+    </aside>
+
+    <section class="result-pane" aria-labelledby="result-title">
+      <header class="result-toolbar">
+        <div class="result-title-group">
+          <p class="eyebrow" id="result-kicker">任务工作区</p>
+          <h2 id="result-title">等待新任务</h2>
+        </div>
+        <div class="result-actions" id="result-actions" hidden>
+          <button class="toolbar-button" id="copy-result" type="button" title="复制全部字幕">
+            <span class="action-icon" aria-hidden="true">&#10697;</span><span>复制</span>
+          </button>
+          <button class="toolbar-button primary" id="download-result" type="button" title="下载当前格式">
+            <span class="action-icon" aria-hidden="true">&#8595;</span><span>下载</span>
+          </button>
+        </div>
+      </header>
+
+      <div class="status-panel" id="status-panel" aria-live="polite">
+        <div class="status-mark" id="status-mark" aria-hidden="true"><span>CC</span></div>
+        <div class="status-copy">
+          <div class="status-title-row">
+            <strong id="status-title">准备就绪</strong>
+            <span class="queue-badge" id="queue-badge" hidden></span>
+          </div>
+          <span id="status-detail">提交任务后，处理状态会显示在这里</span>
+          <span class="status-elapsed" id="status-elapsed"></span>
+        </div>
+        <button class="cancel-button" id="cancel-job" type="button" hidden>取消排队</button>
+        <div class="progress-track" id="progress-track" hidden><span id="progress-value"></span></div>
+      </div>
+
+      <div class="metadata-strip" id="metadata-strip" hidden></div>
+      <div class="notice" id="result-notice" hidden></div>
+
+      <div class="output-shell" id="output-shell" hidden>
+        <div class="output-stats">
+          <span id="output-format-label">TXT</span>
+          <span id="output-stats-label"></span>
+        </div>
+        <pre id="output" tabindex="0"></pre>
+      </div>
+
+      <div class="media-result" id="media-result" hidden>
+        <div class="media-file-mark" id="media-file-mark" aria-hidden="true">MP4</div>
+        <div class="media-file-copy">
+          <strong id="media-filename">视频文件</strong>
+          <span id="media-file-detail"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

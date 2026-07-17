@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#ffffff">
+  <title>登录 - 视频字幕提取</title>
+  <link rel="stylesheet" href="/static/auth.css?v=20260710-3">
+  <script src="/static/auth.js?v=20260710-3" defer></script>
+</head>
+<body>
+  <header class="auth-topbar">
+    <a class="brand" href="/login" aria-label="视频字幕提取">
+      <span class="brand-mark" aria-hidden="true">CC</span>
+      <span class="brand-copy">
+        <strong>视频字幕提取</strong>
+        <span>Caption Workspace</span>
+      </span>
+    </a>
+  </header>
+
+  <main class="auth-main">
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <div class="panel-heading">
+        <p id="auth-kicker">账号访问</p>
+        <h1 id="auth-title">登录</h1>
+      </div>
+
+      <nav class="auth-tabs" aria-label="账号操作">
+        <a id="login-tab" href="/login">登录</a>
+        <a id="register-tab" href="/register">注册</a>
+      </nav>
+
+      <form id="auth-form" novalidate>
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" minlength="3" maxlength="32" autocomplete="username" autocapitalize="none" spellcheck="false" required placeholder="3-32 位字母或数字">
+
+        <div class="register-field" id="invite-field" hidden>
+          <label for="invite-code">邀请码</label>
+          <input id="invite-code" name="invite_code" type="password" minlength="4" maxlength="128" autocomplete="off" spellcheck="false" placeholder="输入邀请码">
+        </div>
+
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required placeholder="至少 8 个字符">
+
+        <div class="register-field" id="confirm-field" hidden>
+          <label for="confirm-password">确认密码</label>
+          <input id="confirm-password" name="confirm_password" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="再次输入密码">
+        </div>
+
+        <p class="form-error" id="form-error" role="alert" aria-live="polite"></p>
+        <button class="submit-button" id="submit-button" type="submit">
+          <span class="button-spinner" aria-hidden="true"></span>
+          <span id="submit-label">登录</span>
+        </button>
+      </form>
+
+      <p class="auth-switch" id="auth-switch">没有账号？<a href="/register">使用邀请码注册</a></p>
+    </section>
+
+    <div class="service-status" id="service-status" role="status" aria-live="polite">
+      <span aria-hidden="true"></span>
+      <strong>正在检查服务</strong>
+    </div>
+  </main>
+</body>
+</html>
