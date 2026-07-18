@@ -300,8 +300,8 @@ class JobManager:
             return
         try:
             self.discarder(dict(request))
-        except Exception:
-            LOGGER.exception("caption job resource cleanup failed")
+        except Exception as exc:
+            LOGGER.error("caption job resource cleanup failed error_type=%s", type(exc).__name__)
 
     def _public_locked(self, record: JobRecord) -> dict[str, Any]:
         queued_ids = [
@@ -393,8 +393,8 @@ class JobManager:
                         record.error_status = exc.status_code
                         record.updated_at = time.time()
                         record.done_event.set()
-            except Exception:
-                LOGGER.exception("caption job failed", extra={"job_id": job_id})
+            except Exception as exc:
+                LOGGER.error("caption job failed error_type=%s", type(exc).__name__)
                 with self.lock:
                     record = self.records.get(job_id)
                     if record:

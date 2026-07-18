@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import errno
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import secrets
 import shutil
 import string
-import subprocess
 from threading import Lock
 import time
 from typing import Any
@@ -19,9 +20,10 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import httpx
 
 from app.network import validate_public_request
+from app.processes import ManagedProcessTimeout, run_managed_process
 
 
-DOUYIN_ADAPTER_VERSION = 2
+DOUYIN_ADAPTER_VERSION = 3
 DOUYIN_URL_RE = re.compile(
     r"(https?://(?:[A-Za-z0-9-]+\.)?(?:douyin\.com|iesdouyin\.com)[^\s<>'\"]+|"
     r"(?:[A-Za-z0-9-]+\.)?(?:douyin\.com|iesdouyin\.com)/[^\s<>'\"]+)",
@@ -32,6 +34,7 @@ TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？、)]}）】》"
 DOUYIN_COOKIE_LOCK = Lock()
 DOUYIN_DETAIL_LOCK = Lock()
 DOUYIN_DETAIL_CACHE: dict[str, tuple[float, "DouyinVideo"]] = {}
+LOGGER = logging.getLogger(__name__)
 
 
 class DouyinAdapterError(Exception):
@@ -135,6 +138,7 @@ def extract_douyin_video_id(url: str) -> str | None:
 
 def _resolve_douyin_redirect(url: str) -> str:
     current = url
+    visited: set[str] = set()
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -150,8 +154,14 @@ def _resolve_douyin_redirect(url: str) -> str:
             event_hooks={"request": [validate_public_request]},
         ) as client:
             for _ in range(6):
+                if not _host_allowed(urlparse(current).hostname):
+                    raise DouyinAdapterError(400, "抖音短链接跳转到了不受信任的站点。", "short_link_untrusted")
+                if current in visited:
+                    raise DouyinAdapterError(508, "抖音短链接发生循环跳转。", "short_link_loop")
+                visited.add(current)
                 response = client.get(current)
                 if response.status_code not in {301, 302, 303, 307, 308}:
+                    response.raise_for_status()
                     break
                 location = response.headers.get("location")
                 if not location:
@@ -160,6 +170,8 @@ def _resolve_douyin_redirect(url: str) -> str:
                 if not _host_allowed(urlparse(next_url).hostname):
                     raise DouyinAdapterError(400, "抖音短链接跳转到了不受信任的站点。", "short_link_untrusted")
                 current = next_url
+            else:
+                raise DouyinAdapterError(508, "抖音短链接跳转次数过多。", "short_link_loop")
     except DouyinAdapterError:
         raise
     except httpx.HTTPError as exc:
@@ -266,19 +278,24 @@ def refresh_douyin_cookies(target_url: str) -> dict[str, str]:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
     )
+    raw_cookies: list[dict[str, Any]] = []
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                executable_path=str(executable),
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-crash-reporter",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+            browser = None
+            context = None
+            page = None
             try:
+                browser = playwright.chromium.launch(
+                    executable_path=str(executable),
+                    headless=True,
+                    timeout=60_000,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-crash-reporter",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
                 context = browser.new_context(
                     locale="zh-CN",
                     timezone_id="Asia/Shanghai",
@@ -291,7 +308,13 @@ def refresh_douyin_cookies(target_url: str) -> dict[str, str]:
                 page.wait_for_timeout(wait_ms)
                 raw_cookies = context.cookies()
             finally:
-                browser.close()
+                for resource in (page, context, browser):
+                    if resource is None:
+                        continue
+                    try:
+                        resource.close()
+                    except Exception:
+                        pass
     except Exception as exc:
         raise DouyinAdapterError(502, f"抖音匿名会话初始化失败：{exc}", "douyin_cookie_refresh_failed") from exc
 
@@ -311,12 +334,19 @@ def douyin_cookies(target_url: str, force_refresh: bool = False) -> dict[str, st
         cached = _read_cached_cookies()
         if cached:
             return cached
-    with DOUYIN_COOKIE_LOCK:
+    acquired = DOUYIN_COOKIE_LOCK.acquire(
+        timeout=_env_int("DOUYIN_BROWSER_LOCK_TIMEOUT_SECONDS", 90, 10)
+    )
+    if not acquired:
+        raise DouyinAdapterError(429, "抖音浏览器资源正忙，请稍后重试。", "douyin_browser_busy")
+    try:
         if not force_refresh:
             cached = _read_cached_cookies()
             if cached:
                 return cached
         return refresh_douyin_cookies(target_url)
+    finally:
+        DOUYIN_COOKIE_LOCK.release()
 
 
 def _fake_ms_token() -> str:
@@ -562,101 +592,136 @@ def download_douyin_media(
         "Referer": "https://www.douyin.com/",
     }
     last_error: Exception | None = None
-    for index, url in enumerate(video.media_urls[:10]):
-        partial = target_dir / f"{video.video_id}.{index}.partial"
-        final = target_dir / f"{video.video_id}.mp4"
-        downloaded = 0
-        try:
-            with httpx.Client(
-                timeout=_env_int("ASR_DOWNLOAD_TIMEOUT_SECONDS", 300, 30),
-                follow_redirects=True,
-                headers=headers,
-                cookies=_scoped_douyin_cookies(video.cookies),
-                event_hooks={"request": [validate_public_request]},
-            ) as client:
-                with client.stream("GET", url) as response:
-                    response.raise_for_status()
-                    content_length = int(response.headers.get("content-length") or 0)
-                    if content_length > max_bytes:
-                        raise DouyinAdapterError(413, "抖音视频文件超过服务器下载限制。", "download_too_large")
-                    content_type = (response.headers.get("content-type") or "").lower()
-                    if content_type and not any(kind in content_type for kind in ("video", "audio", "octet-stream")):
-                        raise RuntimeError(f"unexpected content type {content_type}")
-                    with partial.open("wb") as handle:
-                        for chunk in response.iter_bytes(1024 * 1024):
-                            if not chunk:
-                                continue
-                            downloaded += len(chunk)
-                            if downloaded > max_bytes:
-                                raise DouyinAdapterError(413, "抖音视频文件超过服务器下载限制。", "download_too_large")
-                            handle.write(chunk)
-            if downloaded < 1024:
-                raise RuntimeError("downloaded media is empty")
-            os.replace(partial, final)
-            ffprobe = shutil.which("ffprobe")
-            if not ffprobe:
-                final.unlink(missing_ok=True)
-                raise DouyinAdapterError(503, "服务器缺少 ffprobe。", "ffmpeg_missing")
-            probe = subprocess.run(
-                [
-                    ffprobe,
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration:stream=index,codec_type",
-                    "-of",
-                    "json",
-                    str(final),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
-            )
+    missing_requested_stream = False
+    refreshed_urls = False
+    current_video = video
+    while True:
+        for index, url in enumerate(current_video.media_urls[:10]):
+            partial = target_dir / f"{video.video_id}.{index}.partial"
+            final = target_dir / f"{video.video_id}.mp4"
+            partial.unlink(missing_ok=True)
+            final.unlink(missing_ok=True)
+            downloaded = 0
             try:
-                probe_data = json.loads(probe.stdout) if probe.returncode == 0 else {}
-                streams = probe_data.get("streams") or []
-                has_audio = any(item.get("codec_type") == "audio" for item in streams if isinstance(item, dict))
-                has_video = any(item.get("codec_type") == "video" for item in streams if isinstance(item, dict))
-                media_duration = float((probe_data.get("format") or {}).get("duration") or 0) or None
-            except (TypeError, ValueError, json.JSONDecodeError):
-                has_audio = False
-                has_video = False
-                media_duration = None
-            if require_video and not has_video:
-                final.unlink(missing_ok=True)
-                raise RuntimeError("downloaded media has no video stream")
-            if not require_video and not has_audio:
-                final.unlink(missing_ok=True)
-                raise RuntimeError("downloaded media has no audio stream")
-            if video.duration and media_duration:
-                allowed_shortfall = max(3.0, video.duration * 0.02)
-                if media_duration < video.duration - allowed_shortfall:
-                    final.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"downloaded media duration {media_duration:.1f}s is shorter than video {video.duration:.1f}s"
+                with httpx.Client(
+                    timeout=_env_int("ASR_DOWNLOAD_TIMEOUT_SECONDS", 300, 30),
+                    follow_redirects=True,
+                    headers=headers,
+                    cookies=_scoped_douyin_cookies(current_video.cookies),
+                    event_hooks={"request": [validate_public_request]},
+                ) as client:
+                    with client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        content_length = int(response.headers.get("content-length") or 0)
+                        if content_length > max_bytes:
+                            raise DouyinAdapterError(413, "抖音视频文件超过服务器下载限制。", "download_too_large")
+                        content_type = (response.headers.get("content-type") or "").lower()
+                        if content_type and not any(
+                            kind in content_type for kind in ("video", "audio", "octet-stream")
+                        ):
+                            raise RuntimeError("media endpoint returned a non-media response")
+                        with partial.open("xb") as handle:
+                            for chunk in response.iter_bytes(1024 * 1024):
+                                if not chunk:
+                                    continue
+                                downloaded += len(chunk)
+                                if downloaded > max_bytes:
+                                    raise DouyinAdapterError(
+                                        413,
+                                        "抖音视频文件超过服务器下载限制。",
+                                        "download_too_large",
+                                    )
+                                handle.write(chunk)
+                if downloaded < 1024:
+                    raise RuntimeError("downloaded media is empty")
+                os.replace(partial, final)
+                ffprobe = shutil.which("ffprobe")
+                if not ffprobe:
+                    raise DouyinAdapterError(503, "服务器缺少 ffprobe。", "ffmpeg_missing")
+                try:
+                    probe = run_managed_process(
+                        [
+                            ffprobe,
+                            "-v",
+                            "error",
+                            "-show_entries",
+                            "format=duration:stream=index,codec_type",
+                            "-of",
+                            "json",
+                            str(final),
+                        ],
+                        timeout=30,
                     )
-            return final, {
-                "id": video.video_id,
-                "title": video.title,
-                "author": video.author,
-                "duration": video.duration,
-                "webpage_url": video.webpage_url,
-                "audio_download": "douyin_signed_api",
-                "media_bytes": downloaded,
-                "media_duration": media_duration,
-                "media_candidate_index": index,
-                "media_has_video": has_video,
-                "media_has_audio": has_audio,
-            }
+                except OSError as exc:
+                    raise DouyinAdapterError(503, "无法启动 ffprobe 媒体探测进程。", "ffmpeg_failed") from exc
+                try:
+                    probe_data = json.loads(probe.stdout) if probe.returncode == 0 else {}
+                    streams = probe_data.get("streams") or []
+                    has_audio = any(
+                        item.get("codec_type") == "audio" for item in streams if isinstance(item, dict)
+                    )
+                    has_video = any(
+                        item.get("codec_type") == "video" for item in streams if isinstance(item, dict)
+                    )
+                    media_duration = float((probe_data.get("format") or {}).get("duration") or 0) or None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    has_audio = False
+                    has_video = False
+                    media_duration = None
+                if (require_video and not has_video) or (not require_video and not has_audio):
+                    missing_requested_stream = True
+                    raise RuntimeError("downloaded media does not contain the requested stream")
+                if current_video.duration and media_duration:
+                    allowed_shortfall = max(3.0, current_video.duration * 0.02)
+                    if media_duration < current_video.duration - allowed_shortfall:
+                        raise RuntimeError("downloaded media is shorter than the platform metadata")
+                return final, {
+                    "id": current_video.video_id,
+                    "title": current_video.title,
+                    "author": current_video.author,
+                    "duration": current_video.duration,
+                    "webpage_url": current_video.webpage_url,
+                    "audio_download": "douyin_signed_api",
+                    "media_bytes": downloaded,
+                    "media_duration": media_duration,
+                    "media_candidate_index": index,
+                    "media_has_video": has_video,
+                    "media_has_audio": has_audio,
+                    "media_urls_refreshed": refreshed_urls,
+                }
+            except DouyinAdapterError as exc:
+                partial.unlink(missing_ok=True)
+                final.unlink(missing_ok=True)
+                if exc.reason != "download_too_large":
+                    raise
+                last_error = exc
+            except ManagedProcessTimeout as exc:
+                last_error = exc
+                partial.unlink(missing_ok=True)
+                final.unlink(missing_ok=True)
+            except Exception as exc:
+                if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                    partial.unlink(missing_ok=True)
+                    final.unlink(missing_ok=True)
+                    raise DouyinAdapterError(507, "服务器下载目录剩余空间不足。", "disk_space_low") from exc
+                last_error = exc
+                partial.unlink(missing_ok=True)
+                final.unlink(missing_ok=True)
+
+        if isinstance(last_error, DouyinAdapterError) and last_error.reason == "download_too_large":
+            raise last_error
+        if refreshed_urls:
+            break
+        refreshed_urls = True
+        try:
+            current_video = get_douyin_video(video.webpage_url, force_refresh=True)
         except DouyinAdapterError as exc:
-            partial.unlink(missing_ok=True)
-            if exc.reason != "download_too_large":
-                raise
             last_error = exc
-        except Exception as exc:
-            last_error = exc
-            partial.unlink(missing_ok=True)
-    if isinstance(last_error, DouyinAdapterError):
-        raise last_error
-    raise DouyinAdapterError(502, f"抖音媒体下载失败：{last_error or 'no usable media URL'}", "download_failed")
+            break
+
+    if missing_requested_stream:
+        reason = "video_stream_missing" if require_video else "no_audio_stream"
+        message = "下载的视频没有视频轨。" if require_video else "下载的视频没有音轨。"
+        raise DouyinAdapterError(422, message, reason)
+    LOGGER.warning("Douyin media download failed: %s", type(last_error).__name__ if last_error else "no URL")
+    raise DouyinAdapterError(502, "抖音媒体下载失败，请稍后重试。", "download_failed")

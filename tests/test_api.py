@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -15,6 +16,7 @@ class ApiIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
+        self.root = root
         self.original_paths = (
             main.ASR_TMP_DIR,
             main.ASR_MODEL_DIR,
@@ -139,6 +141,19 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(health.json()["extraction_modes"]["fast"]["model"], main.DEFAULT_ASR_MODEL)
         self.assertEqual(health.json()["extraction_modes"]["accurate"]["model"], main.ACCURATE_ASR_MODEL)
         self.assertIn("enabled", health.json()["ocr"])
+        self.assertIn("available", health.json()["disk"])
+        self.assertIn("ffmpeg_available", health.json())
+        encoded = json.dumps(health.json())
+        self.assertNotIn(str(self.root), encoded)
+        self.assertNotIn("AUTH_DB_PATH", encoded)
+        self.assertNotIn("INVITE_CODE_HASH", encoded)
+
+    def test_unknown_job_reports_restart_or_expiry(self) -> None:
+        response = self.client.get(f"/api/jobs/{'0' * 32}")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"]["code"], "job_expired")
+        self.assertTrue(response.json()["detail"]["retryable"])
 
     def test_disabled_douyin_is_not_reported_ready(self) -> None:
         adapter = {
@@ -263,6 +278,15 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(download.status_code, 200)
         self.assertEqual(download.content, b"downloadable-video")
         self.assertIn("attachment", download.headers["content-disposition"])
+        ranged = self.client.get(
+            job["result"]["download_url"],
+            headers={"Range": "bytes=0-3"},
+        )
+        self.assertIn(ranged.status_code, {200, 206})
+        self.assertEqual(
+            ranged.content,
+            b"down" if ranged.status_code == 206 else b"downloadable-video",
+        )
 
         self.client.post("/api/auth/logout")
         second = self.client.post(
@@ -272,6 +296,18 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         forbidden = self.client.get(job["result"]["download_url"])
         self.assertEqual(forbidden.status_code, 404)
+        forbidden_job = self.client.get(f"/api/jobs/{job['id']}")
+        self.assertEqual(forbidden_job.status_code, 404)
+
+
+class FrontendRecoveryTests(unittest.TestCase):
+    def test_expired_backend_job_clears_saved_frontend_state(self) -> None:
+        script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        finish_block = script.split("function finishWithError", 1)[1].split("function handleJob", 1)[0]
+        poll_block = script.split("async function pollJob", 1)[1].split("function submissionKey", 1)[0]
+
+        self.assertIn("clearActiveJob();", finish_block)
+        self.assertIn("finishWithError(data, response.status);", poll_block)
 
 
 if __name__ == "__main__":

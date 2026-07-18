@@ -119,6 +119,8 @@
     asr_busy: "等待语音识别资源超时，请稍后重试。",
     asr_duration_too_long: "视频时长超过当前服务限制。",
     asr_timeout: "语音识别超时，可稍后重试或使用更短的视频。",
+    asr_worker_crashed: "语音识别进程意外退出，可能是内存不足，请稍后重试。",
+    asr_model_download_failed: "语音识别模型不可用，请检查模型缓存与服务器网络。",
     download_failed: "视频、音频或字幕下载失败，请稍后重试。",
     asr_failed: "本地语音识别失败，请稍后重试。",
     ocr_missing: "画面字幕识别组件尚未准备完成。",
@@ -127,6 +129,7 @@
     ocr_timeout: "画面字幕识别超时，请尝试更短的视频。",
     platform_temporarily_unavailable: "平台暂时拒绝了视频请求，请稍后重试。",
     douyin_browser_missing: "抖音处理组件尚未准备完成。",
+    douyin_browser_busy: "抖音浏览器资源正忙，请稍后重试。",
     douyin_adapter_missing: "抖音处理组件尚未准备完成。",
     unsupported_upload_format: "暂不支持这种视频格式。",
     invalid_upload_media: "无法读取这个视频，请换一个文件。",
@@ -141,9 +144,15 @@
     video_stream_missing: "没有找到可下载的视频画面。",
     audio_stream_missing: "没有找到可提取的音轨。",
     media_convert_failed: "音频转换失败，请稍后重试。",
+    ffmpeg_failed: "媒体探测或转换失败，请确认文件可正常播放。",
+    disk_space_low: "服务器剩余磁盘空间不足，请稍后重试。",
+    no_audio_stream: "视频没有音轨，无法识别语音或生成 MP3。",
+    subtitle_unavailable: "没有找到可读取的字幕或语音内容。",
+    job_queue_full: "任务队列已满，请稍后重试。",
+    job_expired: "服务可能已重启或任务已过期，请重新提交。",
     artifact_expired: "下载文件已过期，请重新提取。",
     artifact_not_found: "下载文件不存在或已过期。",
-    job_not_found: "任务已过期，请重新提交。",
+    job_not_found: "服务可能已重启或任务已过期，请重新提交。",
     idempotency_conflict: "这次提交与上一次请求不一致，请重新提交。",
     authentication_required: "登录已失效，正在返回登录页。"
   };
@@ -581,6 +590,8 @@
   function friendlyError(value, status) {
     const detail = errorDetail(value);
     const reason = detail && typeof detail === "object" ? detail.reason : "";
+    const code = detail && typeof detail === "object" ? detail.code : "";
+    if (code && errorMessages[code]) return errorMessages[code];
     if (reason && errorMessages[reason]) return errorMessages[reason];
     if (status === 401) return "访问凭据已失效，请重新登录。";
     if (status === 413) return "视频或音频文件超过当前大小限制。";

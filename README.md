@@ -25,7 +25,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 playwright install chromium
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
 Open `http://127.0.0.1:8000`. Before sharing the service, set a non-empty
@@ -105,6 +105,7 @@ JOB_RESULT_TTL_SECONDS=3600
 ASR_CONCURRENCY_LIMIT=1
 ASR_QUEUE_WAIT_SECONDS=900
 ASR_TIMEOUT_SECONDS=300
+ASR_TIMEOUT_PER_AUDIO_SECOND=0.5
 ASR_FAST_BEAM_SIZE=1
 ASR_ACCURATE_MODEL=small
 ASR_ACCURATE_COMPUTE_TYPE=int8
@@ -112,6 +113,8 @@ ASR_ACCURATE_CPU_THREADS=3
 ASR_ACCURATE_BEAM_SIZE=5
 ASR_ACCURATE_VAD_FILTER=true
 ASR_ACCURATE_TIMEOUT_SECONDS=1800
+ASR_ACCURATE_TIMEOUT_PER_AUDIO_SECOND=1.5
+ASR_MAX_TIMEOUT_SECONDS=7200
 ASR_DOWNLOAD_TIMEOUT_SECONDS=300
 ASR_MAX_AUDIO_SECONDS=3600
 BILI_MAX_DOWNLOAD_BYTES=1000000000
@@ -129,12 +132,21 @@ OCR_CROP_TOP_RATIO=0.45
 OCR_MIN_CONFIDENCE=0.55
 OCR_CPU_THREADS=2
 OCR_MAX_FRAMES=12000
+MIN_FREE_DISK_BYTES=2147483648
+MIN_FREE_DISK_RATIO=0.05
+PROCESS_ERROR_OUTPUT_BYTES=16384
 RESULT_CACHE_TTL_SECONDS=604800
 RESULT_CACHE_MAX_ITEMS=100
 LEGACY_WAIT_TIMEOUT_SECONDS=1200
 ```
 
-Fast ASR uses the CPU-friendly `tiny` int8 model. Accurate ASR uses `small` int8 with VAD and beam size 5. Models remain warm in a child process between jobs; OCR and ASR share the single heavy-work semaphore to stay within a 4 GB memory budget.
+Fast ASR uses the CPU-friendly `tiny` int8 model. Accurate ASR uses `small` int8 with VAD and beam size 5. The configured ASR timeouts are minimums; long WAV inputs receive a duration-based budget capped by `ASR_MAX_TIMEOUT_SECONDS`. Models remain warm in a child process between jobs; prewarming, OCR, and ASR share the single heavy-work semaphore to stay within a 4 GB memory budget.
+
+Uploads, media downloads, ASR normalization, and OCR preparation check both the absolute and proportional free-disk thresholds before starting. FFmpeg and ffprobe output is continuously drained but capped at `PROCESS_ERROR_OUTPUT_BYTES`, and timed-out processes are terminated, killed if necessary, and reaped.
+
+Run exactly one Uvicorn application worker. Job state and the warm ASR process are intentionally local to this single 4C/4G instance; additional Uvicorn workers would create inconsistent job views and duplicate model memory.
+
+`GET /api/health` reports worker, queue, FFmpeg/ffprobe, ASR warm-state, and disk-threshold status without returning paths, Cookie values, users, or environment variables.
 
 ## Douyin runtime
 
@@ -144,6 +156,7 @@ DOUYIN_COOKIE_STATE_PATH=./var/douyin/cookies.json
 DOUYIN_COOKIE_TTL_SECONDS=1800
 DOUYIN_DETAIL_CACHE_TTL_SECONDS=600
 DOUYIN_BROWSER_WAIT_MS=6000
+DOUYIN_BROWSER_LOCK_TIMEOUT_SECONDS=90
 DOUYIN_MAX_DOWNLOAD_BYTES=1000000000
 PLAYWRIGHT_BROWSERS_PATH=./var/playwright
 ```

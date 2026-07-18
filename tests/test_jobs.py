@@ -18,6 +18,24 @@ def wait_for_terminal(manager: JobManager, job_id: str, timeout: float = 2.0):
 
 
 class JobManagerTests(unittest.TestCase):
+    def test_internal_failure_log_does_not_echo_exception_details(self) -> None:
+        def processor(_payload, _update):
+            raise RuntimeError("secret at /tmp/private/video.mp4")
+
+        manager = JobManager(processor)
+        manager.start()
+        try:
+            with self.assertLogs("app.jobs", level="ERROR") as captured:
+                submitted = manager.submit({})
+                result = wait_for_terminal(manager, submitted["id"])
+            output = "\n".join(captured.output)
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("RuntimeError", output)
+            self.assertNotIn("secret", output)
+            self.assertNotIn("/tmp", output)
+        finally:
+            manager.stop()
+
     def test_job_progress_and_result(self) -> None:
         def processor(payload, update):
             update("work", 55, "处理中")
@@ -81,6 +99,54 @@ class JobManagerTests(unittest.TestCase):
 
         self.assertEqual(second["status"], "queued")
         self.assertEqual(manager.stats()["queued"], 1)
+
+    def test_running_job_does_not_consume_pending_capacity(self) -> None:
+        started = Event()
+        release = Event()
+
+        def processor(payload, _update):
+            if payload["value"] == "running":
+                started.set()
+                release.wait(2)
+            return payload
+
+        manager = JobManager(processor, max_pending=1, worker_count=1)
+        manager.start()
+        try:
+            manager.submit({"value": "running"})
+            self.assertTrue(started.wait(1))
+            manager.submit({"value": "queued"})
+            with self.assertRaises(JobQueueFull):
+                manager.submit({"value": "overflow"})
+            self.assertEqual(manager.stats()["running"], 1)
+            self.assertEqual(manager.stats()["queued"], 1)
+        finally:
+            release.set()
+            manager.stop()
+
+    def test_shutdown_discards_queued_resources(self) -> None:
+        started = Event()
+        release = Event()
+        discarded = []
+
+        def processor(payload, _update):
+            if payload["value"] == "running":
+                started.set()
+                release.wait(2)
+            return payload
+
+        manager = JobManager(processor, worker_count=1, discarder=discarded.append)
+        manager.start()
+        try:
+            manager.submit({"value": "running"})
+            self.assertTrue(started.wait(1))
+            queued = manager.submit({"value": "queued"})
+            manager.stop(timeout=0.01)
+            self.assertEqual(manager.get(queued["id"])["status"], "cancelled")
+            self.assertEqual(discarded, [{"value": "queued"}])
+        finally:
+            release.set()
+            manager.stop()
 
     def test_job_is_scoped_to_owner(self) -> None:
         manager = JobManager(lambda payload, update: payload)
