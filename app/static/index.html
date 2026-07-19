@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#ffffff">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#070910">
   <title>视频内容提取</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260717-3">
-  <script src="/static/app.js?v=20260717-3" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260719-1">
+  <script src="/static/app.js?v=20260719-1" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -44,7 +44,7 @@
             <p class="eyebrow">新建任务</p>
             <h1 id="task-heading">提取字幕</h1>
           </div>
-          <button class="icon-button" id="clear-input" type="button" title="清空输入" aria-label="清空输入">&times;</button>
+          <button class="icon-button" id="clear-input" type="button" title="清空输入" aria-label="清空输入"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
         </div>
 
         <fieldset class="field-group operation-group">
@@ -95,7 +95,7 @@
           <label class="field-label" for="video-file">视频文件</label>
           <input class="visually-hidden" id="video-file" type="file" accept="video/*,.mkv,.flv,.ts,.mts,.m2ts,.wmv">
           <label class="upload-dropzone" id="upload-dropzone" for="video-file">
-            <span class="upload-symbol" aria-hidden="true">&#8593;</span>
+            <span class="upload-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0 4.5 4.5M12 4 7.5 8.5M4.5 20h15"/></svg></span>
             <strong id="upload-file-title">选择视频</strong>
             <span id="upload-file-detail">或拖放到这里</span>
           </label>
@@ -200,7 +200,7 @@
         </details>
 
         <button class="primary-button" id="extract-button" type="submit">
-          <span class="button-icon" aria-hidden="true">&#9654;</span>
+          <span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13c0 .85.93 1.37 1.65.93l10.4-6.5c.7-.44.7-1.52 0-1.96L9.65 4.57A1.08 1.08 0 0 0 8 5.5z"/></svg></span>
           <span id="extract-button-label">开始提取</span>
         </button>
       </form>
@@ -229,10 +229,10 @@
         </div>
         <div class="result-actions" id="result-actions" hidden>
           <button class="toolbar-button" id="copy-result" type="button" title="复制全部字幕">
-            <span class="action-icon" aria-hidden="true">&#10697;</span><span>复制</span>
+            <span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span>复制</span>
           </button>
           <button class="toolbar-button primary" id="download-result" type="button" title="下载当前格式">
-            <span class="action-icon" aria-hidden="true">&#8595;</span><span>下载</span>
+            <span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4.5 20h15"/></svg></span><span>下载</span>
           </button>
         </div>
       </header>
