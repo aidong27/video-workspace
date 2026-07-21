@@ -1,7 +1,10 @@
 import base64
+import asyncio
 import copy
 from contextlib import contextmanager
 from difflib import SequenceMatcher
+import errno
+import gc
 import hashlib
 from http.cookies import SimpleCookie
 import importlib.util
@@ -12,15 +15,19 @@ import math
 from multiprocessing import get_context
 import os
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Full
 import re
+import resource
 import secrets
 import shutil
+import statistics
 import subprocess
+import sys
 import tempfile
-from threading import BoundedSemaphore, Lock, local
+from threading import BoundedSemaphore, Lock, Thread, local
 import time
 import urllib.parse
+import wave
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Literal
@@ -29,6 +36,7 @@ from urllib.parse import quote, urljoin
 import httpx
 import qrcode
 import qrcode.image.svg
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -73,9 +81,19 @@ from app.jobs import (
     job_request_fingerprint,
 )
 from app.network import validate_public_request
+from app.processes import (
+    LimitedStreamCapture,
+    ManagedProcessTimeout,
+    run_managed_process,
+    terminate_child_process,
+    terminate_child_process_group,
+    terminate_process,
+    terminate_process_id,
+)
 
 
 LOGGER = logging.getLogger(__name__)
+load_dotenv()
 
 
 @dataclass
@@ -85,7 +103,7 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2026-07-17-precision-2")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2026-07-21-asr-quality-2")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -100,21 +118,54 @@ RESULT_CACHE_DIR = Path(os.getenv("RESULT_CACHE_DIR", str(ASR_CACHE_DIR / "resul
 BILI_COOKIE_PATH = Path(
     os.getenv("BILI_COOKIE_PATH", "/opt/bili-subtitle-tool/var/auth/bili-cookie.txt")
 )
-DEFAULT_ASR_MODEL = os.getenv("ASR_MODEL", "tiny").strip() or "tiny"
+DEFAULT_ASR_MODEL = os.getenv("ASR_MODEL", "small").strip() or "small"
 ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8").strip() or "int8"
 ASR_DEVICE = os.getenv("ASR_DEVICE", "cpu").strip() or "cpu"
-ASR_CPU_THREADS = max(1, int(os.getenv("ASR_CPU_THREADS", "2")))
-ASR_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_TIMEOUT_SECONDS", "300")))
-ACCURATE_ASR_MODEL = os.getenv("ASR_ACCURATE_MODEL", "small").strip() or "small"
-ACCURATE_ASR_COMPUTE_TYPE = os.getenv("ASR_ACCURATE_COMPUTE_TYPE", "int8").strip() or "int8"
+ASR_CPU_THREADS = max(1, int(os.getenv("ASR_CPU_THREADS", "3")))
+ASR_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_TIMEOUT_SECONDS", "1800")))
+ACCURATE_ASR_MODEL = os.getenv("ASR_ACCURATE_MODEL", DEFAULT_ASR_MODEL).strip() or DEFAULT_ASR_MODEL
+ACCURATE_ASR_COMPUTE_TYPE = (
+    os.getenv("ASR_ACCURATE_COMPUTE_TYPE", ASR_COMPUTE_TYPE).strip() or ASR_COMPUTE_TYPE
+)
 ACCURATE_ASR_DEVICE = os.getenv("ASR_ACCURATE_DEVICE", ASR_DEVICE).strip() or ASR_DEVICE
-ACCURATE_ASR_CPU_THREADS = max(1, int(os.getenv("ASR_ACCURATE_CPU_THREADS", "3")))
-ACCURATE_ASR_TIMEOUT_SECONDS = max(ASR_TIMEOUT_SECONDS, int(os.getenv("ASR_ACCURATE_TIMEOUT_SECONDS", "1800")))
-ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "1"))))
+ACCURATE_ASR_CPU_THREADS = max(
+    1,
+    int(os.getenv("ASR_ACCURATE_CPU_THREADS", str(ASR_CPU_THREADS))),
+)
+ACCURATE_ASR_TIMEOUT_SECONDS = max(
+    ASR_TIMEOUT_SECONDS,
+    int(os.getenv("ASR_ACCURATE_TIMEOUT_SECONDS", "3600")),
+)
+ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "3"))))
 ACCURATE_ASR_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_ACCURATE_BEAM_SIZE", "5"))))
 ASR_DOWNLOAD_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_DOWNLOAD_TIMEOUT_SECONDS", "300")))
-ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "900")))
+ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "1800")))
 ASR_MAX_AUDIO_SECONDS = max(30, int(os.getenv("ASR_MAX_AUDIO_SECONDS", "3600")))
+ASR_PROMPT_MAX_CHARS = min(1000, max(50, int(os.getenv("ASR_PROMPT_MAX_CHARS", "300"))))
+try:
+    ASR_VAD_THRESHOLD = min(0.95, max(0.05, float(os.getenv("ASR_VAD_THRESHOLD", "0.45"))))
+except ValueError:
+    ASR_VAD_THRESHOLD = 0.45
+ASR_VAD_MIN_SILENCE_MS = max(100, int(os.getenv("ASR_VAD_MIN_SILENCE_MS", "700")))
+ASR_VAD_SPEECH_PAD_MS = max(0, int(os.getenv("ASR_VAD_SPEECH_PAD_MS", "300")))
+try:
+    ASR_LOW_LOGPROB_THRESHOLD = float(os.getenv("ASR_LOW_LOGPROB_THRESHOLD", "-1.0"))
+except ValueError:
+    ASR_LOW_LOGPROB_THRESHOLD = -1.0
+try:
+    ASR_RETRY_REPETITION_RATIO = min(
+        1.0,
+        max(0.0, float(os.getenv("ASR_RETRY_REPETITION_RATIO", "0.25"))),
+    )
+except ValueError:
+    ASR_RETRY_REPETITION_RATIO = 0.25
+try:
+    ASR_RETRY_LOW_CONFIDENCE_RATIO = min(
+        1.0,
+        max(0.0, float(os.getenv("ASR_RETRY_LOW_CONFIDENCE_RATIO", "0.65"))),
+    )
+except ValueError:
+    ASR_RETRY_LOW_CONFIDENCE_RATIO = 0.65
 BILI_MAX_DOWNLOAD_BYTES = max(10_000_000, int(os.getenv("BILI_MAX_DOWNLOAD_BYTES", "1000000000")))
 UPLOAD_MAX_BYTES = max(1_000_000, int(os.getenv("UPLOAD_MAX_BYTES", "536870912")))
 UPLOAD_STAGING_MAX_BYTES = max(
@@ -133,7 +184,7 @@ ASR_CONCURRENCY_LIMIT = max(1, int(os.getenv("ASR_CONCURRENCY_LIMIT", "1")))
 ASR_TMP_MAX_AGE_SECONDS = max(300, int(os.getenv("ASR_TMP_MAX_AGE_SECONDS", "86400")))
 RESULT_CACHE_TTL_SECONDS = max(0, int(os.getenv("RESULT_CACHE_TTL_SECONDS", "604800")))
 RESULT_CACHE_MAX_ITEMS = max(1, int(os.getenv("RESULT_CACHE_MAX_ITEMS", "100")))
-JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "8")))
+JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "4")))
 JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("JOB_RESULT_TTL_SECONDS", "3600")))
 MEDIA_ARTIFACT_TTL_SECONDS = max(
     60,
@@ -143,12 +194,39 @@ JOB_MAX_RECORDS = max(10, int(os.getenv("JOB_MAX_RECORDS", "100")))
 JOB_WORKER_COUNT = max(1, int(os.getenv("JOB_WORKER_COUNT", "2")))
 LEGACY_WAIT_TIMEOUT_SECONDS = max(30, int(os.getenv("LEGACY_WAIT_TIMEOUT_SECONDS", "1200")))
 OCR_TIMEOUT_SECONDS = max(60, int(os.getenv("OCR_TIMEOUT_SECONDS", "1800")))
-OCR_SAMPLE_FPS = min(5.0, max(0.5, float(os.getenv("OCR_SAMPLE_FPS", "2.5"))))
+OCR_SAMPLE_FPS = min(5.0, max(0.5, float(os.getenv("OCR_SAMPLE_FPS", "1.5"))))
 OCR_CROP_TOP_RATIO = min(0.75, max(0.2, float(os.getenv("OCR_CROP_TOP_RATIO", "0.45"))))
 OCR_MIN_CONFIDENCE = min(0.95, max(0.1, float(os.getenv("OCR_MIN_CONFIDENCE", "0.55"))))
-OCR_CPU_THREADS = max(1, int(os.getenv("OCR_CPU_THREADS", "2")))
+OCR_CPU_THREADS = max(1, int(os.getenv("OCR_CPU_THREADS", "1")))
 OCR_MAX_FRAMES = max(100, int(os.getenv("OCR_MAX_FRAMES", "12000")))
-RESULT_CACHE_VERSION = 6
+MIN_FREE_DISK_BYTES = max(0, int(os.getenv("MIN_FREE_DISK_BYTES", "2147483648")))
+try:
+    MIN_FREE_DISK_RATIO = min(0.95, max(0.0, float(os.getenv("MIN_FREE_DISK_RATIO", "0.05"))))
+except ValueError:
+    MIN_FREE_DISK_RATIO = 0.05
+PROCESS_ERROR_OUTPUT_BYTES = max(1024, int(os.getenv("PROCESS_ERROR_OUTPUT_BYTES", "16384")))
+try:
+    ASR_TIMEOUT_PER_AUDIO_SECOND = max(0.0, float(os.getenv("ASR_TIMEOUT_PER_AUDIO_SECOND", "0.5")))
+except ValueError:
+    ASR_TIMEOUT_PER_AUDIO_SECOND = 0.5
+try:
+    ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND = max(
+        0.0,
+        float(os.getenv("ASR_ACCURATE_TIMEOUT_PER_AUDIO_SECOND", "1.5")),
+    )
+except ValueError:
+    ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND = 1.5
+ASR_MAX_TIMEOUT_SECONDS = max(
+    ACCURATE_ASR_TIMEOUT_SECONDS,
+    int(os.getenv("ASR_MAX_TIMEOUT_SECONDS", "7200")),
+)
+RESULT_CACHE_VERSION = 8
+ASR_PIPELINE_VERSION = 2
+ASR_PROMPT_VERSION = 1
+ASR_VAD_PROFILE_VERSION = 1
+ASR_AUDIO_FILTER_VERSION = 1
+ASR_QUALITY_METRICS_VERSION = 1
+OCR_PIPELINE_VERSION = 1
 ASR_SEMAPHORE = BoundedSemaphore(ASR_CONCURRENCY_LIMIT)
 LEGACY_REQUEST_SEMAPHORE = BoundedSemaphore(max(1, min(2, JOB_WORKER_COUNT)))
 RESULT_CACHE_LOCK = Lock()
@@ -157,7 +235,14 @@ ASR_WORKER_LOCK = Lock()
 ASR_WORKER_PROCESS: Any = None
 ASR_WORKER_REQUEST_QUEUE: Any = None
 ASR_WORKER_RESULT_QUEUE: Any = None
+ASR_WORKER_READY_EVENT: Any = None
 ASR_WORKER_WARM = False
+ASR_WORKER_START_COUNT = 0
+ASR_WORKER_MODEL_KEY: tuple[str, str, str, int] | None = None
+ASR_PREWARM_THREAD: Thread | None = None
+_ASR_MODEL_KEY: tuple[str, str, str, int] | None = None
+_ASR_MODEL_INSTANCE: Any = None
+_ASR_MODEL_LOCK = Lock()
 PROGRESS_CONTEXT = local()
 UPLOAD_RESERVATION_LOCK = Lock()
 UPLOAD_RESERVATIONS: dict[str, int] = {}
@@ -165,6 +250,10 @@ MEDIA_RESERVATION_LOCK = Lock()
 MEDIA_RESERVATIONS: dict[str, int] = {}
 os.environ.setdefault("HF_HOME", str(ASR_CACHE_DIR / "hf"))
 os.environ.setdefault("XDG_CACHE_HOME", str(ASR_CACHE_DIR))
+os.environ.setdefault("OMP_NUM_THREADS", "3")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 if os.getenv("HF_ENDPOINT"):
     os.environ.setdefault("HF_ENDPOINT", os.getenv("HF_ENDPOINT", ""))
 if os.getenv("HF_HUB_DISABLE_XET"):
@@ -200,15 +289,22 @@ SENSITIVE_PATTERNS = (
     re.compile(
         r"(?i)\b("
         r"authorization|cookie|token|access_token|password|passwd|secret|invite_code|qrcode_key|"
-        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie"
+        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie|mstoken|"
+        r"x-bogus|x_bogus|a_bogus|auth_key|signature"
         r")([=:])([^;\s&]+)"
     ),
     re.compile(
         r"(?i)([?&]("
         r"authorization|cookie|token|access_token|password|passwd|secret|invite_code|qrcode_key|"
-        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie"
+        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie|mstoken|"
+        r"x-bogus|x_bogus|a_bogus|auth_key|signature"
         r")=)[^&\s]+"
     ),
+)
+LOCAL_PATH_PATTERNS = (
+    re.compile(r"(?i)\bfile:///[^\s\"'<>]+"),
+    re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s\"'<>]+(?:/[^\s\"'<>]+)*)"),
+    re.compile(r"(?i)\b[A-Z]:[\\/][^\s\"'<>]+"),
 )
 UPLOAD_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 MEDIA_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -238,12 +334,13 @@ class ExtractRequest(BaseModel):
     use_cookie: bool = False
     format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = "txt"
     lang: str | None = Field(
-        default=None,
+        default="zh",
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     )
-    allow_platform_ai: bool = True
-    quality: Literal["fast", "accurate"] = "fast"
+    hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
+    allow_platform_ai: bool = False
+    quality: Literal["fast", "accurate"] = "accurate"
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -257,11 +354,12 @@ class UploadJobRequest(BaseModel):
     size: int = Field(..., gt=0)
     format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = "txt"
     lang: str | None = Field(
-        default=None,
+        default="zh",
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     )
-    quality: Literal["fast", "accurate"] = "fast"
+    hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
+    quality: Literal["fast", "accurate"] = "accurate"
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -328,6 +426,7 @@ class ExtractionFailure(Exception):
         reason: str = "failed",
         can_try_asr: bool = False,
         terminal: bool = False,
+        retryable: bool | None = None,
     ) -> None:
         detail = redact_sensitive(detail)
         super().__init__(detail)
@@ -336,6 +435,69 @@ class ExtractionFailure(Exception):
         self.reason = reason
         self.can_try_asr = can_try_asr
         self.terminal = terminal
+        self.retryable = retryable
+
+
+@dataclass(frozen=True)
+class DiskSpaceStatus:
+    total_bytes: int
+    free_bytes: int
+    free_ratio: float
+    minimum_free_bytes: int
+    required_bytes: int
+    available: bool
+
+
+def disk_space_status(path: Path, required_bytes: int = 0) -> DiskSpaceStatus:
+    anchor = path
+    while not anchor.exists() and anchor != anchor.parent:
+        anchor = anchor.parent
+    usage = shutil.disk_usage(anchor)
+    minimum = max(MIN_FREE_DISK_BYTES, math.ceil(usage.total * MIN_FREE_DISK_RATIO))
+    required = max(0, int(required_bytes))
+    return DiskSpaceStatus(
+        total_bytes=usage.total,
+        free_bytes=usage.free,
+        free_ratio=usage.free / usage.total if usage.total else 0.0,
+        minimum_free_bytes=minimum,
+        required_bytes=required,
+        available=usage.free >= minimum + required,
+    )
+
+
+def ensure_disk_space(path: Path, required_bytes: int = 0) -> DiskSpaceStatus:
+    try:
+        status = disk_space_status(path, required_bytes)
+    except OSError as exc:
+        raise ExtractionFailure(
+            507,
+            "无法确认服务器剩余磁盘空间，请稍后重试。",
+            "disk_space_low",
+            retryable=True,
+        ) from exc
+    if not status.available:
+        raise ExtractionFailure(
+            507,
+            "服务器剩余磁盘空间不足，暂时不能开始这个任务。",
+            "disk_space_low",
+            retryable=True,
+        )
+    return status
+
+
+def disk_space_http_error(path: Path, required_bytes: int = 0) -> None:
+    try:
+        ensure_disk_space(path, required_bytes)
+    except ExtractionFailure as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "reason": exc.reason,
+                "code": "disk_space_low",
+                "message": exc.detail,
+                "retryable": True,
+            },
+        ) from exc
 
 
 class QuietYtdlpLogger:
@@ -356,11 +518,58 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def sanitize_asr_context(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"https?://\S+", " ", str(value), flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;，；")
+    return cleaned[:ASR_PROMPT_MAX_CHARS] or None
+
+
+def asr_context(
+    title: str | None = None,
+    author: str | None = None,
+    hotwords: str | None = None,
+) -> tuple[str | None, str | None]:
+    cleaned_hotwords = sanitize_asr_context(hotwords)
+    parts: list[str] = []
+    for candidate in (title, author, cleaned_hotwords):
+        cleaned = sanitize_asr_context(candidate)
+        if cleaned and cleaned not in parts:
+            parts.append(cleaned)
+    initial_prompt = sanitize_asr_context("，".join(parts))
+    return initial_prompt, cleaned_hotwords
+
+
+def asr_context_hash(value: str | None) -> str:
+    cleaned = sanitize_asr_context(value)
+    if not cleaned:
+        return "none"
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
+def stable_config_hash(value: str | None) -> str:
+    if not value:
+        return "none"
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def asr_audio_filter() -> str:
+    value = re.sub(r"[\x00-\x1f\x7f]+", "", os.getenv("ASR_AUDIO_FILTER", "").strip())
+    return value[:500]
+
+
 def effective_quality(quality: str, embedded_subtitles: bool = False) -> Literal["fast", "accurate"]:
     return "accurate" if embedded_subtitles or quality == "accurate" else "fast"
 
 
 def asr_profile(quality: str) -> dict[str, Any]:
+    vad_parameters = {
+        "threshold": ASR_VAD_THRESHOLD,
+        "min_silence_duration_ms": ASR_VAD_MIN_SILENCE_MS,
+        "speech_pad_ms": ASR_VAD_SPEECH_PAD_MS,
+    }
     if quality == "accurate":
         return {
             "quality": "accurate",
@@ -370,6 +579,11 @@ def asr_profile(quality: str) -> dict[str, Any]:
             "cpu_threads": ACCURATE_ASR_CPU_THREADS,
             "beam_size": ACCURATE_ASR_BEAM_SIZE,
             "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
+            "vad_parameters": vad_parameters,
+            "condition_on_previous_text": env_bool(
+                "ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT",
+                True,
+            ),
             "timeout_seconds": ACCURATE_ASR_TIMEOUT_SECONDS,
         }
     return {
@@ -379,9 +593,30 @@ def asr_profile(quality: str) -> dict[str, Any]:
         "device": ASR_DEVICE,
         "cpu_threads": ASR_CPU_THREADS,
         "beam_size": ASR_FAST_BEAM_SIZE,
-        "vad_filter": env_bool("ASR_VAD_FILTER", False),
+        "vad_filter": env_bool("ASR_VAD_FILTER", True),
+        "vad_parameters": vad_parameters,
+        "condition_on_previous_text": env_bool("ASR_CONDITION_ON_PREVIOUS_TEXT", False),
         "timeout_seconds": ASR_TIMEOUT_SECONDS,
     }
+
+
+def asr_task_timeout(audio_path: Path, quality: str) -> int:
+    profile = asr_profile(quality)
+    duration = 0.0
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            frame_rate = source.getframerate()
+            if frame_rate > 0:
+                duration = source.getnframes() / frame_rate
+    except (OSError, EOFError, wave.Error):
+        pass
+    per_second = (
+        ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND
+        if profile["quality"] == "accurate"
+        else ASR_TIMEOUT_PER_AUDIO_SECOND
+    )
+    dynamic = math.ceil(duration * per_second + 60) if duration > 0 else 0
+    return min(ASR_MAX_TIMEOUT_SECONDS, max(int(profile["timeout_seconds"]), dynamic))
 
 
 def safe_upload_filename(value: str) -> tuple[str, str]:
@@ -424,7 +659,8 @@ def reserve_upload(upload_token: str, requested_bytes: int | None) -> int:
             },
         )
     with UPLOAD_RESERVATION_LOCK:
-        if sum(UPLOAD_RESERVATIONS.values()) + reservation > UPLOAD_STAGING_MAX_BYTES:
+        projected = sum(UPLOAD_RESERVATIONS.values()) + reservation
+        if projected > UPLOAD_STAGING_MAX_BYTES:
             raise HTTPException(
                 status_code=429,
                 detail={
@@ -432,6 +668,7 @@ def reserve_upload(upload_token: str, requested_bytes: int | None) -> int:
                     "message": "服务器正在处理其他上传视频，请稍后再试。",
                 },
             )
+        disk_space_http_error(ASR_TMP_DIR, projected)
         UPLOAD_RESERVATIONS[upload_token] = reservation
     return reservation
 
@@ -486,11 +723,8 @@ def discard_upload_payload(payload: dict[str, Any]) -> None:
         shutil.rmtree(directory)
     except FileNotFoundError:
         pass
-    except OSError:
-        LOGGER.exception(
-            "failed to remove staged upload",
-            extra={"upload_token": upload_token},
-        )
+    except OSError as exc:
+        LOGGER.error("failed to remove staged upload error_type=%s", type(exc).__name__)
         return
     release_upload_reservation(upload_token)
 
@@ -509,7 +743,8 @@ def reserve_media_artifact(artifact_token: str) -> int:
                 status_code=409,
                 detail={"reason": "artifact_conflict", "message": "媒体任务令牌冲突，请重新提交。"},
             )
-        if sum(MEDIA_RESERVATIONS.values()) + reservation > MEDIA_STAGING_MAX_BYTES:
+        projected = sum(MEDIA_RESERVATIONS.values()) + reservation
+        if projected > MEDIA_STAGING_MAX_BYTES:
             raise HTTPException(
                 status_code=429,
                 detail={
@@ -517,6 +752,7 @@ def reserve_media_artifact(artifact_token: str) -> int:
                     "message": "服务器媒体暂存空间正忙，请稍后再试。",
                 },
             )
+        disk_space_http_error(MEDIA_ARTIFACT_DIR, projected)
         MEDIA_RESERVATIONS[artifact_token] = reservation
     return reservation
 
@@ -569,11 +805,8 @@ def discard_media_payload(payload: dict[str, Any]) -> None:
         shutil.rmtree(directory)
     except FileNotFoundError:
         pass
-    except OSError:
-        LOGGER.exception(
-            "failed to remove media artifact",
-            extra={"artifact_token": artifact_token},
-        )
+    except OSError as exc:
+        LOGGER.error("failed to remove media artifact error_type=%s", type(exc).__name__)
         return
     release_media_reservation(artifact_token)
 
@@ -611,11 +844,12 @@ def cleanup_stale_media_artifacts(now: float | None = None, remove_all: bool = F
         artifact_token = directory.name.removeprefix("media-artifact-")
         if not MEDIA_TOKEN_RE.fullmatch(artifact_token):
             continue
-        if not remove_all and artifact_token in active_tokens:
+        metadata_path = directory / "artifact.json"
+        if not remove_all and artifact_token in active_tokens and not metadata_path.is_file():
             continue
         expired = remove_all
         try:
-            metadata = json.loads((directory / "artifact.json").read_text(encoding="utf-8"))
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             expired = expired or float(metadata.get("expires_at") or 0) <= current
         except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
             try:
@@ -664,6 +898,8 @@ def redact_sensitive(value: Any) -> Any:
             redacted = pattern.sub(lambda match: match.group(1) + "<redacted>", redacted)
         else:
             redacted = pattern.sub("<redacted>", redacted)
+    for pattern in LOCAL_PATH_PATTERNS:
+        redacted = pattern.sub("<local-path>", redacted)
     return redacted
 
 
@@ -678,6 +914,108 @@ def public_reason(reason: str) -> str:
         "douyin_cookie_refresh_failed": "platform_temporarily_unavailable",
         "douyin_media_missing": "download_failed",
     }.get(reason, reason)
+
+
+def stable_error_code(reason: str) -> str:
+    normalized = public_reason(reason)
+    return {
+        "invalid_input": "invalid_url",
+        "input_too_long": "invalid_url",
+        "invalid_page": "invalid_url",
+        "short_link_unresolved": "invalid_url",
+        "short_link_untrusted": "invalid_url",
+        "short_link_loop": "invalid_url",
+        "video_not_found": "video_unavailable",
+        "no_official_subtitle": "subtitle_unavailable",
+        "subtitle_empty": "subtitle_unavailable",
+        "empty_subtitle": "subtitle_unavailable",
+        "subtitle_parse_failed": "subtitle_unavailable",
+        "unsupported_subtitle_format": "subtitle_unavailable",
+        "asr_empty": "subtitle_unavailable",
+        "ocr_empty": "subtitle_unavailable",
+        "audio_stream_missing": "no_audio_stream",
+        "upload_audio_missing": "no_audio_stream",
+        "audio_extract_failed": "download_failed",
+        "download_too_large": "media_too_large",
+        "media_convert_failed": "ffmpeg_failed",
+        "media_probe_timeout": "ffmpeg_failed",
+        "upload_probe_timeout": "ffmpeg_failed",
+        "invalid_downloaded_media": "download_failed",
+        "queue_full": "job_queue_full",
+        "job_not_found": "job_expired",
+        "job_cancelled": "task_cancelled",
+    }.get(normalized, normalized)
+
+
+USER_ERROR_MESSAGES = {
+    "invalid_url": "请输入有效的 B站或抖音视频链接。",
+    "unsupported_platform": "暂不支持这个视频平台。",
+    "video_unavailable": "视频不存在、已下架或当前账号无权访问。",
+    "subtitle_unavailable": "没有找到可读取的字幕或语音内容。",
+    "cookie_expired": "B站登录态已失效，请刷新 Cookie 或关闭 Cookie 后重试。",
+    "download_failed": "媒体下载或音轨准备失败，请稍后重试。",
+    "media_too_large": "媒体文件超过服务器允许的大小。",
+    "upload_too_large": "上传文件超过服务器允许的大小。",
+    "disk_space_low": "服务器剩余磁盘空间不足，请稍后重试。",
+    "no_audio_stream": "视频没有音轨，无法进行语音识别或生成 MP3。",
+    "no_subtitle_stream": "视频没有可读取的文本字幕轨。",
+    "asr_timeout": "语音识别超时，请缩短视频或稍后重试。",
+    "asr_worker_crashed": "语音识别进程意外退出，可能是内存不足；请稍后重试。",
+    "asr_model_download_failed": "语音识别模型不可用或下载失败，请检查模型缓存与网络。",
+    "asr_failed": "本地语音识别失败，请稍后重试。",
+    "asr_busy": "精确处理资源正忙，请稍后重试。",
+    "ocr_timeout": "画面字幕识别超时，请缩短视频或稍后重试。",
+    "ocr_failed": "画面字幕识别失败；有音轨时会自动尝试语音识别。",
+    "ocr_missing": "服务器未安装画面字幕识别组件。",
+    "ffmpeg_failed": "媒体探测或转换失败，请确认文件可正常播放。",
+    "ffmpeg_missing": "服务器缺少 FFmpeg 或 ffprobe。",
+    "job_queue_full": "任务队列已满，请稍后重试。",
+    "job_expired": "服务可能已重启或任务已过期，请重新提交。",
+    "task_cancelled": "任务已取消。",
+    "invalid_upload_media": "上传文件不是可读取的视频媒体。",
+    "upload_video_missing": "上传文件中没有视频轨。",
+    "asr_duration_too_long": "视频时长超过当前服务器的处理限制。",
+    "cookie_required": "此视频需要有效的 B站登录态。",
+    "platform_temporarily_unavailable": "平台暂时拒绝了请求，请稍后重试。",
+    "douyin_browser_busy": "抖音浏览器资源正忙，请稍后重试。",
+}
+
+
+def error_retryable(status_code: int, code: str, override: bool | None = None) -> bool:
+    if override is not None:
+        return override
+    if code in {"invalid_url", "unsupported_platform", "video_unavailable", "media_too_large", "upload_too_large"}:
+        return False
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504, 507}
+
+
+def failure_user_message(exc: ExtractionFailure) -> str:
+    return USER_ERROR_MESSAGES.get(stable_error_code(exc.reason), "平台字幕不可用。")
+
+
+def extraction_error_detail(
+    source: str,
+    exc: ExtractionFailure,
+    failures: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    reason = public_reason(exc.reason)
+    code = stable_error_code(reason)
+    LOGGER.warning(
+        "task failed source=%s reason=%s detail=%s",
+        source,
+        reason,
+        redact_sensitive(exc.detail),
+    )
+    detail: dict[str, Any] = {
+        "source": source,
+        "reason": reason,
+        "code": code,
+        "message": USER_ERROR_MESSAGES.get(code, "任务处理失败，请稍后重试。"),
+        "retryable": error_retryable(exc.status_code, code, exc.retryable),
+    }
+    if failures:
+        detail["attempts"] = failures
+    return detail
 
 
 def result_cache_enabled() -> bool:
@@ -701,12 +1039,26 @@ def result_cache_key(req: ExtractRequest, canonical_input: str) -> str:
         "embedded_subtitles": req.embedded_subtitles,
         "cookie": cookie_fingerprint,
         "asr_model": profile["model"],
+        "asr_pipeline_version": ASR_PIPELINE_VERSION,
         "asr_compute_type": profile["compute_type"],
         "asr_device": profile["device"],
         "asr_beam_size": profile["beam_size"],
         "asr_vad_filter": profile["vad_filter"],
-        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower(),
+        "asr_vad_parameters": profile["vad_parameters"] if profile["vad_filter"] else None,
+        "asr_vad_profile_version": ASR_VAD_PROFILE_VERSION,
+        "asr_condition_on_previous_text": profile["condition_on_previous_text"],
+        "asr_context_retry_enabled": env_bool("ASR_CONTEXT_RETRY_ENABLED", True),
+        "asr_low_logprob_threshold": ASR_LOW_LOGPROB_THRESHOLD,
+        "asr_retry_repetition_ratio": ASR_RETRY_REPETITION_RATIO,
+        "asr_retry_low_confidence_ratio": ASR_RETRY_LOW_CONFIDENCE_RATIO,
+        "asr_prompt_version": ASR_PROMPT_VERSION,
+        "hotwords_hash": asr_context_hash(req.hotwords),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
+        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
+        "asr_audio_filter_version": ASR_AUDIO_FILTER_VERSION,
+        "asr_quality_metrics_version": ASR_QUALITY_METRICS_VERSION,
         "ocr_sample_fps": OCR_SAMPLE_FPS if req.embedded_subtitles else None,
+        "ocr_pipeline_version": OCR_PIPELINE_VERSION if req.embedded_subtitles else None,
         "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO if req.embedded_subtitles else None,
         "ocr_min_confidence": OCR_MIN_CONFIDENCE if req.embedded_subtitles else None,
     }
@@ -725,11 +1077,27 @@ def upload_result_cache_key(req: UploadJobRequest) -> str:
         "quality": quality,
         "embedded_subtitles": req.embedded_subtitles,
         "asr_model": profile["model"],
+        "asr_pipeline_version": ASR_PIPELINE_VERSION,
         "asr_compute_type": profile["compute_type"],
         "asr_device": profile["device"],
         "asr_beam_size": profile["beam_size"],
         "asr_vad_filter": profile["vad_filter"],
+        "asr_vad_parameters": profile["vad_parameters"] if profile["vad_filter"] else None,
+        "asr_vad_profile_version": ASR_VAD_PROFILE_VERSION,
+        "asr_condition_on_previous_text": profile["condition_on_previous_text"],
+        "asr_context_retry_enabled": env_bool("ASR_CONTEXT_RETRY_ENABLED", True),
+        "asr_low_logprob_threshold": ASR_LOW_LOGPROB_THRESHOLD,
+        "asr_retry_repetition_ratio": ASR_RETRY_REPETITION_RATIO,
+        "asr_retry_low_confidence_ratio": ASR_RETRY_LOW_CONFIDENCE_RATIO,
+        "asr_prompt_version": ASR_PROMPT_VERSION,
+        "upload_prompt_hash": asr_context_hash(upload_display_title(req.filename)),
+        "hotwords_hash": asr_context_hash(req.hotwords),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
+        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
+        "asr_audio_filter_version": ASR_AUDIO_FILTER_VERSION,
+        "asr_quality_metrics_version": ASR_QUALITY_METRICS_VERSION,
         "ocr_sample_fps": OCR_SAMPLE_FPS if req.embedded_subtitles else None,
+        "ocr_pipeline_version": OCR_PIPELINE_VERSION if req.embedded_subtitles else None,
         "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO if req.embedded_subtitles else None,
         "ocr_min_confidence": OCR_MIN_CONFIDENCE if req.embedded_subtitles else None,
     }
@@ -739,6 +1107,13 @@ def upload_result_cache_key(req: UploadJobRequest) -> str:
 
 def result_cache_path(key: str) -> Path:
     return RESULT_CACHE_DIR / f"{key}.json"
+
+
+def cache_updated_since(key: str, timestamp: float) -> bool:
+    try:
+        return result_cache_path(key).stat().st_mtime >= timestamp
+    except OSError:
+        return False
 
 
 @contextmanager
@@ -789,7 +1164,12 @@ def load_cached_result(key: str, now: float | None = None) -> tuple[list[Subtitl
             path.unlink(missing_ok=True)
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        path.unlink(missing_ok=True)
+        return None
+    except OSError:
         return None
     if not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION:
         path.unlink(missing_ok=True)
@@ -821,6 +1201,9 @@ def save_cached_result(key: str, entries: list[SubtitleEntry], metadata: dict[st
     try:
         temp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         os.replace(temp_path, path)
+    except OSError as exc:
+        LOGGER.warning("result cache write failed: %s", redact_sensitive(str(exc)))
+        return
     finally:
         temp_path.unlink(missing_ok=True)
     cleanup_result_cache()
@@ -867,7 +1250,15 @@ def cleanup_result_cache(now: float | None = None) -> int:
 
 
 def failure_record(source: str, exc: ExtractionFailure) -> dict[str, Any]:
-    return {"source": source, "reason": public_reason(exc.reason), "detail": redact_sensitive(exc.detail)}
+    reason = public_reason(exc.reason)
+    code = stable_error_code(reason)
+    return {
+        "source": source,
+        "reason": reason,
+        "code": code,
+        "message": USER_ERROR_MESSAGES.get(code, "该字幕来源不可用。"),
+        "retryable": error_retryable(exc.status_code, code, exc.retryable),
+    }
 
 
 def bili_page_number(value: str) -> int:
@@ -908,6 +1299,11 @@ def normalize_input(value: str) -> str:
     if host.endswith("b23.tv"):
         return resolve_b23_url(url)
     if host.endswith("bilibili.com"):
+        av_match = re.fullmatch(r"/video/(av\d+)/?", parsed.path, flags=re.IGNORECASE)
+        if av_match:
+            page = bili_page_number(url)
+            canonical = f"https://www.bilibili.com/video/{av_match.group(1).lower()}"
+            return f"{canonical}?p={page}" if page > 1 else canonical
         return url
     raise ExtractionFailure(400, "请输入有效的 B站或抖音视频链接，也可以输入 BV 号。", "invalid_input", terminal=True)
 
@@ -931,26 +1327,71 @@ def extract_bili_url(value: str) -> str | None:
     return url
 
 
+def bili_redirect_host_allowed(host: str | None) -> bool:
+    value = (host or "").lower().rstrip(".")
+    return any(value == root or value.endswith(f".{root}") for root in ("b23.tv", "bilibili.com"))
+
+
 @lru_cache(maxsize=128)
 def resolve_b23_url(url: str) -> str:
+    current = url
+    visited: set[str] = set()
     try:
         with httpx.Client(
             timeout=10,
-            follow_redirects=True,
+            follow_redirects=False,
             headers={"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"},
             event_hooks={"request": [validate_public_request]},
         ) as client:
-            resp = client.get(url)
-    except httpx.RequestError as exc:
-        raise ExtractionFailure(502, f"Bilibili short link request failed: {exc}", "short_link_request_failed") from exc
-
-    final_url = str(resp.url)
-    bvid = extract_bvid(final_url)
-    if bvid:
-        return canonical_bili_url(bvid, final_url)
-    try:
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
+            for _ in range(6):
+                if not bili_redirect_host_allowed(urllib.parse.urlparse(current).hostname):
+                    raise ExtractionFailure(
+                        400,
+                        "B站短链接跳转到了不受信任的站点。",
+                        "short_link_untrusted",
+                        terminal=True,
+                    )
+                if current in visited:
+                    raise ExtractionFailure(
+                        508,
+                        "B站短链接发生循环跳转，请更换原始链接。",
+                        "short_link_loop",
+                        terminal=True,
+                    )
+                visited.add(current)
+                resp = client.get(current)
+                if resp.status_code in {301, 302, 303, 307, 308}:
+                    location = resp.headers.get("location")
+                    if not location:
+                        break
+                    next_url = urljoin(current, location)
+                    if not bili_redirect_host_allowed(urllib.parse.urlparse(next_url).hostname):
+                        raise ExtractionFailure(
+                            400,
+                            "B站短链接跳转到了不受信任的站点。",
+                            "short_link_untrusted",
+                            terminal=True,
+                        )
+                    bvid = extract_bvid(next_url)
+                    if bvid:
+                        return canonical_bili_url(bvid, next_url)
+                    current = next_url
+                    continue
+                resp.raise_for_status()
+                bvid = extract_bvid(str(resp.url) or current)
+                if bvid:
+                    return canonical_bili_url(bvid, str(resp.url) or current)
+                break
+            else:
+                raise ExtractionFailure(
+                    508,
+                    "B站短链接跳转次数过多，请更换原始链接。",
+                    "short_link_loop",
+                    terminal=True,
+                )
+    except ExtractionFailure:
+        raise
+    except httpx.HTTPError as exc:
         raise ExtractionFailure(502, f"Bilibili short link request failed: {exc}", "short_link_request_failed") from exc
     raise ExtractionFailure(
         400,
@@ -1019,7 +1460,14 @@ def save_bili_cookie(cookie: str) -> None:
             os.chmod(BILI_COOKIE_PATH, 0o600)
     except OSError as exc:
         temporary.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Bilibili cookie persistence failed: {exc}") from exc
+        LOGGER.error("Bilibili cookie persistence failed: %s", redact_sensitive(str(exc)))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "reason": "cookie_persistence_failed",
+                "message": "B站登录态保存失败，请检查服务日志。",
+            },
+        ) from exc
     os.environ.update({"BILI_COOKIE": value, "BILI_SESSDATA": "", "BILI_JCT": "", "BILI_BUVID3": ""})
 
 
@@ -1093,6 +1541,14 @@ def api_get_json(url: str, referer: str, allow_cookie: bool = False) -> dict[str
         message = data.get("message")
         if code in {-400, -404, 62002, 62004}:
             raise ExtractionFailure(404, f"Bilibili API error: {message}", "not_found", terminal=True)
+        if allow_cookie and code in {-101, -111}:
+            raise ExtractionFailure(
+                401,
+                "B站登录态已失效，请刷新 Cookie 或关闭 Cookie 后重试。",
+                "cookie_expired",
+                can_try_asr=True,
+                retryable=True,
+            )
         raise ExtractionFailure(502, f"Bilibili API error: {message}", "api_error")
     return data
 
@@ -1189,6 +1645,17 @@ def bili_view_context(
 
 
 def view_source(url: str, allow_cookie: bool = False) -> ExtractionSource:
+    if not extract_bvid(url):
+        info = extract_info(url, allow_cookie=allow_cookie)
+        return ExtractionSource(
+            title=info.get("title"),
+            video_id=str(info.get("id") or "") or None,
+            webpage_url=str(info.get("webpage_url") or url),
+            tracks=[],
+            duration=float(info.get("duration") or 0) or None,
+            platform="bilibili",
+            author=info.get("uploader"),
+        )
     bvid, canonical_url, data, selected_page, _ = bili_view_context(url, allow_cookie)
     page_number = bili_page_number(canonical_url)
     title = data.get("title")
@@ -1345,7 +1812,7 @@ def fetch_subtitle(track: SubtitleTrack, referer: str, allow_cookie: bool = Fals
         with httpx.Client(
             timeout=20,
             follow_redirects=True,
-            headers=headers_for(referer, False),
+            headers=headers_for(referer, allow_cookie),
             event_hooks={"request": [validate_public_request]},
         ) as client:
             resp = client.get(track.url)
@@ -1551,7 +2018,7 @@ def official_subtitle(req: ExtractRequest, allow_cookie: bool, source_label: str
                 source = bili_api_source(url, allow_cookie=allow_cookie)
                 attempts.append("bilibili_api")
             except ExtractionFailure as exc:
-                if exc.terminal:
+                if exc.terminal and (source is None or exc.reason != "invalid_bvid"):
                     raise exc
                 if source is None:
                     raise exc
@@ -1601,6 +2068,7 @@ def ensure_asr_ready() -> None:
     ASR_TMP_DIR.mkdir(parents=True, exist_ok=True)
     ASR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     ASR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_disk_space(ASR_MODEL_DIR, 512 * 1024 * 1024)
 
 
 def cleanup_stale_asr_tmp(now: float | None = None) -> int:
@@ -1609,7 +2077,7 @@ def cleanup_stale_asr_tmp(now: float | None = None) -> int:
         return 0
     removed = 0
     for path in ASR_TMP_DIR.iterdir():
-        if not path.is_dir() or not path.name.startswith("asr-"):
+        if not path.is_dir() or not path.name.startswith(("asr-", "ocr-")):
             continue
         is_upload = path.name.startswith("asr-upload-")
         try:
@@ -1648,7 +2116,7 @@ def probe_uploaded_media(path: Path, require_audio: bool = True) -> dict[str, An
     if not ffprobe:
         raise ExtractionFailure(503, "Local ASR requires ffprobe.", "ffmpeg_missing")
     try:
-        proc = subprocess.run(
+        proc = run_managed_process(
             [
                 ffprobe,
                 "-v",
@@ -1665,13 +2133,13 @@ def probe_uploaded_media(path: Path, require_audio: bool = True) -> dict[str, An
                 "json",
                 str(path),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
             timeout=min(60, ASR_DOWNLOAD_TIMEOUT_SECONDS),
+            output_limit=PROCESS_ERROR_OUTPUT_BYTES,
         )
-    except subprocess.TimeoutExpired as exc:
+    except ManagedProcessTimeout as exc:
         raise ExtractionFailure(408, "Uploaded video inspection timed out.", "upload_probe_timeout") from exc
+    except OSError as exc:
+        raise ExtractionFailure(503, "无法启动 ffprobe 媒体探测进程。", "ffmpeg_failed", retryable=True) from exc
     if proc.returncode != 0:
         raise ExtractionFailure(400, "The uploaded file is not a readable video.", "invalid_upload_media")
     try:
@@ -1732,37 +2200,49 @@ def normalize_audio_for_asr(
     if not ffmpeg:
         raise ExtractionFailure(503, "Local ASR requires ffmpeg.", "ffmpeg_missing")
     try:
-        proc = subprocess.run(
-            [
-                ffmpeg,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-protocol_whitelist",
-                LOCAL_MEDIA_PROTOCOL_WHITELIST,
-                "-i",
-                str(input_path),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-sample_fmt",
-                "s16",
-                str(normalized_path),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        source_bytes = input_path.stat().st_size
+    except OSError:
+        source_bytes = 0
+    ensure_disk_space(tmp_dir, min(256 * 1024 * 1024, max(64 * 1024 * 1024, source_bytes // 2)))
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        LOCAL_MEDIA_PROTOCOL_WHITELIST,
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-sample_fmt",
+        "s16",
+    ]
+    audio_filter = asr_audio_filter()
+    if audio_filter:
+        command.extend(["-af", audio_filter])
+    command.append(str(normalized_path))
+    try:
+        proc = run_managed_process(
+            command,
             timeout=max(1.0, timeout_seconds or ASR_DOWNLOAD_TIMEOUT_SECONDS),
+            output_limit=PROCESS_ERROR_OUTPUT_BYTES,
         )
-    except subprocess.TimeoutExpired as exc:
+    except ManagedProcessTimeout as exc:
         normalized_path.unlink(missing_ok=True)
         raise ExtractionFailure(504, "ffmpeg audio normalization timed out.", "download_failed") from exc
+    except OSError as exc:
+        normalized_path.unlink(missing_ok=True)
+        raise ExtractionFailure(503, "无法启动 ffmpeg 音轨转换进程。", "ffmpeg_failed", retryable=True) from exc
     if proc.returncode != 0 or not normalized_path.exists():
-        raise ExtractionFailure(502, f"ffmpeg audio normalization failed: {proc.stderr[:300]}", "audio_extract_failed")
+        normalized_path.unlink(missing_ok=True)
+        LOGGER.warning("ffmpeg audio normalization failed: %s", redact_sensitive(proc.stderr))
+        raise ExtractionFailure(502, "ffmpeg 音轨转换失败。", "audio_extract_failed")
     return normalized_path
 
 
@@ -1783,19 +2263,31 @@ def extract_embedded_text_subtitle(
     if not streams:
         return None
     requested_language = normalized_language(lang)
+
+    def language_score(item: dict[str, Any]) -> int:
+        stream_language = normalized_language(str(item.get("language") or ""))
+        if requested_language:
+            return 0 if stream_language == requested_language else 3
+        if stream_language == "zh-hans":
+            return 0
+        if stream_language == "zh-hant":
+            return 1
+        return 2 if not stream_language else 3
+
     streams.sort(
         key=lambda item: (
-            0 if requested_language and normalized_language(item.get("language")) == requested_language else 1,
+            language_score(item),
             int(item.get("index") or 0),
         )
     )
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ExtractionFailure(503, "Embedded subtitle extraction requires ffmpeg.", "ffmpeg_missing")
+    ensure_disk_space(tmp_dir, 32 * 1024 * 1024)
     for stream in streams:
         target = tmp_dir / f"embedded-{int(stream['index'])}.srt"
         try:
-            completed = subprocess.run(
+            completed = run_managed_process(
                 [
                     ffmpeg,
                     "-y",
@@ -1815,14 +2307,15 @@ def extract_embedded_text_subtitle(
                     "srt",
                     str(target),
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
                 timeout=min(120, OCR_TIMEOUT_SECONDS),
+                output_limit=PROCESS_ERROR_OUTPUT_BYTES,
             )
-        except subprocess.TimeoutExpired:
+        except ManagedProcessTimeout:
             target.unlink(missing_ok=True)
             continue
+        except OSError as exc:
+            target.unlink(missing_ok=True)
+            raise ExtractionFailure(503, "无法启动 ffmpeg 字幕提取进程。", "ffmpeg_failed", retryable=True) from exc
         if completed.returncode != 0 or not target.is_file():
             target.unlink(missing_ok=True)
             continue
@@ -2025,6 +2518,7 @@ def burned_subtitle_ocr_worker(
     result_queue: Any,
 ) -> None:
     ffmpeg_process: subprocess.Popen[bytes] | None = None
+    stderr_capture: LimitedStreamCapture | None = None
     try:
         from rapidocr import RapidOCR
 
@@ -2068,8 +2562,9 @@ def burned_subtitle_ocr_worker(
                 "pipe:1",
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        stderr_capture = LimitedStreamCapture(ffmpeg_process.stderr, PROCESS_ERROR_OUTPUT_BYTES).start()
         result_queue.put({"kind": "started", "ffmpeg_pid": ffmpeg_process.pid})
         frames: list[dict[str, Any]] = []
         if ffmpeg_process.stdout is None:
@@ -2088,10 +2583,11 @@ def burned_subtitle_ocr_worker(
         try:
             return_code = ffmpeg_process.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            ffmpeg_process.kill()
-            return_code = ffmpeg_process.wait(timeout=5)
+            terminate_process(ffmpeg_process)
+            return_code = int(ffmpeg_process.returncode or -1)
         if return_code != 0 and not frames:
-            raise RuntimeError(f"ffmpeg frame extraction failed with exit code {return_code}")
+            error = stderr_capture.text() if stderr_capture is not None else ""
+            raise RuntimeError(f"ffmpeg frame extraction failed with exit code {return_code}: {error}")
         entries = build_ocr_entries(frames, OCR_SAMPLE_FPS)
         result_queue.put(
             {
@@ -2110,11 +2606,14 @@ def burned_subtitle_ocr_worker(
         result_queue.put({"kind": "result", "ok": False, "error": redact_sensitive(str(exc))})
     finally:
         if ffmpeg_process is not None and ffmpeg_process.poll() is None:
-            ffmpeg_process.kill()
+            terminate_process(ffmpeg_process)
+        if ffmpeg_process is not None and ffmpeg_process.stdout is not None:
             try:
-                ffmpeg_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+                ffmpeg_process.stdout.close()
+            except (AttributeError, OSError):
                 pass
+        if stderr_capture is not None:
+            stderr_capture.finish()
 
 
 def extract_burned_subtitles(media_path: Path, duration: float) -> tuple[list[SubtitleEntry], dict[str, Any]]:
@@ -2122,6 +2621,7 @@ def extract_burned_subtitles(media_path: Path, duration: float) -> tuple[list[Su
         raise ExtractionFailure(503, "Video subtitle OCR requires ffmpeg.", "ffmpeg_missing")
     if importlib.util.find_spec("rapidocr") is None or importlib.util.find_spec("onnxruntime") is None:
         raise ExtractionFailure(503, "Video subtitle OCR is not installed.", "ocr_missing")
+    ensure_disk_space(ASR_TMP_DIR, 16 * 1024 * 1024)
     acquired = ASR_SEMAPHORE.acquire(blocking=False)
     if not acquired:
         report_progress("ocr_wait", 28, "正在等待精确解析资源")
@@ -2132,25 +2632,29 @@ def extract_burned_subtitles(media_path: Path, duration: float) -> tuple[list[Su
     process: Any = None
     ffmpeg_pid: int | None = None
     try:
-        ctx = get_context("spawn")
-        result_queue = ctx.Queue(maxsize=64)
-        process = ctx.Process(
-            target=burned_subtitle_ocr_worker,
-            args=(str(media_path), duration, result_queue),
-            name="video-subtitle-ocr",
-        )
-        process.start()
+        try:
+            ctx = get_context("spawn")
+            result_queue = ctx.Queue(maxsize=64)
+            process = ctx.Process(
+                target=burned_subtitle_ocr_worker,
+                args=(str(media_path), duration, result_queue),
+                name="video-subtitle-ocr",
+            )
+            process.start()
+        except (OSError, RuntimeError) as exc:
+            raise ExtractionFailure(
+                503,
+                "无法启动 OCR 隔离进程。",
+                "ocr_failed",
+                retryable=True,
+            ) from exc
         deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if ffmpeg_pid:
-                    try:
-                        os.kill(ffmpeg_pid, 9)
-                    except OSError:
-                        pass
-                process.kill()
-                process.join(5)
+                    terminate_process_id(ffmpeg_pid)
+                terminate_child_process(process)
                 raise ExtractionFailure(504, f"Video subtitle OCR timed out after {OCR_TIMEOUT_SECONDS} seconds.", "ocr_timeout")
             try:
                 message = result_queue.get(timeout=min(1.0, remaining))
@@ -2171,6 +2675,7 @@ def extract_burned_subtitles(media_path: Path, duration: float) -> tuple[list[Su
                 continue
             process.join(5)
             if not message.get("ok"):
+                LOGGER.warning("OCR worker failed: %s", redact_sensitive(str(message.get("error") or "unknown error")))
                 raise ExtractionFailure(502, f"Video subtitle OCR failed: {message.get('error') or 'unknown error'}", "ocr_failed")
             entries = [
                 SubtitleEntry(float(start), float(end), str(text))
@@ -2180,9 +2685,7 @@ def extract_burned_subtitles(media_path: Path, duration: float) -> tuple[list[Su
             meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
             return entries, meta
     finally:
-        if process is not None and process.is_alive():
-            process.kill()
-            process.join(5)
+        terminate_child_process(process)
         if result_queue is not None:
             try:
                 result_queue.close()
@@ -2216,6 +2719,199 @@ def extract_video_subtitle_pixels(
     return entries, meta
 
 
+def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
+    group_owned = False
+    try:
+        if hasattr(os, "setsid"):
+            os.setsid()
+            group_owned = True
+    except OSError:
+        group_owned = False
+    result_queue.put({"kind": "started", "group_owned": group_owned})
+    deadline = time.monotonic() + max(30, int(payload.get("timeout_seconds") or 300))
+    max_bytes = max(1, int(payload.get("max_bytes") or 1))
+    too_large = False
+    timed_out = False
+    last_progress = -1
+
+    def progress_hook(status: dict[str, Any]) -> None:
+        nonlocal too_large, timed_out, last_progress
+        if time.monotonic() >= deadline:
+            timed_out = True
+            raise RuntimeError("yt-dlp deadline exceeded")
+        downloaded = int(status.get("downloaded_bytes") or 0)
+        total = int(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
+        if downloaded > max_bytes or total > max_bytes:
+            too_large = True
+            raise RuntimeError("yt-dlp size limit exceeded")
+        if status.get("status") != "downloading" or total <= 0:
+            return
+        progress = min(100, int(downloaded / total * 100))
+        if progress < last_progress + 2:
+            return
+        last_progress = progress
+        try:
+            result_queue.put_nowait({"kind": "progress", "progress": progress})
+        except Full:
+            pass
+
+    target_dir = Path(str(payload["target_dir"]))
+    mode = str(payload.get("mode") or "audio")
+    media_type = str(payload.get("media_type") or "audio")
+    options: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": str(
+            target_dir / ("%(id)s.%(ext)s" if mode == "audio" else "source.%(ext)s")
+        ),
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "http_headers": dict(payload.get("http_headers") or {}),
+        "logger": QuietYtdlpLogger(),
+        "noplaylist": True,
+        "cachedir": False,
+        "continuedl": False,
+        "overwrites": True,
+        "max_filesize": max_bytes,
+        "progress_hooks": [progress_hook],
+    }
+    if mode == "audio":
+        options["format"] = "bestaudio/best"
+    elif media_type == "video":
+        options.update(
+            {
+                "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                "merge_output_format": "mp4",
+                "concurrent_fragment_downloads": max(
+                    1,
+                    min(8, int(payload.get("fragment_concurrency") or 4)),
+                ),
+            }
+        )
+    else:
+        options["format"] = "bestaudio/best"
+
+    try:
+        with YoutubeDL(options) as ydl:
+            raw_info = ydl.extract_info(str(payload["url"]), download=True)
+        info = raw_info if isinstance(raw_info, dict) else {}
+        summary = {
+            key: info.get(key)
+            for key in ("id", "title", "duration", "webpage_url", "uploader", "channel", "ext")
+            if info.get(key) is not None
+        }
+        result_queue.put({"kind": "result", "ok": True, "info": summary}, timeout=5)
+    except Exception as exc:
+        reason = "media_too_large" if too_large else ("download_timeout" if timed_out else "download_failed")
+        try:
+            result_queue.put(
+                {
+                    "kind": "result",
+                    "ok": False,
+                    "reason": reason,
+                    "error": redact_sensitive(str(exc)),
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+
+def run_isolated_ytdlp_download(
+    *,
+    url: str,
+    target_dir: Path,
+    mode: Literal["audio", "media"],
+    media_type: Literal["video", "audio"] = "audio",
+    allow_cookie: bool,
+    max_bytes: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    result_queue: Any = None
+    process: Any = None
+    group_owned = False
+    try:
+        try:
+            ctx = get_context("spawn")
+            result_queue = ctx.Queue(maxsize=64)
+            process = ctx.Process(
+                target=ytdlp_download_worker,
+                args=(
+                    {
+                        "url": url,
+                        "target_dir": str(target_dir),
+                        "mode": mode,
+                        "media_type": media_type,
+                        "http_headers": headers_for(allow_cookie=allow_cookie),
+                        "max_bytes": max_bytes,
+                        "timeout_seconds": max(1, int(timeout_seconds)),
+                        "fragment_concurrency": max(
+                            1,
+                            min(8, int(os.getenv("MEDIA_FRAGMENT_CONCURRENCY", "2"))),
+                        ),
+                    },
+                    result_queue,
+                ),
+                name="isolated-ytdlp-download",
+            )
+            process.start()
+        except (OSError, RuntimeError) as exc:
+            raise ExtractionFailure(
+                503,
+                "无法启动 yt-dlp 隔离下载进程。",
+                "download_failed",
+                retryable=True,
+            ) from exc
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ExtractionFailure(504, "yt-dlp 下载超时。", "download_failed", retryable=True)
+            try:
+                message = result_queue.get(timeout=min(1.0, remaining))
+            except Empty:
+                if not process.is_alive():
+                    process.join(0)
+                    raise ExtractionFailure(
+                        502,
+                        "yt-dlp 下载进程意外退出。",
+                        "download_failed",
+                        retryable=True,
+                    )
+                continue
+            if not isinstance(message, dict):
+                continue
+            if message.get("kind") == "started":
+                group_owned = bool(message.get("group_owned"))
+                continue
+            if message.get("kind") == "progress" and mode == "media":
+                progress = min(78, 20 + int(int(message.get("progress") or 0) * 0.58))
+                report_progress("media_download", progress, "正在下载媒体文件")
+                continue
+            if message.get("kind") != "result":
+                continue
+            process.join(5)
+            if not message.get("ok"):
+                reason = str(message.get("reason") or "download_failed")
+                LOGGER.warning("isolated yt-dlp failed: %s", redact_sensitive(str(message.get("error") or reason)))
+                if reason == "media_too_large":
+                    raise ExtractionFailure(413, "下载媒体超过大小限制。", "media_too_large")
+                if reason == "download_timeout":
+                    raise ExtractionFailure(504, "yt-dlp 下载超时。", "download_failed", retryable=True)
+                raise ExtractionFailure(502, "yt-dlp 下载失败。", "download_failed", retryable=True)
+            info = message.get("info")
+            return info if isinstance(info, dict) else {}
+    finally:
+        terminate_child_process_group(process, group_owned)
+        if result_queue is not None:
+            try:
+                result_queue.cancel_join_thread()
+                result_queue.close()
+            except Exception:
+                pass
+
+
 def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple[Path, dict[str, Any]]:
     def do_api_download() -> tuple[Path, dict[str, Any]]:
         deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
@@ -2231,16 +2927,26 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
         play_data = play.get("data") or {}
         audio_items = ((play_data.get("dash") or {}).get("audio") or []) if isinstance(play_data, dict) else []
         if not audio_items:
-            raise ExtractionFailure(502, "Bilibili playurl API returned no audio stream.", "audio_extract_failed")
+            raise ExtractionFailure(
+                422,
+                "B站视频没有音轨。",
+                "no_audio_stream",
+                terminal=True,
+            )
         audio_items = [
             item
             for item in audio_items
             if isinstance(item, dict) and (item.get("baseUrl") or item.get("base_url"))
         ]
         if not audio_items:
-            raise ExtractionFailure(502, "Bilibili playurl API returned no usable audio stream.", "audio_extract_failed")
+            raise ExtractionFailure(
+                422,
+                "B站视频没有可读取的音轨。",
+                "no_audio_stream",
+                terminal=True,
+            )
         audio_items.sort(key=lambda item: int(item.get("bandwidth") or 0))
-        audio_quality = os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower()
+        audio_quality = os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower()
         if audio_quality == "best":
             selected_audio = audio_items[-1]
         elif audio_quality == "smallest":
@@ -2308,33 +3014,14 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
         deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
         attempt_dir = tmp_dir / "yt-dlp"
         attempt_dir.mkdir(parents=True, exist_ok=True)
-        timed_out = False
-
-        def progress_hook(_: dict[str, Any]) -> None:
-            nonlocal timed_out
-            if deadline - time.monotonic() <= 0:
-                timed_out = True
-                raise RuntimeError("yt-dlp download deadline exceeded")
-
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio/best",
-            "outtmpl": str(attempt_dir / "%(id)s.%(ext)s"),
-            "socket_timeout": 30,
-            "http_headers": headers_for(allow_cookie=allow_cookie),
-            "logger": QuietYtdlpLogger(),
-            "noplaylist": True,
-            "max_filesize": BILI_MAX_DOWNLOAD_BYTES,
-            "progress_hooks": [progress_hook],
-        }
-        try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception as exc:
-            if timed_out:
-                raise ExtractionFailure(504, "yt-dlp audio download timed out.", "download_failed") from exc
-            raise
+        info = run_isolated_ytdlp_download(
+            url=url,
+            target_dir=attempt_dir,
+            mode="audio",
+            allow_cookie=allow_cookie,
+            max_bytes=BILI_MAX_DOWNLOAD_BYTES,
+            timeout_seconds=remaining_before(deadline, "yt-dlp audio download"),
+        )
         candidates = sorted(
             (
                 path
@@ -2364,7 +3051,7 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
     try:
         return do_api_download()
     except ExtractionFailure as first:
-        if first.terminal:
+        if first.terminal and first.reason != "invalid_bvid":
             raise
         try:
             return do_download()
@@ -2379,6 +3066,23 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
                 f"{second.detail} Bilibili API reason: {first.detail}",
                 second.reason,
             ) from second
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise ExtractionFailure(
+                507,
+                "服务器下载目录剩余空间不足。",
+                "disk_space_low",
+                retryable=True,
+            ) from exc
+        try:
+            return do_download()
+        except Exception as raw_second:
+            second = raw_second if isinstance(raw_second, ExtractionFailure) else ExtractionFailure(
+                502,
+                f"yt-dlp audio download failed: {raw_second}",
+                "audio_extract_failed",
+            )
+            raise second from raw_second
     except Exception as exc:
         try:
             return do_download()
@@ -2400,7 +3104,7 @@ def probe_downloaded_media(path: Path) -> dict[str, Any]:
     if not ffprobe:
         raise ExtractionFailure(503, "Media extraction requires ffprobe.", "ffmpeg_missing")
     try:
-        completed = subprocess.run(
+        completed = run_managed_process(
             [
                 ffprobe,
                 "-v",
@@ -2411,13 +3115,13 @@ def probe_downloaded_media(path: Path) -> dict[str, Any]:
                 "json",
                 str(path),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
             timeout=30,
+            output_limit=PROCESS_ERROR_OUTPUT_BYTES,
         )
-    except subprocess.TimeoutExpired as exc:
+    except ManagedProcessTimeout as exc:
         raise ExtractionFailure(504, "Media inspection timed out.", "media_probe_timeout") from exc
+    except OSError as exc:
+        raise ExtractionFailure(503, "无法启动 ffprobe 媒体探测进程。", "ffmpeg_failed", retryable=True) from exc
     if completed.returncode != 0:
         raise ExtractionFailure(502, "Downloaded file is not readable media.", "invalid_downloaded_media")
     try:
@@ -2471,67 +3175,16 @@ def download_bilibili_media_ytdlp(
 ) -> tuple[Path, dict[str, Any]]:
     target_dir.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
-    timed_out = False
-    too_large = False
-    last_progress = -1
-
-    def progress_hook(status: dict[str, Any]) -> None:
-        nonlocal timed_out, too_large, last_progress
-        if time.monotonic() >= deadline:
-            timed_out = True
-            raise RuntimeError("media download deadline exceeded")
-        downloaded = int(status.get("downloaded_bytes") or 0)
-        total = int(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
-        if downloaded > MEDIA_MAX_BYTES or total > MEDIA_MAX_BYTES:
-            too_large = True
-            raise RuntimeError("media download size limit exceeded")
-        if status.get("status") != "downloading" or total <= 0:
-            return
-        percent = min(78, 20 + int(downloaded / total * 58))
-        if percent >= last_progress + 2:
-            last_progress = percent
-            report_progress("media_download", percent, "正在下载媒体文件")
-
-    options: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "outtmpl": str(target_dir / "source.%(ext)s"),
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "concurrent_fragment_downloads": max(
-            1,
-            min(8, int(os.getenv("MEDIA_FRAGMENT_CONCURRENCY", "4"))),
-        ),
-        "http_headers": headers_for(allow_cookie=cookie_allowed(req.use_cookie)),
-        "logger": QuietYtdlpLogger(),
-        "noplaylist": True,
-        "cachedir": False,
-        "continuedl": False,
-        "overwrites": True,
-        "max_filesize": MEDIA_MAX_BYTES,
-        "progress_hooks": [progress_hook],
-    }
-    if req.media_type == "video":
-        options.update(
-            {
-                "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-                "merge_output_format": "mp4",
-            }
-        )
-    else:
-        options["format"] = "bestaudio/best"
-    try:
-        with YoutubeDL(options) as ydl:
-            raw_info = ydl.extract_info(req.input, download=True)
-    except Exception as exc:
-        if timed_out:
-            raise ExtractionFailure(504, "Media download timed out.", "download_failed") from exc
-        if too_large:
-            raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large") from exc
-        raise ExtractionFailure(502, "Bilibili media download failed.", "download_failed") from exc
+    info = run_isolated_ytdlp_download(
+        url=req.input,
+        target_dir=target_dir,
+        mode="media",
+        media_type=req.media_type,
+        allow_cookie=cookie_allowed(req.use_cookie),
+        max_bytes=MEDIA_MAX_BYTES,
+        timeout_seconds=remaining_before(deadline, "Bilibili yt-dlp media download"),
+    )
     source_path, probe = select_downloaded_media(target_dir, req.media_type)
-    info = raw_info if isinstance(raw_info, dict) else {}
     return source_path, {
         "id": info.get("id"),
         "title": info.get("title"),
@@ -2617,6 +3270,16 @@ def download_bilibili_stream(
             if exc.status_code == 413:
                 raise
             last_error = exc
+        except OSError as exc:
+            target.unlink(missing_ok=True)
+            if exc.errno == errno.ENOSPC:
+                raise ExtractionFailure(
+                    507,
+                    "服务器下载目录剩余空间不足。",
+                    "disk_space_low",
+                    retryable=True,
+                ) from exc
+            last_error = exc
         except Exception as exc:
             target.unlink(missing_ok=True)
             last_error = exc
@@ -2647,18 +3310,24 @@ def merge_bilibili_dash(
     else:
         command.extend(["-map", "0:v:0"])
     command.extend(["-c", "copy", "-movflags", "+faststart", str(target)])
+    try:
+        required_bytes = video_path.stat().st_size + (audio_path.stat().st_size if audio_path else 0)
+    except OSError:
+        required_bytes = 64 * 1024 * 1024
+    ensure_disk_space(target.parent, required_bytes)
     report_progress("media_convert", 82, "正在合并视频和音频")
     try:
-        completed = subprocess.run(
+        completed = run_managed_process(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
             timeout=remaining_before(deadline, "Bilibili media merge"),
+            output_limit=PROCESS_ERROR_OUTPUT_BYTES,
         )
-    except subprocess.TimeoutExpired as exc:
+    except ManagedProcessTimeout as exc:
         target.unlink(missing_ok=True)
         raise ExtractionFailure(504, "Bilibili media merge timed out.", "media_convert_failed") from exc
+    except OSError as exc:
+        target.unlink(missing_ok=True)
+        raise ExtractionFailure(503, "无法启动 ffmpeg 媒体合并进程。", "ffmpeg_failed", retryable=True) from exc
     if completed.returncode != 0 or not target.is_file():
         target.unlink(missing_ok=True)
         raise ExtractionFailure(502, "Bilibili media merge failed.", "media_convert_failed")
@@ -2803,7 +3472,7 @@ def download_bilibili_media(
     try:
         return download_bilibili_media_api(req, target_dir)
     except ExtractionFailure as first:
-        if first.terminal or first.status_code in {404, 413}:
+        if (first.terminal and first.reason != "invalid_bvid") or first.status_code in {404, 413}:
             raise
         LOGGER.warning(
             "Bilibili playurl media path failed; trying yt-dlp",
@@ -2832,9 +3501,14 @@ def prepare_media_output(
         if not ffmpeg:
             raise ExtractionFailure(503, "Audio extraction requires ffmpeg.", "ffmpeg_missing")
         final_path = artifact_dir / "artifact.mp3"
+        try:
+            source_bytes = source_path.stat().st_size
+        except OSError:
+            source_bytes = 0
+        ensure_disk_space(artifact_dir, min(MEDIA_MAX_BYTES, max(32 * 1024 * 1024, source_bytes // 2)))
         report_progress("media_convert", 86, "正在生成 MP3 音频")
         try:
-            completed = subprocess.run(
+            completed = run_managed_process(
                 [
                     ffmpeg,
                     "-y",
@@ -2855,14 +3529,15 @@ def prepare_media_output(
                     "3",
                     str(final_path),
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
                 timeout=ASR_DOWNLOAD_TIMEOUT_SECONDS,
+                output_limit=PROCESS_ERROR_OUTPUT_BYTES,
             )
-        except subprocess.TimeoutExpired as exc:
+        except ManagedProcessTimeout as exc:
             final_path.unlink(missing_ok=True)
             raise ExtractionFailure(504, "Audio conversion timed out.", "media_convert_failed") from exc
+        except OSError as exc:
+            final_path.unlink(missing_ok=True)
+            raise ExtractionFailure(503, "无法启动 ffmpeg 音频转换进程。", "ffmpeg_failed", retryable=True) from exc
         if completed.returncode != 0 or not final_path.is_file():
             final_path.unlink(missing_ok=True)
             raise ExtractionFailure(502, "Audio conversion failed.", "media_convert_failed")
@@ -2915,7 +3590,17 @@ def finalize_media_artifact(
         "created_at": now,
         "expires_at": expires_at,
     }
-    write_media_artifact_metadata(final_path.parent, metadata)
+    try:
+        write_media_artifact_metadata(final_path.parent, metadata)
+    except OSError as exc:
+        reason = "disk_space_low" if exc.errno == errno.ENOSPC else "artifact_write_failed"
+        status_code = 507 if exc.errno == errno.ENOSPC else 502
+        raise ExtractionFailure(
+            status_code,
+            "服务器无法保存媒体产物。",
+            reason,
+            retryable=True,
+        ) from exc
     platform = detect_platform(req.input)
     result_metadata = {
         "title": title,
@@ -2949,6 +3634,7 @@ def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
     started = time.monotonic()
     artifact_dir = media_artifact_directory(req.artifact_token)
     source_dir = artifact_dir / "source"
+    ensure_disk_space(MEDIA_ARTIFACT_DIR, MEDIA_MAX_BYTES)
     MEDIA_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(MEDIA_ARTIFACT_DIR, 0o700)
     artifact_dir.mkdir(mode=0o700)
@@ -2977,20 +3663,243 @@ def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
     return finalize_media_artifact(req, final_path, content_type, info, started)
 
 
-@lru_cache(maxsize=4)
-def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: int) -> Any:
-    from faster_whisper import WhisperModel
+def _release_whisper_model_locked() -> None:
+    global _ASR_MODEL_KEY, _ASR_MODEL_INSTANCE
+    instance = _ASR_MODEL_INSTANCE
+    _ASR_MODEL_INSTANCE = None
+    _ASR_MODEL_KEY = None
+    if instance is not None:
+        runtime_model = getattr(instance, "model", None)
+        unload = getattr(runtime_model, "unload_model", None)
+        if not callable(unload):
+            unload = getattr(instance, "unload_model", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception as exc:
+                LOGGER.warning("ASR model unload failed: %s", type(exc).__name__)
+    gc.collect()
 
-    return WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-        cpu_threads=cpu_threads,
-        download_root=str(ASR_MODEL_DIR),
+
+def clear_whisper_model() -> None:
+    with _ASR_MODEL_LOCK:
+        _release_whisper_model_locked()
+
+
+def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: int) -> Any:
+    global _ASR_MODEL_KEY, _ASR_MODEL_INSTANCE
+    key = (model_name, compute_type, device, cpu_threads)
+    with _ASR_MODEL_LOCK:
+        if _ASR_MODEL_INSTANCE is not None and _ASR_MODEL_KEY == key:
+            return _ASR_MODEL_INSTANCE
+        if _ASR_MODEL_INSTANCE is not None:
+            _release_whisper_model_locked()
+        from faster_whisper import WhisperModel
+
+        instance = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            download_root=str(ASR_MODEL_DIR),
+        )
+        _ASR_MODEL_INSTANCE = instance
+        _ASR_MODEL_KEY = key
+        return instance
+
+
+def classify_asr_worker_error(value: str) -> str:
+    normalized = value.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "huggingface",
+            "localentrynotfound",
+            "couldn't reach",
+            "failed to download",
+            "download error",
+            "model not found",
+            "permission denied",
+        )
+    ):
+        return "asr_model_download_failed"
+    if any(marker in normalized for marker in ("out of memory", "memoryerror", "cannot allocate memory")):
+        return "asr_worker_crashed"
+    return "asr_failed"
+
+
+def audio_duration_seconds(audio_path: str) -> float:
+    try:
+        with wave.open(audio_path, "rb") as source:
+            frame_rate = source.getframerate()
+            return source.getnframes() / frame_rate if frame_rate > 0 else 0.0
+    except (OSError, EOFError, wave.Error):
+        return 0.0
+
+
+def peak_rss_mb() -> float | None:
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (OSError, ValueError):
+        return None
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return round(value / divisor, 1)
+
+
+def parse_linux_memory_kib(value: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for line in value.splitlines():
+        name, separator, raw = line.partition(":")
+        if not separator:
+            continue
+        fields = raw.strip().split()
+        try:
+            result[name] = int(fields[0]) if fields else 0
+        except ValueError:
+            continue
+    return result
+
+
+def runtime_memory_status() -> dict[str, float | None]:
+    process_values: dict[str, int] = {}
+    system_values: dict[str, int] = {}
+    if sys.platform.startswith("linux"):
+        try:
+            process_values = parse_linux_memory_kib(Path("/proc/self/status").read_text(encoding="utf-8"))
+        except OSError:
+            pass
+        try:
+            system_values = parse_linux_memory_kib(Path("/proc/meminfo").read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    swap_total = system_values.get("SwapTotal")
+    swap_free = system_values.get("SwapFree")
+    return {
+        "process_rss_mb": round(process_values["VmRSS"] / 1024, 1)
+        if "VmRSS" in process_values
+        else None,
+        "process_swap_mb": round(process_values["VmSwap"] / 1024, 1)
+        if "VmSwap" in process_values
+        else None,
+        "system_available_mb": round(system_values["MemAvailable"] / 1024, 1)
+        if "MemAvailable" in system_values
+        else None,
+        "swap_total_mb": round(swap_total / 1024, 1) if swap_total is not None else None,
+        "swap_used_mb": round(max(0, swap_total - (swap_free or 0)) / 1024, 1)
+        if swap_total is not None and swap_free is not None
+        else None,
+    }
+
+
+def segment_metric(segment: Any, name: str) -> float | None:
+    try:
+        value = float(getattr(segment, name))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def repeated_segment_ratio(texts: list[str]) -> float:
+    normalized = [re.sub(r"\W+", "", text, flags=re.UNICODE).lower() for text in texts]
+    normalized = [text for text in normalized if text]
+    if len(normalized) < 2:
+        return 0.0
+    repeats = 0
+    seen: list[str] = []
+    for text in normalized:
+        duplicate = text in seen
+        if not duplicate and seen:
+            duplicate = SequenceMatcher(None, seen[-1], text).ratio() >= 0.92
+        if duplicate:
+            repeats += 1
+        else:
+            seen.append(text)
+    return repeats / len(normalized)
+
+
+def run_whisper_transcription(
+    model: Any,
+    audio_path: str,
+    options: dict[str, Any],
+    audio_duration: float,
+) -> tuple[list[tuple[float, float, str]], Any, dict[str, Any]]:
+    started = time.monotonic()
+    segments, info = model.transcribe(audio_path, **options)
+    entries: list[tuple[float, float, str]] = []
+    avg_logprobs: list[float] = []
+    no_speech_probs: list[float] = []
+    compression_ratios: list[float] = []
+    texts: list[str] = []
+    for segment in segments:
+        text = str(segment.text or "").strip()
+        if not text:
+            continue
+        entries.append((float(segment.start), float(segment.end), text))
+        texts.append(text)
+        avg_logprob = segment_metric(segment, "avg_logprob")
+        no_speech_prob = segment_metric(segment, "no_speech_prob")
+        compression_ratio = segment_metric(segment, "compression_ratio")
+        if avg_logprob is not None:
+            avg_logprobs.append(avg_logprob)
+        if no_speech_prob is not None:
+            no_speech_probs.append(no_speech_prob)
+        if compression_ratio is not None:
+            compression_ratios.append(compression_ratio)
+    elapsed = max(0.0, time.monotonic() - started)
+    low_confidence = sum(value < ASR_LOW_LOGPROB_THRESHOLD for value in avg_logprobs)
+    duration_after_vad = getattr(info, "duration_after_vad", None)
+    try:
+        duration_after_vad = float(duration_after_vad) if duration_after_vad is not None else None
+    except (TypeError, ValueError):
+        duration_after_vad = None
+    metrics = {
+        "audio_duration_seconds": round(audio_duration, 3) if audio_duration > 0 else None,
+        "duration_after_vad": round(duration_after_vad, 3) if duration_after_vad is not None else None,
+        "transcribe_seconds": round(elapsed, 3),
+        "realtime_factor": round(elapsed / audio_duration, 4) if audio_duration > 0 else None,
+        "median_avg_logprob": round(statistics.median(avg_logprobs), 4) if avg_logprobs else None,
+        "median_no_speech_prob": round(statistics.median(no_speech_probs), 4) if no_speech_probs else None,
+        "median_compression_ratio": round(statistics.median(compression_ratios), 4)
+        if compression_ratios
+        else None,
+        "low_confidence_segment_ratio": round(low_confidence / len(avg_logprobs), 4)
+        if avg_logprobs
+        else 0.0,
+        "repeated_segment_ratio": round(repeated_segment_ratio(texts), 4),
+        "peak_rss_mb": peak_rss_mb(),
+    }
+    return entries, info, metrics
+
+
+def prefer_retry_result(first: dict[str, Any], retry: dict[str, Any]) -> bool:
+    first_repeat = float(first.get("repeated_segment_ratio") or 0.0)
+    retry_repeat = float(retry.get("repeated_segment_ratio") or 0.0)
+    if retry_repeat + 0.01 < first_repeat:
+        return True
+    first_low = float(first.get("low_confidence_segment_ratio") or 0.0)
+    retry_low = float(retry.get("low_confidence_segment_ratio") or 0.0)
+    if retry_repeat <= first_repeat + 0.01 and retry_low + 0.05 < first_low:
+        return True
+    first_logprob = first.get("median_avg_logprob")
+    retry_logprob = retry.get("median_avg_logprob")
+    return bool(
+        retry_repeat <= first_repeat + 0.01
+        and retry_low <= first_low + 0.05
+        and isinstance(first_logprob, (int, float))
+        and isinstance(retry_logprob, (int, float))
+        and retry_logprob > first_logprob + 0.1
     )
 
 
-def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "fast") -> dict[str, Any]:
+def transcribe_audio_payload(
+    audio_path: str,
+    lang: str | None,
+    quality: str = "accurate",
+    initial_prompt: str | None = None,
+    hotwords: str | None = None,
+) -> dict[str, Any]:
+    cleaned_prompt = sanitize_asr_context(initial_prompt)
+    cleaned_hotwords = sanitize_asr_context(hotwords)
     try:
         profile = asr_profile(quality)
         model = whisper_model(
@@ -2999,18 +3908,68 @@ def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "
             profile["device"],
             profile["cpu_threads"],
         )
-        segments, info = model.transcribe(
-            audio_path,
-            language=lang or None,
-            beam_size=profile["beam_size"],
-            vad_filter=profile["vad_filter"],
-            condition_on_previous_text=False,
+        options: dict[str, Any] = {
+            "language": lang or None,
+            "beam_size": profile["beam_size"],
+            "vad_filter": profile["vad_filter"],
+            "condition_on_previous_text": profile["condition_on_previous_text"],
+        }
+        if profile["vad_filter"]:
+            options["vad_parameters"] = profile["vad_parameters"]
+        if cleaned_prompt:
+            options["initial_prompt"] = cleaned_prompt
+        if cleaned_hotwords:
+            options["hotwords"] = cleaned_hotwords
+        duration = audio_duration_seconds(audio_path)
+        entries, info, metrics = run_whisper_transcription(model, audio_path, options, duration)
+        initial_seconds = float(metrics.get("transcribe_seconds") or 0.0)
+        repeated_ratio = float(metrics.get("repeated_segment_ratio") or 0.0)
+        low_confidence_ratio = float(metrics.get("low_confidence_segment_ratio") or 0.0)
+        retry_reason: str | None = None
+        if repeated_ratio >= ASR_RETRY_REPETITION_RATIO:
+            retry_reason = "repetition"
+        elif low_confidence_ratio >= ASR_RETRY_LOW_CONFIDENCE_RATIO:
+            retry_reason = "low_confidence"
+        retry_performed = bool(
+            entries
+            and retry_reason
+            and profile["quality"] == "accurate"
+            and profile["condition_on_previous_text"]
+            and env_bool("ASR_CONTEXT_RETRY_ENABLED", True)
         )
-        entries = []
-        for segment in segments:
-            text = str(segment.text or "").strip()
-            if text:
-                entries.append((float(segment.start), float(segment.end), text))
+        retry_selected = False
+        if retry_performed:
+            retry_options = dict(options)
+            retry_options["condition_on_previous_text"] = False
+            retry_entries, retry_info, retry_metrics = run_whisper_transcription(
+                model,
+                audio_path,
+                retry_options,
+                duration,
+            )
+            total_seconds = initial_seconds + float(retry_metrics.get("transcribe_seconds") or 0.0)
+            if retry_entries and prefer_retry_result(metrics, retry_metrics):
+                entries, info, metrics = retry_entries, retry_info, retry_metrics
+                retry_selected = True
+            metrics["transcribe_seconds"] = round(total_seconds, 3)
+            metrics["realtime_factor"] = round(total_seconds / duration, 4) if duration > 0 else None
+        metrics.update(
+            {
+                "asr_attempt_count": 2 if retry_performed else 1,
+                "context_retry_performed": retry_performed,
+                "context_retry_selected": retry_selected,
+                "context_retry_reason": retry_reason if retry_performed else None,
+                "quality_warning": (
+                    "repetition"
+                    if float(metrics.get("repeated_segment_ratio") or 0.0)
+                    >= ASR_RETRY_REPETITION_RATIO
+                    else "low_confidence"
+                    if float(metrics.get("low_confidence_segment_ratio") or 0.0)
+                    >= ASR_RETRY_LOW_CONFIDENCE_RATIO
+                    else None
+                ),
+            }
+        )
         return {
             "ok": True,
             "entries": entries,
@@ -3024,49 +3983,117 @@ def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "
                 "cpu_threads": profile["cpu_threads"],
                 "beam_size": profile["beam_size"],
                 "vad_filter": profile["vad_filter"],
+                "vad_parameters": profile["vad_parameters"] if profile["vad_filter"] else None,
+                "condition_on_previous_text": (
+                    False if retry_selected else profile["condition_on_previous_text"]
+                ),
+                "initial_prompt_used": bool(cleaned_prompt),
+                "hotwords_used": bool(cleaned_hotwords),
+                "initial_prompt_hash": asr_context_hash(cleaned_prompt),
+                "hotwords_hash": asr_context_hash(cleaned_hotwords),
+                "audio_filter_enabled": bool(asr_audio_filter()),
+                "audio_filter_hash": stable_config_hash(asr_audio_filter()),
+                **metrics,
             },
         }
     except Exception as exc:
-        return {"ok": False, "error": redact_sensitive(str(exc))}
+        error = str(exc)
+        for sensitive_value in (cleaned_prompt, cleaned_hotwords):
+            if sensitive_value:
+                error = error.replace(sensitive_value, "<redacted>")
+        return {
+            "ok": False,
+            "error": redact_sensitive(error),
+            "error_type": type(exc).__name__,
+            "reason": classify_asr_worker_error(error),
+        }
 
 
-def transcribe_audio_worker(audio_path: str, lang: str | None, quality: str, result_queue: Any) -> None:
-    result_queue.put(transcribe_audio_payload(audio_path, lang, quality))
+def transcribe_audio_worker(
+    audio_path: str,
+    lang: str | None,
+    quality: str,
+    initial_prompt: str | None,
+    hotwords: str | None,
+    result_queue: Any,
+) -> None:
+    result_queue.put(transcribe_audio_payload(audio_path, lang, quality, initial_prompt, hotwords))
 
 
-def persistent_asr_worker(request_queue: Any, result_queue: Any) -> None:
-    whisper_model(DEFAULT_ASR_MODEL, ASR_COMPUTE_TYPE, ASR_DEVICE, ASR_CPU_THREADS)
-    while True:
-        task = request_queue.get()
-        if task is None:
-            return
-        task_id = str(task.get("task_id") or "")
-        result = transcribe_audio_payload(
-            str(task.get("audio_path") or ""),
-            task.get("lang"),
-            str(task.get("quality") or "fast"),
+def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: Any) -> None:
+    prewarm_quality = os.getenv("ASR_PREWARM_QUALITY", "accurate").strip().lower()
+    if prewarm_quality not in {"fast", "accurate"}:
+        prewarm_quality = "accurate"
+    prewarm_profile = asr_profile(prewarm_quality)
+    prewarmed = False
+    try:
+        whisper_model(
+            prewarm_profile["model"],
+            prewarm_profile["compute_type"],
+            prewarm_profile["device"],
+            prewarm_profile["cpu_threads"],
         )
-        result["task_id"] = task_id
-        result_queue.put(result)
+        prewarmed = True
+    except Exception:
+        # Prewarming is opportunistic. The first real request retries initialization
+        # and returns the model error through the normal task result path.
+        clear_whisper_model()
+    finally:
+        result_queue.put(
+            {
+                "kind": "prewarm",
+                "ok": prewarmed,
+                "model_key": [
+                    prewarm_profile["model"],
+                    prewarm_profile["compute_type"],
+                    prewarm_profile["device"],
+                    prewarm_profile["cpu_threads"],
+                ],
+            }
+        )
+        ready_event.set()
+    try:
+        while True:
+            task = request_queue.get()
+            if task is None:
+                return
+            task_id = str(task.get("task_id") or "")
+            result = transcribe_audio_payload(
+                str(task.get("audio_path") or ""),
+                task.get("lang"),
+                str(task.get("quality") or "accurate"),
+                task.get("initial_prompt"),
+                task.get("hotwords"),
+            )
+            result["task_id"] = task_id
+            result_queue.put(result)
+    finally:
+        clear_whisper_model()
 
 
 def asr_worker_alive() -> bool:
-    return bool(ASR_WORKER_PROCESS is not None and ASR_WORKER_PROCESS.is_alive())
+    try:
+        return bool(ASR_WORKER_PROCESS is not None and ASR_WORKER_PROCESS.is_alive())
+    except (AssertionError, RuntimeError):
+        return False
 
 
 def stop_asr_worker_locked(graceful: bool = True) -> None:
-    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_WARM
+    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT, ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
     process = ASR_WORKER_PROCESS
     request_queue = ASR_WORKER_REQUEST_QUEUE
-    if process is not None and process.is_alive() and graceful and request_queue is not None:
+    if ASR_WORKER_READY_EVENT is not None:
+        try:
+            ASR_WORKER_READY_EVENT.set()
+        except Exception:
+            pass
+    if asr_worker_alive() and graceful and request_queue is not None:
         try:
             request_queue.put_nowait(None)
             process.join(3)
         except Exception:
             pass
-    if process is not None and process.is_alive():
-        process.kill()
-        process.join(5)
+    terminate_child_process(process)
     for queue in (ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE):
         if queue is None:
             continue
@@ -3078,7 +4105,9 @@ def stop_asr_worker_locked(graceful: bool = True) -> None:
     ASR_WORKER_PROCESS = None
     ASR_WORKER_REQUEST_QUEUE = None
     ASR_WORKER_RESULT_QUEUE = None
+    ASR_WORKER_READY_EVENT = None
     ASR_WORKER_WARM = False
+    ASR_WORKER_MODEL_KEY = None
 
 
 def stop_asr_worker() -> None:
@@ -3087,25 +4116,92 @@ def stop_asr_worker() -> None:
 
 
 def ensure_persistent_asr_worker_locked() -> None:
-    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE
+    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT, ASR_WORKER_START_COUNT
     if asr_worker_alive():
         return
     stop_asr_worker_locked(graceful=False)
-    ctx = get_context("spawn")
-    ASR_WORKER_REQUEST_QUEUE = ctx.Queue(maxsize=1)
-    ASR_WORKER_RESULT_QUEUE = ctx.Queue(maxsize=1)
-    ASR_WORKER_PROCESS = ctx.Process(
-        target=persistent_asr_worker,
-        args=(ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE),
-        name="bili-subtitle-asr",
-        daemon=True,
-    )
-    ASR_WORKER_PROCESS.start()
+    try:
+        ctx = get_context("spawn")
+        ASR_WORKER_REQUEST_QUEUE = ctx.Queue(maxsize=1)
+        ASR_WORKER_RESULT_QUEUE = ctx.Queue(maxsize=1)
+        ASR_WORKER_READY_EVENT = ctx.Event()
+        ASR_WORKER_PROCESS = ctx.Process(
+            target=persistent_asr_worker,
+            args=(ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT),
+            name="bili-subtitle-asr",
+            daemon=True,
+        )
+        ASR_WORKER_PROCESS.start()
+        ASR_WORKER_START_COUNT += 1
+    except (OSError, RuntimeError) as exc:
+        stop_asr_worker_locked(graceful=False)
+        raise ExtractionFailure(
+            503,
+            "无法启动 ASR 常驻进程。",
+            "asr_worker_crashed",
+            retryable=True,
+        ) from exc
+
+
+def prewarm_asr_worker() -> None:
+    global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
+    acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+    if not acquired:
+        return
+    try:
+        try:
+            ensure_asr_ready()
+        except ExtractionFailure as exc:
+            LOGGER.warning("ASR prewarm skipped: %s", public_reason(exc.reason))
+            return
+        with ASR_WORKER_LOCK:
+            ensure_persistent_asr_worker_locked()
+            ready_event = ASR_WORKER_READY_EVENT
+            result_queue = ASR_WORKER_RESULT_QUEUE
+        ready = False
+        if ready_event is not None:
+            deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if ready_event.wait(min(1.0, max(0.1, deadline - time.monotonic()))):
+                    ready = True
+                    break
+                if not asr_worker_alive():
+                    break
+        if ready and result_queue is not None:
+            try:
+                status = result_queue.get(timeout=1.0)
+            except Empty:
+                status = None
+            if isinstance(status, dict) and status.get("kind") == "prewarm":
+                ASR_WORKER_WARM = bool(status.get("ok"))
+                model_key = status.get("model_key")
+                if isinstance(model_key, list) and len(model_key) == 4:
+                    ASR_WORKER_MODEL_KEY = (
+                        str(model_key[0]),
+                        str(model_key[1]),
+                        str(model_key[2]),
+                        int(model_key[3]),
+                    )
+    finally:
+        ASR_SEMAPHORE.release()
+
+
+def start_asr_prewarm() -> None:
+    global ASR_PREWARM_THREAD
+    if ASR_PREWARM_THREAD is not None and ASR_PREWARM_THREAD.is_alive():
+        return
+    ASR_PREWARM_THREAD = Thread(target=prewarm_asr_worker, name="asr-prewarm", daemon=True)
+    ASR_PREWARM_THREAD.start()
 
 
 def parse_transcription_result(result: dict[str, Any]) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     if not result.get("ok"):
-        raise ExtractionFailure(502, f"Local ASR failed: {result.get('error') or 'unknown error'}", "asr_failed")
+        reason = str(result.get("reason") or "asr_failed")
+        error_type = re.sub(r"[^A-Za-z0-9_.-]", "", str(result.get("error_type") or "ASRWorkerError"))
+        LOGGER.warning("ASR worker task failed reason=%s error_type=%s", reason, error_type)
+        message = USER_ERROR_MESSAGES.get(reason, USER_ERROR_MESSAGES["asr_failed"])
+        status_code = 503 if reason in {"asr_model_download_failed", "asr_worker_crashed"} else 502
+        raise ExtractionFailure(status_code, message, reason, retryable=True)
     entries = [
         SubtitleEntry(float(start), float(end), str(text))
         for start, end, text in result.get("entries", [])
@@ -3115,28 +4211,86 @@ def parse_transcription_result(result: dict[str, Any]) -> tuple[list[SubtitleEnt
     return entries, meta
 
 
+def asr_public_diagnostics(meta: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "audio_duration_seconds",
+        "duration_after_vad",
+        "transcribe_seconds",
+        "realtime_factor",
+        "median_avg_logprob",
+        "median_no_speech_prob",
+        "median_compression_ratio",
+        "low_confidence_segment_ratio",
+        "repeated_segment_ratio",
+        "peak_rss_mb",
+        "asr_attempt_count",
+        "context_retry_performed",
+        "context_retry_selected",
+        "context_retry_reason",
+        "quality_warning",
+        "initial_prompt_used",
+        "hotwords_used",
+        "initial_prompt_hash",
+        "hotwords_hash",
+        "audio_filter_enabled",
+        "audio_filter_hash",
+        "condition_on_previous_text",
+        "vad_parameters",
+        "asr_worker_restart_count",
+    }
+    return {key: meta[key] for key in allowed if key in meta}
+
+
+def asr_quality_user_note(meta: dict[str, Any]) -> str | None:
+    warning = meta.get("quality_warning")
+    if warning == "repetition":
+        return "识别结果仍检测到较多重复片段，建议核对原音频或补充专业词汇后重试。"
+    if warning == "low_confidence":
+        return "部分片段识别置信度偏低，建议核对原音频或补充专业词汇后重试。"
+    return None
+
+
 def transcribe_audio_once(
     audio_path: Path,
     lang: str | None,
-    quality: str = "fast",
+    quality: str = "accurate",
+    initial_prompt: str | None = None,
+    hotwords: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     profile = asr_profile(quality)
-    ctx = get_context("spawn")
-    result_queue = ctx.Queue(maxsize=1)
+    timeout_seconds = asr_task_timeout(audio_path, profile["quality"])
+    result_queue: Any = None
     process: Any = None
     try:
-        process = ctx.Process(
-            target=transcribe_audio_worker,
-            args=(str(audio_path), lang, profile["quality"], result_queue),
-        )
-        process.start()
-        deadline = time.monotonic() + profile["timeout_seconds"]
+        try:
+            ctx = get_context("spawn")
+            result_queue = ctx.Queue(maxsize=1)
+            process = ctx.Process(
+                target=transcribe_audio_worker,
+                args=(
+                    str(audio_path),
+                    lang,
+                    profile["quality"],
+                    initial_prompt,
+                    hotwords,
+                    result_queue,
+                ),
+            )
+            process.start()
+        except (OSError, RuntimeError) as exc:
+            raise ExtractionFailure(
+                503,
+                "无法启动 ASR 识别进程。",
+                "asr_worker_crashed",
+                retryable=True,
+            ) from exc
+        deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ExtractionFailure(
                     504,
-                    f"Local ASR timed out after {profile['timeout_seconds']} seconds.",
+                    f"Local ASR timed out after {timeout_seconds} seconds.",
                     "asr_timeout",
                 )
             try:
@@ -3145,39 +4299,53 @@ def transcribe_audio_once(
             except Empty:
                 if not process.is_alive():
                     process.join(1)
+                    detail = (
+                        "本地语音识别进程可能因内存不足被系统终止。"
+                        if process.exitcode in {-9, 137}
+                        else "本地语音识别进程意外退出。"
+                    )
                     raise ExtractionFailure(
                         502,
-                        f"Local ASR exited without a result. exit_code={process.exitcode}",
-                        "asr_failed",
+                        detail,
+                        "asr_worker_crashed",
+                        retryable=True,
                     )
         process.join(5)
-        if process.is_alive():
-            process.kill()
-            process.join(5)
+        terminate_child_process(process)
         if not isinstance(result, dict):
             raise ExtractionFailure(502, "Local ASR returned an invalid result.", "asr_failed")
         entries, meta = parse_transcription_result(result)
         meta["asr_worker_reused"] = False
+        meta["asr_worker_restart_count"] = 0
+        meta["timeout_seconds"] = timeout_seconds
         return entries, meta
     finally:
-        if process is not None and process.is_alive():
-            process.kill()
-            process.join(5)
-        try:
-            result_queue.close()
-        except Exception:
-            pass
+        terminate_child_process(process)
+        if result_queue is not None:
+            try:
+                result_queue.close()
+            except Exception:
+                pass
 
 
 def transcribe_audio(
     audio_path: Path,
     lang: str | None,
-    quality: str = "fast",
+    quality: str = "accurate",
+    initial_prompt: str | None = None,
+    hotwords: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
-    global ASR_WORKER_WARM
+    global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
     profile = asr_profile(quality)
+    timeout_seconds = asr_task_timeout(audio_path, profile["quality"])
     if not env_bool("ASR_PERSISTENT_WORKER", True):
-        return transcribe_audio_once(audio_path, lang, profile["quality"])
+        return transcribe_audio_once(
+            audio_path,
+            lang,
+            profile["quality"],
+            initial_prompt,
+            hotwords,
+        )
 
     with ASR_WORKER_LOCK:
         worker_reused = asr_worker_alive()
@@ -3193,31 +4361,59 @@ def transcribe_audio(
                 "audio_path": str(audio_path),
                 "lang": lang,
                 "quality": profile["quality"],
+                "initial_prompt": sanitize_asr_context(initial_prompt),
+                "hotwords": sanitize_asr_context(hotwords),
             }
         )
-        deadline = time.monotonic() + profile["timeout_seconds"]
+        deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 stop_asr_worker_locked(graceful=False)
                 raise ExtractionFailure(
                     504,
-                    f"Local ASR timed out after {profile['timeout_seconds']} seconds.",
+                    f"Local ASR timed out after {timeout_seconds} seconds.",
                     "asr_timeout",
                 )
             if process is None or not process.is_alive():
                 exit_code = process.exitcode if process is not None else None
                 stop_asr_worker_locked(graceful=False)
-                raise ExtractionFailure(502, f"Local ASR worker exited without a result. exit_code={exit_code}", "asr_failed")
+                detail = (
+                    "本地语音识别进程可能因内存不足被系统终止。"
+                    if exit_code in {-9, 137}
+                    else "本地语音识别进程意外退出，下一次任务会自动重建。"
+                )
+                raise ExtractionFailure(502, detail, "asr_worker_crashed", retryable=True)
             try:
                 result = result_queue.get(timeout=min(1.0, remaining))
             except Empty:
+                continue
+            if isinstance(result, dict) and result.get("kind") == "prewarm":
+                ASR_WORKER_WARM = bool(result.get("ok"))
+                model_key = result.get("model_key")
+                if isinstance(model_key, list) and len(model_key) == 4:
+                    ASR_WORKER_MODEL_KEY = (
+                        str(model_key[0]),
+                        str(model_key[1]),
+                        str(model_key[2]),
+                        int(model_key[3]),
+                    )
+                continue
+            if not isinstance(result, dict):
                 continue
             if result.get("task_id") != task_id:
                 continue
             entries, meta = parse_transcription_result(result)
             ASR_WORKER_WARM = True
+            ASR_WORKER_MODEL_KEY = (
+                str(meta.get("model") or profile["model"]),
+                str(meta.get("compute_type") or profile["compute_type"]),
+                str(meta.get("device") or profile["device"]),
+                int(meta.get("cpu_threads") or profile["cpu_threads"]),
+            )
             meta["asr_worker_reused"] = reused
+            meta["asr_worker_restart_count"] = max(0, ASR_WORKER_START_COUNT - 1)
+            meta["timeout_seconds"] = timeout_seconds
             return entries, meta
 
 
@@ -3228,6 +4424,7 @@ def video_pixel_subtitle(
     url = normalize_input(req.input)
     platform = detect_platform(url)
     started = time.monotonic()
+    ensure_disk_space(ASR_TMP_DIR, min(MEDIA_MAX_BYTES, 512 * 1024 * 1024))
     with tempfile.TemporaryDirectory(prefix="ocr-", dir=str(ASR_TMP_DIR)) as tmp:
         tmp_path = Path(tmp)
         report_progress("platform", 16, "正在解析视频画面与字幕信息")
@@ -3274,7 +4471,18 @@ def video_pixel_subtitle(
             if not acquired:
                 raise ExtractionFailure(429, "Local ASR wait exceeded the queue timeout.", "asr_busy")
             try:
-                entries, fallback_asr_info = transcribe_audio(audio_path, req.lang, "accurate")
+                initial_prompt, hotwords = asr_context(
+                    str(info.get("title") or ""),
+                    str(info.get("author") or ""),
+                    req.hotwords,
+                )
+                entries, fallback_asr_info = transcribe_audio(
+                    audio_path,
+                    req.lang,
+                    "accurate",
+                    initial_prompt,
+                    hotwords,
+                )
             finally:
                 ASR_SEMAPHORE.release()
         if not entries:
@@ -3297,6 +4505,9 @@ def video_pixel_subtitle(
         track_source_type = "burned_in_ocr"
         subtitle_format = "ocr"
         note = "已通过画面文字识别提取视频中的烧录字幕。"
+    quality_note = asr_quality_user_note(fallback_asr_info)
+    if quality_note:
+        note = f"{note} {quality_note}"
     profile = asr_profile("accurate")
     meta = {
         "title": info.get("title"),
@@ -3333,11 +4544,13 @@ def video_pixel_subtitle(
                 "asr_language_probability": fallback_asr_info.get("language_probability"),
             }
         )
+        meta.update(asr_public_diagnostics(fallback_asr_info))
     return entries, meta
 
 
 def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None = None) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     ensure_asr_ready()
+    ensure_disk_space(ASR_TMP_DIR, min(BILI_MAX_DOWNLOAD_BYTES, 512 * 1024 * 1024))
     quality = effective_quality(req.quality, req.embedded_subtitles)
     profile = asr_profile(quality)
     url = normalize_input(req.input)
@@ -3397,7 +4610,14 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
                 68,
                 "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
             )
-            entries, asr_info = transcribe_audio(audio_path, req.lang, quality)
+            initial_prompt, hotwords = asr_context(view.title, view.author, req.hotwords)
+            entries, asr_info = transcribe_audio(
+                audio_path,
+                req.lang,
+                quality,
+                initial_prompt,
+                hotwords,
+            )
     finally:
         ASR_SEMAPHORE.release()
     if not entries:
@@ -3405,6 +4625,9 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
     note = "未找到可用的平台字幕，本次使用本地语音识别。"
     if prior_note:
         note = f"{redact_sensitive(prior_note)} 已改用本地语音识别。"
+    quality_note = asr_quality_user_note(asr_info)
+    if quality_note:
+        note = f"{note} {quality_note}"
     meta = {
         "title": view.title or info.get("title"),
         "id": view.video_id or info.get("id"),
@@ -3428,7 +4651,7 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
         "asr_cpu_threads": asr_info.get("cpu_threads") or profile["cpu_threads"],
         "asr_beam_size": asr_info.get("beam_size") or profile["beam_size"],
         "asr_vad_filter": asr_info.get("vad_filter", profile["vad_filter"]),
-        "asr_timeout_seconds": profile["timeout_seconds"],
+        "asr_timeout_seconds": asr_info.get("timeout_seconds") or profile["timeout_seconds"],
         "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
         "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
         "asr_worker_reused": bool(asr_info.get("asr_worker_reused")),
@@ -3438,6 +4661,7 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
         "audio_quality_strategy": info.get("audio_quality_strategy"),
         "asr_language_probability": asr_info.get("language_probability"),
         "available_tracks": [],
+        **asr_public_diagnostics(asr_info),
     }
     return entries, meta
 
@@ -3464,12 +4688,15 @@ def apply_upload_metadata(meta: dict[str, Any], req: UploadJobRequest) -> None:
 
 def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     started = time.monotonic()
+    request_started_at = time.time()
     report_progress("validating", 7, "正在校验上传视频")
     key = upload_result_cache_key(req)
 
     with result_key_guard(key):
         report_progress("cache", 10, "正在检查已有识别结果")
-        cached = None if req.force_refresh else load_cached_result(key)
+        cached = load_cached_result(key)
+        if req.force_refresh and not cache_updated_since(key, request_started_at):
+            cached = None
         if cached is not None:
             entries, meta, cache_age = cached
             meta["cache_hit"] = True
@@ -3518,7 +4745,18 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                         68,
                         "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
                     )
-                    return transcribe_audio(normalized_path, req.lang, quality)
+                    initial_prompt, hotwords = asr_context(
+                        upload_display_title(req.filename),
+                        None,
+                        req.hotwords,
+                    )
+                    return transcribe_audio(
+                        normalized_path,
+                        req.lang,
+                        quality,
+                        initial_prompt,
+                        hotwords,
+                    )
                 finally:
                     ASR_SEMAPHORE.release()
 
@@ -3557,6 +4795,9 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 track_source_type = "burned_in_ocr"
                 subtitle_format = "ocr"
                 note = "已通过画面文字识别提取上传视频中的烧录字幕。"
+            quality_note = asr_quality_user_note(asr_info)
+            if quality_note:
+                note = f"{note} {quality_note}"
             meta = {
                 "title": upload_display_title(req.filename),
                 "id": f"upload-{req.sha256[:12]}",
@@ -3581,7 +4822,11 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 "asr_cpu_threads": asr_info.get("cpu_threads") or (profile["cpu_threads"] if asr_info else None),
                 "asr_beam_size": asr_info.get("beam_size") or (profile["beam_size"] if asr_info else None),
                 "asr_vad_filter": asr_info.get("vad_filter", profile["vad_filter"] if asr_info else None),
-                "asr_timeout_seconds": profile["timeout_seconds"] if asr_info else None,
+                "asr_timeout_seconds": (
+                    asr_info.get("timeout_seconds") or profile["timeout_seconds"]
+                    if asr_info
+                    else None
+                ),
                 "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
                 "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
                 "asr_worker_reused": bool(asr_info.get("asr_worker_reused")),
@@ -3593,6 +4838,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 "cache_hit": False,
                 "cache_age_seconds": 0,
                 **subtitle_info,
+                **asr_public_diagnostics(asr_info),
             }
             apply_upload_metadata(meta, req)
             meta["entry_count"] = len(entries)
@@ -3651,17 +4897,17 @@ def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
 
 
 def extraction_http_error(req: ExtractRequest, exc: ExtractionFailure, failures: list[dict[str, Any]]) -> HTTPException:
-    return HTTPException(
-        status_code=exc.status_code,
-        detail={
-            "source": "failed",
-            "reason": public_reason(exc.reason),
-            "message": redact_sensitive(exc.detail),
-            "attempts": redact_sensitive(failures),
+    detail = extraction_error_detail("failed", exc, failures)
+    detail.update(
+        {
             "cookie_enabled": cookie_enabled(),
             "cookie_requested": req.use_cookie,
             "cookie_used": False,
-        },
+        }
+    )
+    return HTTPException(
+        status_code=exc.status_code,
+        detail=detail,
     )
 
 
@@ -3695,10 +4941,14 @@ def extract_subtitle_uncached(req: ExtractRequest) -> tuple[list[SubtitleEntry],
                         entries, meta = asr_subtitle(
                             req,
                             allow_cookie=allow_cookie,
-                            prior_note=second.detail,
+                            prior_note=failure_user_message(second),
                         )
                 else:
-                    entries, meta = asr_subtitle(req, allow_cookie=False, prior_note=first.detail)
+                    entries, meta = asr_subtitle(
+                        req,
+                        allow_cookie=False,
+                        prior_note=failure_user_message(first),
+                    )
     except ExtractionFailure as exc:
         raise extraction_http_error(req, exc, failures) from exc
 
@@ -3715,17 +4965,25 @@ def extract_subtitle_uncached(req: ExtractRequest) -> tuple[list[SubtitleEntry],
 
 def extract_subtitle_data(req: ExtractRequest) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     start = time.monotonic()
+    request_started_at = time.time()
     report_progress("validating", 7, "正在校验视频链接")
     try:
         canonical_input = normalize_input(req.input)
     except ExtractionFailure as exc:
         raise extraction_http_error(req, exc, []) from exc
-    canonical_req = req.model_copy(update={"input": canonical_input})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical_input,
+            "hotwords": sanitize_asr_context(req.hotwords),
+        }
+    )
     key = result_cache_key(canonical_req, canonical_input)
 
     with result_key_guard(key):
         report_progress("cache", 10, "正在检查已有结果")
-        cached = None if req.force_refresh else load_cached_result(key)
+        cached = load_cached_result(key)
+        if req.force_refresh and not cache_updated_since(key, request_started_at):
+            cached = None
         if cached is not None:
             entries, meta, cache_age = cached
             meta["cache_hit"] = True
@@ -3799,7 +5057,12 @@ def cached_extraction_payload(
         return None
     started = time.monotonic()
     canonical = canonical_input or normalize_input(req.input)
-    canonical_req = req.model_copy(update={"input": canonical})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical,
+            "hotwords": sanitize_asr_context(req.hotwords),
+        }
+    )
     key = result_cache_key(canonical_req, canonical)
     with result_key_guard(key, blocking=False) as acquired:
         if not acquired:
@@ -3845,11 +5108,7 @@ def process_queued_job(
         except ExtractionFailure as exc:
             raise HTTPException(
                 status_code=exc.status_code,
-                detail={
-                    "source": "upload",
-                    "reason": public_reason(exc.reason),
-                    "message": redact_sensitive(exc.detail),
-                },
+                detail=extraction_error_detail("upload", exc),
             ) from exc
         finally:
             discard_upload_payload(payload)
@@ -3864,11 +5123,7 @@ def process_queued_job(
         except ExtractionFailure as exc:
             raise HTTPException(
                 status_code=exc.status_code,
-                detail={
-                    "source": "media",
-                    "reason": public_reason(exc.reason),
-                    "message": redact_sensitive(exc.detail),
-                },
+                detail=extraction_error_detail("media", exc),
             ) from exc
         finally:
             if not completed:
@@ -3916,7 +5171,12 @@ def submit_extraction_job(req: ExtractRequest, owner_id: int, idempotency_key: s
         canonical_input = normalize_input(req.input)
     except ExtractionFailure as exc:
         raise extraction_http_error(req, exc, []) from exc
-    canonical_req = req.model_copy(update={"input": canonical_input})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical_input,
+            "hotwords": sanitize_asr_context(req.hotwords),
+        }
+    )
     cached_payload = cached_extraction_payload(canonical_req, canonical_input)
     try:
         if cached_payload is not None:
@@ -3940,7 +5200,9 @@ def submit_extraction_job(req: ExtractRequest, owner_id: int, idempotency_key: s
             detail={
                 "source": "queue",
                 "reason": "queue_full",
+                "code": "job_queue_full",
                 "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                "retryable": True,
             },
         ) from exc
     job["platform"] = detect_platform(canonical_input)
@@ -3966,10 +5228,46 @@ def request_content_length(request: Request) -> int | None:
     return value
 
 
+def request_asr_hotwords(request: Request) -> str | None:
+    encoded = request.headers.get("x-asr-hotwords", "").strip()
+    if not encoded:
+        return None
+    if re.search(r"%(?![0-9A-Fa-f]{2})", encoded):
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "invalid_hotwords", "message": "专业词汇编码无效。"},
+        )
+    if len(encoded) > ASR_PROMPT_MAX_CHARS * 12:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "reason": "hotwords_too_long",
+                "message": f"专业词汇最多输入 {ASR_PROMPT_MAX_CHARS} 个字符。",
+            },
+        )
+    try:
+        decoded = urllib.parse.unquote(encoded, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "invalid_hotwords", "message": "专业词汇编码无效。"},
+        ) from exc
+    if len(decoded) > ASR_PROMPT_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "reason": "hotwords_too_long",
+                "message": f"专业词汇最多输入 {ASR_PROMPT_MAX_CHARS} 个字符。",
+            },
+        )
+    return sanitize_asr_context(decoded)
+
+
 def upload_idempotency_fingerprint(
     filename: str,
     output_format: str,
     lang: str | None,
+    hotwords: str | None,
     quality: str,
     embedded_subtitles: bool,
     force_refresh: bool,
@@ -3982,6 +5280,7 @@ def upload_idempotency_fingerprint(
             "filename": safe_name,
             "format": output_format,
             "lang": (lang or "").lower().replace("_", "-"),
+            "hotwords_hash": asr_context_hash(hotwords),
             "quality": quality,
             "embedded_subtitles": embedded_subtitles,
             "force_refresh": force_refresh,
@@ -4008,11 +5307,7 @@ def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | No
     except ExtractionFailure as exc:
         raise HTTPException(
             status_code=exc.status_code,
-            detail={
-                "source": "media",
-                "reason": public_reason(exc.reason),
-                "message": redact_sensitive(exc.detail),
-            },
+            detail=extraction_error_detail("media", exc),
         ) from exc
     canonical_req = req.model_copy(update={"input": canonical_input})
     fingerprint = media_idempotency_fingerprint(canonical_req, canonical_input) if idempotency_key else None
@@ -4034,7 +5329,9 @@ def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | No
             detail={
                 "source": "queue",
                 "reason": "queue_full",
+                "code": "job_queue_full",
                 "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                "retryable": True,
             },
         )
 
@@ -4061,7 +5358,9 @@ def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | No
                 detail={
                     "source": "queue",
                     "reason": "queue_full",
+                    "code": "job_queue_full",
                     "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                    "retryable": True,
                 },
             ) from exc
         transferred = not bool(job.get("reused"))
@@ -4083,6 +5382,7 @@ async def stage_uploaded_video(
     quality: Literal["fast", "accurate"],
     embedded_subtitles: bool,
     force_refresh: bool,
+    hotwords: str | None = None,
 ) -> UploadJobRequest:
     safe_name, extension = safe_upload_filename(filename)
     content_length = request_content_length(request)
@@ -4097,6 +5397,7 @@ async def stage_uploaded_video(
         directory.mkdir(mode=0o700)
         digest = hashlib.sha256()
         written = 0
+        next_disk_check = 32 * 1024 * 1024
         try:
             with target.open("xb") as handle:
                 os.chmod(target, 0o600)
@@ -4105,6 +5406,9 @@ async def stage_uploaded_video(
                         continue
                     next_size = written + len(chunk)
                     resize_upload_reservation(upload_token, next_size)
+                    if next_size >= next_disk_check:
+                        disk_space_http_error(ASR_TMP_DIR)
+                        next_disk_check = next_size + 32 * 1024 * 1024
                     handle.write(chunk)
                     digest.update(chunk)
                     written = next_size
@@ -4131,10 +5435,35 @@ async def stage_uploaded_video(
             size=written,
             format=output_format,
             lang=lang,
+            hotwords=sanitize_asr_context(hotwords),
             quality=quality,
             embedded_subtitles=embedded_subtitles,
             force_refresh=force_refresh,
         )
+    except asyncio.CancelledError:
+        discard_upload_payload(payload)
+        raise
+    except OSError as exc:
+        discard_upload_payload(payload)
+        if exc.errno == errno.ENOSPC:
+            raise HTTPException(
+                status_code=507,
+                detail={
+                    "reason": "disk_space_low",
+                    "code": "disk_space_low",
+                    "message": "服务器剩余磁盘空间不足，上传已安全停止。",
+                    "retryable": True,
+                },
+            ) from exc
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "reason": "upload_write_failed",
+                "code": "upload_failed",
+                "message": "服务器无法保存上传文件，请稍后重试。",
+                "retryable": True,
+            },
+        ) from exc
     except Exception:
         discard_upload_payload(payload)
         raise
@@ -4313,8 +5642,7 @@ def startup() -> None:
         and env_bool("ASR_PERSISTENT_WORKER", True)
         and env_bool("ASR_PREWARM", True)
     ):
-        with ASR_WORKER_LOCK:
-            ensure_persistent_asr_worker_locked()
+        start_asr_prewarm()
 
 
 @app.on_event("shutdown")
@@ -4328,6 +5656,25 @@ def health() -> dict[str, Any]:
     JOB_MANAGER.cleanup()
     cleanup_stale_media_artifacts()
     douyin = douyin_adapter_status()
+    ffmpeg_available = bool(shutil.which("ffmpeg"))
+    ffprobe_available = bool(shutil.which("ffprobe"))
+    try:
+        disk = disk_space_status(MEDIA_ARTIFACT_DIR)
+        disk_payload = {
+            "available": disk.available,
+            "free_bytes": disk.free_bytes,
+            "free_ratio": round(disk.free_ratio, 4),
+            "minimum_free_bytes": disk.minimum_free_bytes,
+            "minimum_free_ratio": MIN_FREE_DISK_RATIO,
+        }
+    except OSError:
+        disk_payload = {
+            "available": False,
+            "free_bytes": None,
+            "free_ratio": None,
+            "minimum_free_bytes": MIN_FREE_DISK_BYTES,
+            "minimum_free_ratio": MIN_FREE_DISK_RATIO,
+        }
     return {
         "status": "ok",
         "service_version": SERVICE_VERSION,
@@ -4341,30 +5688,50 @@ def health() -> dict[str, Any]:
         "asr_prewarm": env_bool("ASR_PREWARM", True),
         "asr_worker_alive": asr_worker_alive(),
         "asr_worker_warm": ASR_WORKER_WARM and asr_worker_alive(),
-        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower(),
+        "ffmpeg_available": ffmpeg_available,
+        "ffprobe_available": ffprobe_available,
+        "disk": disk_payload,
+        "memory": runtime_memory_status(),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
+        "asr_audio_filter_enabled": bool(asr_audio_filter()),
+        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
         "max_audio_seconds": ASR_MAX_AUDIO_SECONDS,
         "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
         "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
+        "asr_single_model_instance": True,
+        "asr_prewarm_quality": os.getenv("ASR_PREWARM_QUALITY", "accurate").strip().lower(),
+        "asr_worker_restart_count": max(0, ASR_WORKER_START_COUNT - 1),
+        "asr_worker_model_key": list(ASR_WORKER_MODEL_KEY) if ASR_WORKER_MODEL_KEY else None,
+        "default_request": {
+            "quality": "accurate",
+            "language": "zh",
+            "allow_platform_ai": False,
+        },
         "extraction_modes": {
             "fast": {
                 "model": DEFAULT_ASR_MODEL,
                 "beam_size": ASR_FAST_BEAM_SIZE,
-                "vad_filter": env_bool("ASR_VAD_FILTER", False),
+                "vad_filter": env_bool("ASR_VAD_FILTER", True),
+                "condition_on_previous_text": env_bool("ASR_CONDITION_ON_PREVIOUS_TEXT", False),
             },
             "accurate": {
                 "model": ACCURATE_ASR_MODEL,
                 "beam_size": ACCURATE_ASR_BEAM_SIZE,
                 "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
+                "condition_on_previous_text": env_bool(
+                    "ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT",
+                    True,
+                ),
             },
         },
         "ocr": {
             "enabled": bool(
-                shutil.which("ffmpeg")
+                ffmpeg_available
                 and importlib.util.find_spec("rapidocr") is not None
                 and importlib.util.find_spec("onnxruntime") is not None
             ),
             "engine": "RapidOCR PP-OCRv6",
-            "embedded_tracks_enabled": bool(shutil.which("ffmpeg")),
+            "embedded_tracks_enabled": ffmpeg_available,
             "sample_fps": OCR_SAMPLE_FPS,
             "max_frames": OCR_MAX_FRAMES,
         },
@@ -4376,7 +5743,7 @@ def health() -> dict[str, Any]:
             "allowed_extensions": sorted(UPLOAD_ALLOWED_EXTENSIONS),
         },
         "media": {
-            "enabled": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
+            "enabled": ffmpeg_available and ffprobe_available,
             "max_bytes": MEDIA_MAX_BYTES,
             "staging_max_bytes": MEDIA_STAGING_MAX_BYTES,
             "staging_reserved_bytes": media_staging_bytes(),
@@ -4479,10 +5846,7 @@ def api_login_qrcode() -> dict[str, Any]:
     if not web_qr_login_enabled():
         raise HTTPException(
             status_code=403,
-            detail=(
-                "Web QR login is disabled. Use sudo /usr/local/sbin/bili-subtitle-qr-login "
-                "on the server for optional Cookie refresh."
-            ),
+            detail={"reason": "qr_login_disabled", "message": "网页扫码登录当前未启用。"},
         )
     headers = {"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"}
     try:
@@ -4592,15 +5956,16 @@ async def api_create_upload_job(
         alias="format",
     ),
     lang: str | None = Query(
-        default=None,
+        default="zh",
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     ),
-    quality: Literal["fast", "accurate"] = Query("fast"),
+    quality: Literal["fast", "accurate"] = Query("accurate"),
     embedded_subtitles: bool = Query(False),
     force_refresh: bool = Query(False),
 ) -> JSONResponse:
     user = require_auth_user(request)
+    hotwords = request_asr_hotwords(request)
     idempotency_key = request_idempotency_key(request)
     content_length = request_content_length(request)
     idempotency_fingerprint = (
@@ -4608,6 +5973,7 @@ async def api_create_upload_job(
             filename,
             output_format,
             lang,
+            hotwords,
             quality,
             embedded_subtitles,
             force_refresh,
@@ -4633,7 +5999,9 @@ async def api_create_upload_job(
             detail={
                 "source": "queue",
                 "reason": "queue_full",
+                "code": "job_queue_full",
                 "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                "retryable": True,
             },
         )
 
@@ -4642,6 +6010,7 @@ async def api_create_upload_job(
         filename=filename,
         output_format=output_format,
         lang=lang,
+        hotwords=hotwords,
         quality=quality,
         embedded_subtitles=embedded_subtitles,
         force_refresh=force_refresh,
@@ -4672,7 +6041,9 @@ async def api_create_upload_job(
                     detail={
                         "source": "queue",
                         "reason": "queue_full",
+                        "code": "job_queue_full",
                         "message": f"任务队列已满，当前最多等待 {JOB_QUEUE_MAX_PENDING} 个任务，请稍后再试。",
+                        "retryable": True,
                     },
                 ) from exc
             transferred = not bool(job.get("reused"))
@@ -4691,7 +6062,15 @@ def api_get_job(job_id: str, request: Request) -> JSONResponse:
     try:
         job = JOB_MANAGER.get(job_id, owner_id=user.user_id)
     except JobNotFound as exc:
-        raise HTTPException(status_code=404, detail={"reason": "job_not_found", "message": "任务不存在或已过期。"}) from exc
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "job_not_found",
+                "code": "job_expired",
+                "message": "服务可能已重启或任务已过期，请重新提交。",
+                "retryable": True,
+            },
+        ) from exc
     return JSONResponse(job, headers={"Cache-Control": "no-store"})
 
 
@@ -4718,11 +6097,24 @@ def api_cancel_job(job_id: str, request: Request) -> JSONResponse:
     try:
         job = JOB_MANAGER.cancel(job_id, owner_id=user.user_id)
     except JobNotFound as exc:
-        raise HTTPException(status_code=404, detail={"reason": "job_not_found", "message": "任务不存在或已过期。"}) from exc
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "job_not_found",
+                "code": "job_expired",
+                "message": "服务可能已重启或任务已过期，请重新提交。",
+                "retryable": True,
+            },
+        ) from exc
     if job["status"] == "running":
         raise HTTPException(
             status_code=409,
-            detail={"reason": "job_running", "message": "任务已经开始处理，暂时无法安全取消。"},
+            detail={
+                "reason": "job_running",
+                "code": "task_not_interruptible",
+                "message": "当前阶段不可立即中断，任务仍在安全处理资源。",
+                "retryable": False,
+            },
         )
     return JSONResponse(job, headers={"Cache-Control": "no-store"})
 

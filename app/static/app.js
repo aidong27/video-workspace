@@ -28,6 +28,8 @@
     platformAiRow: $("platform-ai-row"),
     format: $("format-select"),
     lang: $("lang-select"),
+    hotwordsRow: $("hotwords-row"),
+    hotwords: $("hotwords-input"),
     allowPlatformAi: $("allow-platform-ai"),
     cookieRow: $("cookie-row"),
     useCookie: $("use-cookie"),
@@ -119,6 +121,8 @@
     asr_busy: "等待语音识别资源超时，请稍后重试。",
     asr_duration_too_long: "视频时长超过当前服务限制。",
     asr_timeout: "语音识别超时，可稍后重试或使用更短的视频。",
+    asr_worker_crashed: "语音识别进程意外退出，可能是内存不足，请稍后重试。",
+    asr_model_download_failed: "语音识别模型不可用，请检查模型缓存与服务器网络。",
     download_failed: "视频、音频或字幕下载失败，请稍后重试。",
     asr_failed: "本地语音识别失败，请稍后重试。",
     ocr_missing: "画面字幕识别组件尚未准备完成。",
@@ -127,6 +131,7 @@
     ocr_timeout: "画面字幕识别超时，请尝试更短的视频。",
     platform_temporarily_unavailable: "平台暂时拒绝了视频请求，请稍后重试。",
     douyin_browser_missing: "抖音处理组件尚未准备完成。",
+    douyin_browser_busy: "抖音浏览器资源正忙，请稍后重试。",
     douyin_adapter_missing: "抖音处理组件尚未准备完成。",
     unsupported_upload_format: "暂不支持这种视频格式。",
     invalid_upload_media: "无法读取这个视频，请换一个文件。",
@@ -141,9 +146,15 @@
     video_stream_missing: "没有找到可下载的视频画面。",
     audio_stream_missing: "没有找到可提取的音轨。",
     media_convert_failed: "音频转换失败，请稍后重试。",
+    ffmpeg_failed: "媒体探测或转换失败，请确认文件可正常播放。",
+    disk_space_low: "服务器剩余磁盘空间不足，请稍后重试。",
+    no_audio_stream: "视频没有音轨，无法识别语音或生成 MP3。",
+    subtitle_unavailable: "没有找到可读取的字幕或语音内容。",
+    job_queue_full: "任务队列已满，请稍后重试。",
+    job_expired: "服务可能已重启或任务已过期，请重新提交。",
     artifact_expired: "下载文件已过期，请重新提取。",
     artifact_not_found: "下载文件不存在或已过期。",
-    job_not_found: "任务已过期，请重新提交。",
+    job_not_found: "服务可能已重启或任务已过期，请重新提交。",
     idempotency_conflict: "这次提交与上一次请求不一致，请重新提交。",
     authentication_required: "登录已失效，正在返回登录页。"
   };
@@ -222,8 +233,9 @@
     setInputMode(payload.kind === "upload" ? "upload" : "link");
     if (payload.kind !== "media") {
       elements.format.value = payload.format || "txt";
-      elements.lang.value = payload.lang || "";
-      setSelectedQuality(payload.quality || "fast");
+      elements.lang.value = payload.lang || "zh";
+      elements.hotwords.value = payload.hotwords || "";
+      setSelectedQuality(payload.quality || "accurate");
       elements.embeddedSubtitles.checked = Boolean(payload.embedded_subtitles);
     }
     elements.forceRefresh.checked = Boolean(payload.force_refresh);
@@ -237,7 +249,7 @@
     }
     if (!payload.input) return;
     elements.input.value = payload.input;
-    if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai !== false;
+    if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai === true;
     elements.useCookie.checked = Boolean(payload.use_cookie);
     if (payload.kind !== "media") setSelectedSource(payload.source || "auto");
     updatePlatformDetect();
@@ -317,7 +329,7 @@
 
   function selectedQuality() {
     const selected = elements.form.querySelector('input[name="quality"]:checked');
-    return selected ? selected.value : "fast";
+    return selected ? selected.value : "accurate";
   }
 
   function selectedEmbeddedSubtitles() {
@@ -413,11 +425,13 @@
       radio.disabled = state.busy || embedded;
     });
     elements.allowPlatformAi.disabled = state.busy || embedded;
+    elements.hotwords.disabled = state.busy || !subtitleMode;
+    elements.hotwordsRow.hidden = !subtitleMode;
     elements.qualityCaption.textContent = embedded
       ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
       : selectedQuality() === "accurate"
-        ? "使用更强模型和更细致解码，处理时间更长"
-        : "适合吐字清晰的视频，优先缩短等待时间";
+        ? "保留跨段上下文并使用更细致的解码"
+        : "使用同一常驻模型，以较窄搜索缩短等待时间";
     elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
   }
 
@@ -495,6 +509,7 @@
           source: selectedSource(),
           format: elements.format.value,
           lang: elements.lang.value || null,
+          hotwords: elements.hotwords.value.trim() || null,
           quality: selectedQuality(),
           embedded_subtitles: selectedEmbeddedSubtitles(),
           use_cookie: elements.useCookie.checked,
@@ -581,6 +596,8 @@
   function friendlyError(value, status) {
     const detail = errorDetail(value);
     const reason = detail && typeof detail === "object" ? detail.reason : "";
+    const code = detail && typeof detail === "object" ? detail.code : "";
+    if (code && errorMessages[code]) return errorMessages[code];
     if (reason && errorMessages[reason]) return errorMessages[reason];
     if (status === 401) return "访问凭据已失效，请重新登录。";
     if (status === 413) return "视频或音频文件超过当前大小限制。";
@@ -741,10 +758,11 @@
       title: meta.title || sourceId,
       operation,
       source: payload.source,
-      quality: payload.quality || "fast",
+      quality: payload.quality || "accurate",
       embeddedSubtitles: Boolean(payload.embedded_subtitles),
       format: payload.format || (operation === "audio" ? "mp3" : "mp4"),
       lang: payload.lang || "",
+      hotwords: payload.hotwords || "",
       platform: meta.platform || detectPlatform(payload.input),
       time: Date.now()
     };
@@ -777,9 +795,10 @@
         elements.input.value = item.input;
         if ((item.operation || "subtitle") === "subtitle") {
           elements.format.value = item.format;
-          elements.lang.value = item.lang || "";
+          elements.lang.value = item.lang || "zh";
+          elements.hotwords.value = item.hotwords || "";
           setSelectedSource(item.source || "auto");
-          setSelectedQuality(item.quality || "fast");
+          setSelectedQuality(item.quality || "accurate");
           elements.embeddedSubtitles.checked = Boolean(item.embeddedSubtitles);
           syncInputMode();
         }
@@ -931,6 +950,7 @@
       last_modified: file.lastModified || 0,
       format: elements.format.value,
       lang: elements.lang.value || null,
+      hotwords: elements.hotwords.value.trim() || null,
       quality: selectedQuality(),
       embedded_subtitles: selectedEmbeddedSubtitles(),
       force_refresh: elements.forceRefresh.checked
@@ -960,6 +980,7 @@
     xhr.open("POST", `/api/upload-jobs?${params.toString()}`);
     xhr.withCredentials = true;
     xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+    if (payload.hotwords) xhr.setRequestHeader("X-ASR-Hotwords", encodeURIComponent(payload.hotwords));
     xhr.upload.addEventListener("progress", (event) => {
       if (!event.lengthComputable || state.uploadXhr !== xhr) return;
       const percent = Math.min(100, Math.max(2, Math.round((event.loaded / event.total) * 100)));

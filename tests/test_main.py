@@ -1,6 +1,9 @@
+import asyncio
+import json
 import os
 from pathlib import Path
 import tempfile
+from threading import Event, Thread
 import time
 import unittest
 from unittest.mock import patch
@@ -8,6 +11,37 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app import main
+
+
+class RequestDefaultsTests(unittest.TestCase):
+    def test_linux_memory_parser_ignores_invalid_fields(self) -> None:
+        parsed = main.parse_linux_memory_kib(
+            "VmRSS: 153600 kB\nVmSwap: 2048 kB\nBroken: unavailable\n"
+        )
+
+        self.assertEqual(parsed["VmRSS"], 153600)
+        self.assertEqual(parsed["VmSwap"], 2048)
+        self.assertNotIn("Broken", parsed)
+
+    def test_subtitle_requests_default_to_local_quality_first_settings(self) -> None:
+        request = main.ExtractRequest(input="BV14jFvzbEvj")
+
+        self.assertEqual(request.source, "auto")
+        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.lang, "zh")
+        self.assertFalse(request.allow_platform_ai)
+
+    def test_upload_requests_use_the_same_quality_and_language_defaults(self) -> None:
+        request = main.UploadJobRequest(
+            upload_token="a" * 32,
+            stored_name="source.mp4",
+            filename="clip.mp4",
+            sha256="b" * 64,
+            size=123,
+        )
+
+        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.lang, "zh")
 
 
 class ResultCacheTests(unittest.TestCase):
@@ -50,6 +84,20 @@ class ResultCacheTests(unittest.TestCase):
         self.assertEqual(main.effective_quality("fast", embedded_subtitles=True), "accurate")
         self.assertEqual(main.asr_profile("fast")["model"], main.DEFAULT_ASR_MODEL)
         self.assertEqual(main.asr_profile("accurate")["model"], main.ACCURATE_ASR_MODEL)
+
+    def test_cache_key_includes_hashed_hotwords_and_audio_filter(self) -> None:
+        canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
+        first = main.ExtractRequest(input=canonical, source="asr", hotwords="MQTT, ESP32")
+        second = first.model_copy(update={"hotwords": "LoRa, Node-RED"})
+
+        with patch.dict(os.environ, {"ASR_AUDIO_FILTER": ""}):
+            first_key = main.result_cache_key(first, canonical)
+            second_key = main.result_cache_key(second, canonical)
+        with patch.dict(os.environ, {"ASR_AUDIO_FILTER": "highpass=f=70"}):
+            filtered_key = main.result_cache_key(first, canonical)
+
+        self.assertNotEqual(first_key, second_key)
+        self.assertNotEqual(first_key, filtered_key)
 
     def test_cached_entries_round_trip(self) -> None:
         entries = [main.SubtitleEntry(0.25, 1.5, "测试字幕")]
@@ -122,6 +170,54 @@ class ResultCacheTests(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertFalse(path.exists())
 
+    def test_corrupt_cache_file_is_deleted_before_recalculation(self) -> None:
+        key = "f" * 64
+        path = main.result_cache_path(key)
+        path.write_text("{broken-json", encoding="utf-8")
+
+        self.assertIsNone(main.load_cached_result(key))
+        self.assertFalse(path.exists())
+
+    def test_concurrent_force_refresh_runs_recognition_once(self) -> None:
+        canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
+        request = main.ExtractRequest(input=canonical, force_refresh=True)
+        entered = Event()
+        release = Event()
+        calls = []
+        results = []
+
+        def extract(_request):
+            calls.append(True)
+            entered.set()
+            release.wait(2)
+            return [main.SubtitleEntry(0, 1, "并发结果")], {
+                "title": "并发测试",
+                "source": "asr_local",
+                "platform": "bilibili",
+            }
+
+        def run() -> None:
+            results.append(main.extract_subtitle_data(request))
+
+        with patch.object(main, "normalize_input", return_value=canonical), patch.object(
+            main, "extract_subtitle_uncached", side_effect=extract
+        ):
+            first = Thread(target=run)
+            second = Thread(target=run)
+            first.start()
+            self.assertTrue(entered.wait(1))
+            second.start()
+            time.sleep(0.05)
+            release.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(bool(meta["cache_hit"]) for _, meta in results), 1)
+
 
 class UploadExtractionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -163,7 +259,7 @@ class UploadExtractionTests(unittest.TestCase):
         )
 
     def test_upload_job_transcribes_and_removes_staged_video(self) -> None:
-        request = self.staged_request()
+        request = self.staged_request().model_copy(update={"hotwords": "MQTT, ESP32"})
         directory = main.ASR_TMP_DIR / f"asr-upload-{request.upload_token}"
         updates = []
         with patch.object(main, "ensure_asr_ready"), patch.object(
@@ -178,7 +274,7 @@ class UploadExtractionTests(unittest.TestCase):
             main,
             "transcribe_audio",
             return_value=([main.SubtitleEntry(0, 1.5, "测试字幕")], {"detected_language": "zh"}),
-        ):
+        ) as transcribe:
             result = main.process_queued_job(
                 request.model_dump(mode="json"),
                 lambda stage, progress, message: updates.append((stage, progress, message)),
@@ -191,11 +287,15 @@ class UploadExtractionTests(unittest.TestCase):
         self.assertFalse(directory.exists())
         self.assertNotIn(request.upload_token, main.UPLOAD_RESERVATIONS)
         self.assertTrue(any(stage == "transcribe" for stage, _, _ in updates))
+        self.assertIn("会议录像", transcribe.call_args.args[3])
+        self.assertEqual(transcribe.call_args.args[4], "MQTT, ESP32")
 
-    def test_upload_cache_identity_uses_content_not_filename_or_format(self) -> None:
+    def test_upload_cache_reuses_formats_but_includes_filename_prompt(self) -> None:
         first = self.staged_request(token="c" * 32, filename="first.mp4")
-        second = first.model_copy(update={"filename": "second.mp4", "format": "json", "force_refresh": True})
+        second = first.model_copy(update={"format": "json", "force_refresh": True})
+        renamed = first.model_copy(update={"filename": "different-topic.mp4"})
         self.assertEqual(main.upload_result_cache_key(first), main.upload_result_cache_key(second))
+        self.assertNotEqual(main.upload_result_cache_key(first), main.upload_result_cache_key(renamed))
 
     def test_long_upload_filename_preserves_supported_extension(self) -> None:
         filename, extension = main.safe_upload_filename(f"{'x' * 240}.MP4")
@@ -214,8 +314,8 @@ class UploadExtractionTests(unittest.TestCase):
             },
         )()
         with patch.object(main.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
-            main.subprocess,
-            "run",
+            main,
+            "run_managed_process",
             return_value=completed,
         ), self.assertRaises(main.ExtractionFailure) as raised:
             main.probe_uploaded_media(self.root / "video.mp4")
@@ -232,8 +332,8 @@ class UploadExtractionTests(unittest.TestCase):
             },
         )()
         with patch.object(main.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
-            main.subprocess,
-            "run",
+            main,
+            "run_managed_process",
             return_value=completed,
         ):
             result = main.probe_uploaded_media(self.root / "silent.mp4", require_audio=False)
@@ -319,6 +419,332 @@ class UploadExtractionTests(unittest.TestCase):
 
         self.assertTrue(directory.exists())
         self.assertIn(request.upload_token, main.UPLOAD_RESERVATIONS)
+
+    def test_interrupted_stream_upload_removes_partial_file_and_reservation(self) -> None:
+        class InterruptedRequest:
+            headers = {"content-length": "4"}
+
+            async def stream(self):
+                yield b"ab"
+                raise main.ClientDisconnect()
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(
+                main.stage_uploaded_video(
+                    InterruptedRequest(),
+                    filename="clip.mp4",
+                    output_format="txt",
+                    lang=None,
+                    quality="fast",
+                    embedded_subtitles=False,
+                    force_refresh=False,
+                )
+            )
+
+        self.assertEqual(raised.exception.detail["reason"], "upload_interrupted")
+        self.assertEqual(list(main.ASR_TMP_DIR.glob("asr-upload-*")), [])
+        self.assertEqual(main.upload_staging_bytes(), 0)
+
+    def test_cancelled_upload_request_removes_partial_file_and_reservation(self) -> None:
+        class CancelledRequest:
+            headers = {"content-length": "4"}
+
+            async def stream(self):
+                yield b"ab"
+                raise asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                main.stage_uploaded_video(
+                    CancelledRequest(),
+                    filename="clip.mp4",
+                    output_format="txt",
+                    lang=None,
+                    quality="fast",
+                    embedded_subtitles=False,
+                    force_refresh=False,
+                )
+            )
+
+        self.assertEqual(list(main.ASR_TMP_DIR.glob("asr-upload-*")), [])
+        self.assertEqual(main.upload_staging_bytes(), 0)
+
+    def test_streaming_size_limit_removes_partial_upload(self) -> None:
+        class OversizedRequest:
+            headers = {}
+
+            async def stream(self):
+                yield b"12345"
+
+        original_limits = main.UPLOAD_MAX_BYTES, main.UPLOAD_STAGING_MAX_BYTES
+        main.UPLOAD_MAX_BYTES = 4
+        main.UPLOAD_STAGING_MAX_BYTES = 8
+        try:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(
+                    main.stage_uploaded_video(
+                        OversizedRequest(),
+                        filename="clip.mp4",
+                        output_format="txt",
+                        lang=None,
+                        quality="fast",
+                        embedded_subtitles=False,
+                        force_refresh=False,
+                    )
+                )
+        finally:
+            main.UPLOAD_MAX_BYTES, main.UPLOAD_STAGING_MAX_BYTES = original_limits
+
+        self.assertEqual(raised.exception.status_code, 413)
+        self.assertEqual(list(main.ASR_TMP_DIR.glob("asr-upload-*")), [])
+        self.assertEqual(main.upload_staging_bytes(), 0)
+
+
+class LocalMediaFixtureTests(unittest.TestCase):
+    @unittest.skipUnless(main.shutil.which("ffmpeg") and main.shutil.which("ffprobe"), "FFmpeg is unavailable")
+    def test_ffprobe_validates_a_small_real_video_with_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.mp4"
+            result = main.run_managed_process(
+                [
+                    main.shutil.which("ffmpeg") or "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=32x32:r=2:d=1",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=1",
+                    "-shortest",
+                    "-c:v",
+                    "mpeg4",
+                    "-c:a",
+                    "aac",
+                    str(path),
+                ],
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            metadata = main.probe_uploaded_media(path)
+
+        self.assertTrue(metadata["has_audio"])
+        self.assertGreater(metadata["duration"], 0)
+
+
+class ResourceSafetyTests(unittest.TestCase):
+    def test_audio_normalization_applies_only_the_configured_filter(self) -> None:
+        def fake_run(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"wav")
+            return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+        audio_filter = "highpass=f=70,lowpass=f=7800,loudnorm=I=-20:TP=-2:LRA=11"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"media")
+            with patch.dict(os.environ, {"ASR_AUDIO_FILTER": audio_filter}), patch.object(
+                main.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), patch.object(main, "ensure_disk_space"), patch.object(
+                main, "run_managed_process", side_effect=fake_run
+            ) as run:
+                normalized = main.normalize_audio_for_asr(source, root, "test")
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-af") + 1], audio_filter)
+        self.assertTrue(normalized.name.endswith(".asr.wav"))
+
+    def test_isolated_ytdlp_spawn_failure_is_diagnostic_and_closes_queue(self) -> None:
+        closed: list[str] = []
+
+        class FakeQueue:
+            def cancel_join_thread(self) -> None:
+                closed.append("cancel")
+
+            def close(self) -> None:
+                closed.append("close")
+
+        class FakeContext:
+            def Queue(self, maxsize: int):
+                self.maxsize = maxsize
+                return FakeQueue()
+
+            def Process(self, **_kwargs):
+                raise RuntimeError("spawn unavailable")
+
+        with patch.object(main, "get_context", return_value=FakeContext()), self.assertRaises(
+            main.ExtractionFailure
+        ) as raised:
+            main.run_isolated_ytdlp_download(
+                url="https://www.bilibili.com/video/av123456",
+                target_dir=Path("."),
+                mode="audio",
+                allow_cookie=False,
+                max_bytes=1024,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(raised.exception.reason, "download_failed")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(closed, ["cancel", "close"])
+
+    def test_isolated_ytdlp_timeout_stops_owned_process_group(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.messages = [{"kind": "started", "group_owned": True}]
+
+            def get(self, timeout: float):
+                self.timeout = timeout
+                return self.messages.pop(0)
+
+            def cancel_join_thread(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class FakeProcess:
+            pid = 4321
+
+            def __init__(self) -> None:
+                self.alive = True
+
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, _timeout=0) -> None:
+                pass
+
+        queue = FakeQueue()
+        process = FakeProcess()
+
+        class FakeContext:
+            def Queue(self, maxsize: int):
+                self.maxsize = maxsize
+                return queue
+
+            def Process(self, **_kwargs):
+                return process
+
+        def stop_group(target, group_owned):
+            self.assertIs(target, process)
+            self.assertTrue(group_owned)
+            process.alive = False
+
+        with patch.object(main, "get_context", return_value=FakeContext()), patch.object(
+            main.time, "monotonic", side_effect=[0.0, 0.1, 2.0]
+        ), patch.object(main, "terminate_child_process_group", side_effect=stop_group) as stop, self.assertRaises(
+            main.ExtractionFailure
+        ) as raised:
+            main.run_isolated_ytdlp_download(
+                url="https://www.bilibili.com/video/av123456",
+                target_dir=Path("."),
+                mode="media",
+                media_type="video",
+                allow_cookie=False,
+                max_bytes=1024,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(raised.exception.status_code, 504)
+        stop.assert_called_once()
+
+    def test_low_disk_rejects_upload_before_reservation(self) -> None:
+        status = main.DiskSpaceStatus(
+            total_bytes=10_000,
+            free_bytes=100,
+            free_ratio=0.01,
+            minimum_free_bytes=1_000,
+            required_bytes=500,
+            available=False,
+        )
+        token = "1" * 32
+        with main.UPLOAD_RESERVATION_LOCK:
+            main.UPLOAD_RESERVATIONS.clear()
+        with patch.object(main, "disk_space_status", return_value=status), self.assertRaises(
+            HTTPException
+        ) as raised:
+            main.reserve_upload(token, 500)
+
+        self.assertEqual(raised.exception.status_code, 507)
+        self.assertEqual(raised.exception.detail["code"], "disk_space_low")
+        self.assertNotIn(token, main.UPLOAD_RESERVATIONS)
+
+    def test_public_error_uses_stable_code_without_internal_detail(self) -> None:
+        failure = main.ExtractionFailure(
+            422,
+            "failed at /opt/private/video.mp4 Cookie: SESSDATA=secret",
+            "upload_audio_missing",
+        )
+
+        detail = main.extraction_error_detail("upload", failure)
+
+        self.assertEqual(detail["reason"], "upload_audio_missing")
+        self.assertEqual(detail["code"], "no_audio_stream")
+        self.assertNotIn("/opt/private", detail["message"])
+        self.assertNotIn("secret", detail["message"])
+
+    def test_startup_cleanup_removes_old_ocr_orphan_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            orphan = root / "ocr-orphan"
+            protected = root / "models"
+            orphan.mkdir()
+            protected.mkdir()
+            modified = time.time() - main.ASR_TMP_MAX_AGE_SECONDS - 5
+            os.utime(orphan, (modified, modified))
+
+            with patch.object(main, "ASR_TMP_DIR", root):
+                removed = main.cleanup_stale_asr_tmp()
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(protected.exists())
+
+    def test_asr_semaphore_is_released_when_download_fails(self) -> None:
+        class FakeSemaphore:
+            def __init__(self) -> None:
+                self.releases = 0
+
+            def acquire(self, **_kwargs) -> bool:
+                return True
+
+            def release(self) -> None:
+                self.releases += 1
+
+        semaphore = FakeSemaphore()
+        source = main.ExtractionSource(
+            title="test",
+            video_id="BV14jFvzbEvj",
+            webpage_url="https://www.bilibili.com/video/BV14jFvzbEvj",
+            tracks=[],
+            duration=3,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_dir = Path(directory)
+            with patch.object(main, "ASR_TMP_DIR", tmp_dir), patch.object(
+                main, "ASR_SEMAPHORE", semaphore
+            ), patch.object(main, "ensure_asr_ready"), patch.object(
+                main, "ensure_disk_space"
+            ), patch.object(main, "view_source", return_value=source), patch.object(
+                main,
+                "download_audio_for_asr",
+                side_effect=main.ExtractionFailure(502, "network failed", "download_failed"),
+            ), self.assertRaises(main.ExtractionFailure):
+                main.asr_subtitle(
+                    main.ExtractRequest(input="BV14jFvzbEvj", source="asr"),
+                    allow_cookie=False,
+                )
+
+        self.assertEqual(semaphore.releases, 1)
 
 
 class MediaArtifactTests(unittest.TestCase):
@@ -407,8 +833,201 @@ class MediaArtifactTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(raised.exception.detail["reason"], "media_storage_busy")
 
+    def test_expired_artifact_deletes_file_metadata_and_reservation(self) -> None:
+        token = "c" * 32
+        main.reserve_media_artifact(token)
+        directory = main.media_artifact_directory(token)
+        directory.mkdir(parents=True)
+        artifact = directory / "artifact.mp4"
+        artifact.write_bytes(b"expired")
+        main.write_media_artifact_metadata(
+            directory,
+            {
+                "artifact_token": token,
+                "owner_id": 7,
+                "stored_name": artifact.name,
+                "size": artifact.stat().st_size,
+                "expires_at": time.time() - 1,
+            },
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            main.load_media_artifact(token, owner_id=7)
+
+        self.assertEqual(raised.exception.status_code, 410)
+        self.assertFalse(directory.exists())
+        self.assertNotIn(token, main.MEDIA_RESERVATIONS)
+
+    def test_cleanup_removes_expired_finalized_artifact_even_if_reserved(self) -> None:
+        token = "d" * 32
+        main.reserve_media_artifact(token)
+        directory = main.media_artifact_directory(token)
+        directory.mkdir(parents=True)
+        artifact = directory / "artifact.mp4"
+        artifact.write_bytes(b"expired")
+        main.write_media_artifact_metadata(
+            directory,
+            {
+                "artifact_token": token,
+                "owner_id": 7,
+                "stored_name": artifact.name,
+                "size": artifact.stat().st_size,
+                "expires_at": time.time() - 1,
+            },
+        )
+
+        removed = main.cleanup_stale_media_artifacts()
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(directory.exists())
+        self.assertNotIn(token, main.MEDIA_RESERVATIONS)
+
+
+class BilibiliRedirectAndCookieTests(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, status_code: int, url: str, location: str | None = None, payload=None) -> None:
+            self.status_code = status_code
+            self.url = url
+            self.headers = {"location": location} if location else {}
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, responses, **_kwargs) -> None:
+            self.responses = list(responses)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, _url):
+            return self.responses.pop(0)
+
+    def tearDown(self) -> None:
+        main.resolve_b23_url.cache_clear()
+
+    def test_b23_redirect_preserves_page_and_rejects_untrusted_target(self) -> None:
+        safe = self.FakeClient(
+            [
+                self.FakeResponse(
+                    302,
+                    "https://b23.tv/test",
+                    "https://www.bilibili.com/video/BV14jFvzbEvj?p=3",
+                )
+            ]
+        )
+        with patch.object(main.httpx, "Client", return_value=safe):
+            resolved = main.resolve_b23_url("https://b23.tv/test")
+        self.assertEqual(resolved, "https://www.bilibili.com/video/BV14jFvzbEvj?p=3")
+
+        main.resolve_b23_url.cache_clear()
+        unsafe = self.FakeClient(
+            [self.FakeResponse(302, "https://b23.tv/test", "https://example.com/video/BV14jFvzbEvj")]
+        )
+        with patch.object(main.httpx, "Client", return_value=unsafe), self.assertRaises(
+            main.ExtractionFailure
+        ) as raised:
+            main.resolve_b23_url("https://b23.tv/test")
+        self.assertEqual(raised.exception.reason, "short_link_untrusted")
+
+    def test_b23_redirect_loop_is_bounded(self) -> None:
+        client = self.FakeClient(
+            [self.FakeResponse(302, "https://b23.tv/loop", "https://b23.tv/loop")]
+        )
+        with patch.object(main.httpx, "Client", return_value=client), self.assertRaises(
+            main.ExtractionFailure
+        ) as raised:
+            main.resolve_b23_url("https://b23.tv/loop")
+        self.assertEqual(raised.exception.reason, "short_link_loop")
+
+    def test_cookie_is_not_read_when_request_disables_it(self) -> None:
+        with patch.object(main, "configured_cookie_header", side_effect=AssertionError("cookie read")) as read:
+            self.assertFalse(main.cookie_allowed(False))
+            self.assertNotIn("Cookie", main.headers_for(allow_cookie=False))
+        read.assert_not_called()
+
+    def test_expired_cookie_has_stable_error_without_cookie_value(self) -> None:
+        response = self.FakeResponse(
+            200,
+            "https://api.bilibili.com/test",
+            payload={"code": -101, "message": "账号未登录"},
+        )
+        client = self.FakeClient([response])
+        with patch.object(main.httpx, "Client", return_value=client), patch.object(
+            main,
+            "headers_for",
+            return_value={"Cookie": "SESSDATA=top-secret"},
+        ), self.assertRaises(main.ExtractionFailure) as raised:
+            main.api_get_json("https://api.bilibili.com/test", "https://www.bilibili.com/", True)
+
+        self.assertEqual(raised.exception.reason, "cookie_expired")
+        self.assertNotIn("top-secret", raised.exception.detail)
+
 
 class BilibiliSelectionTests(unittest.TestCase):
+    def test_av_link_preserves_page_and_uses_ytdlp_metadata_fallback(self) -> None:
+        normalized = main.normalize_input(
+            "https://www.bilibili.com/video/AV123456?p=2&spm_id_from=333.999"
+        )
+        self.assertEqual(normalized, "https://www.bilibili.com/video/av123456?p=2")
+
+        info = {
+            "id": "123456",
+            "title": "AV test",
+            "duration": 9,
+            "webpage_url": normalized,
+            "uploader": "tester",
+        }
+        with patch.object(main, "extract_info", return_value=info) as extract:
+            source = main.view_source(normalized)
+
+        self.assertEqual(source.video_id, "123456")
+        self.assertEqual(source.duration, 9)
+        extract.assert_called_once()
+
+    def test_non_bv_media_falls_back_to_ytdlp(self) -> None:
+        request = main.MediaJobRequest(
+            input="https://www.bilibili.com/video/av123456",
+            media_type="video",
+            artifact_token="2" * 32,
+            owner_id=1,
+        )
+        expected = (Path("source.mp4"), {"title": "AV test"})
+        invalid_bvid = main.ExtractionFailure(400, "missing BV", "invalid_bvid", terminal=True)
+        with patch.object(main, "download_bilibili_media_api", side_effect=invalid_bvid), patch.object(
+            main, "download_bilibili_media_ytdlp", return_value=expected
+        ) as fallback:
+            result = main.download_bilibili_media(request, Path("."))
+
+        self.assertEqual(result, expected)
+        fallback.assert_called_once()
+
+    def test_non_bv_missing_platform_subtitle_can_fall_back_to_asr(self) -> None:
+        request = main.ExtractRequest(input="https://www.bilibili.com/video/av123456")
+        info = {
+            "id": "123456",
+            "title": "AV test",
+            "duration": 9,
+            "webpage_url": request.input,
+            "subtitles": {},
+            "automatic_captions": {},
+        }
+        invalid_bvid = main.ExtractionFailure(400, "missing BV", "invalid_bvid", terminal=True)
+        with patch.object(main, "extract_info", return_value=info), patch.object(
+            main, "bili_api_source", side_effect=invalid_bvid
+        ), self.assertRaises(main.ExtractionFailure) as raised:
+            main.official_subtitle(request, allow_cookie=False, source_label="official_no_cookie")
+
+        self.assertEqual(raised.exception.reason, "no_official_subtitle")
+        self.assertTrue(raised.exception.can_try_asr)
+
     def test_direct_video_uses_compatible_highest_dash_streams(self) -> None:
         request = main.MediaJobRequest(
             input="https://www.bilibili.com/video/BV14jFvzbEvj",
@@ -582,7 +1201,7 @@ class BilibiliCookieFallbackTests(unittest.TestCase):
         asr.assert_called_once_with(
             request,
             allow_cookie=True,
-            prior_note=cookie_failure.detail,
+            prior_note="没有找到可读取的字幕或语音内容。",
         )
         self.assertEqual(result_entries, entries)
         self.assertEqual(
@@ -592,13 +1211,42 @@ class BilibiliCookieFallbackTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_sensitive_values_and_local_paths_are_redacted(self) -> None:
+        value = (
+            "failed at /opt/private/video.mp4 and C:\\Users\\name\\secret.txt "
+            "or file:///tmp/private.wav; https://example.com/video/1 token=top-secret"
+        )
+
+        redacted = main.redact_sensitive(value)
+
+        self.assertNotIn("/opt/private", redacted)
+        self.assertNotIn("C:\\Users", redacted)
+        self.assertNotIn("file:///tmp", redacted)
+        self.assertNotIn("top-secret", redacted)
+        self.assertIn("https://example.com/video/1", redacted)
+
     def test_unicode_filename_is_preserved_and_sanitized(self) -> None:
         self.assertEqual(main.safe_filename("标题：测试/01", "markdown"), "标题：测试_01.md")
+        filename = main.safe_filename('evil"\r\nContent-Disposition: inline', "srt")
+        self.assertNotIn("\r", filename)
+        self.assertNotIn("\n", filename)
+        self.assertNotIn('"', filename)
 
     def test_invalid_transcription_result_becomes_public_failure(self) -> None:
         with self.assertRaises(main.ExtractionFailure) as raised:
             main.parse_transcription_result({"ok": False, "error": "decode failed"})
         self.assertEqual(raised.exception.reason, "asr_failed")
+
+        with self.assertRaises(main.ExtractionFailure) as model_failure:
+            main.parse_transcription_result(
+                {
+                    "ok": False,
+                    "error": "LocalEntryNotFoundError: model not found",
+                    "reason": "asr_model_download_failed",
+                }
+            )
+        self.assertEqual(model_failure.exception.reason, "asr_model_download_failed")
+        self.assertEqual(model_failure.exception.status_code, 503)
 
     def test_invalid_input_keeps_structured_error(self) -> None:
         with self.assertRaises(HTTPException) as raised:
@@ -639,9 +1287,317 @@ class RenderingTests(unittest.TestCase):
         redacted = main.redact_sensitive("https://example.test/poll?qrcode_key=abc123&next=1")
         self.assertNotIn("abc123", redacted)
         self.assertIn("qrcode_key=<redacted>", redacted)
+        signed = main.redact_sensitive("https://example.test/media?msToken=session-value&X-Bogus=signed-value")
+        self.assertNotIn("session-value", signed)
+        self.assertNotIn("signed-value", signed)
 
 
 class AsrWorkerTests(unittest.TestCase):
+    def test_fast_and_accurate_profiles_share_one_default_model_key(self) -> None:
+        fast = main.asr_profile("fast")
+        accurate = main.asr_profile("accurate")
+
+        for key in ("model", "compute_type", "device", "cpu_threads"):
+            self.assertEqual(fast[key], accurate[key])
+        self.assertEqual(fast["beam_size"], 3)
+        self.assertEqual(accurate["beam_size"], 5)
+        self.assertFalse(fast["condition_on_previous_text"])
+        self.assertTrue(accurate["condition_on_previous_text"])
+
+    def test_whisper_model_keeps_only_one_instance_and_unloads_on_switch(self) -> None:
+        created = []
+
+        class RuntimeModel:
+            def __init__(self) -> None:
+                self.unloads = 0
+
+            def unload_model(self) -> None:
+                self.unloads += 1
+
+        class FakeModel:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.model = RuntimeModel()
+
+        def factory(name: str, **_kwargs):
+            instance = FakeModel(name)
+            created.append(instance)
+            return instance
+
+        main.clear_whisper_model()
+        try:
+            with patch("faster_whisper.WhisperModel", side_effect=factory):
+                first = main.whisper_model("small", "int8", "cpu", 3)
+                reused = main.whisper_model("small", "int8", "cpu", 3)
+                switched = main.whisper_model("small", "int8", "cpu", 2)
+
+            self.assertIs(first, reused)
+            self.assertIsNot(first, switched)
+            self.assertEqual(len(created), 2)
+            self.assertEqual(first.model.unloads, 1)
+        finally:
+            main.clear_whisper_model()
+        self.assertEqual(created[-1].model.unloads, 1)
+
+    def test_accurate_transcription_uses_context_metrics_and_one_retry(self) -> None:
+        class Segment:
+            def __init__(self, start: float, text: str, logprob: float) -> None:
+                self.start = start
+                self.end = start + 1
+                self.text = text
+                self.avg_logprob = logprob
+                self.no_speech_prob = 0.05
+                self.compression_ratio = 1.2
+
+        class Info:
+            language = "zh"
+            language_probability = 0.98
+            duration_after_vad = 8.5
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def transcribe(self, _audio_path: str, **options):
+                self.calls.append(options)
+                if len(self.calls) == 1:
+                    return [Segment(float(index), "重复字幕", -1.4) for index in range(4)], Info()
+                return [Segment(0, "第一句", -0.2), Segment(1, "第二句", -0.3)], Info()
+
+        model = FakeModel()
+        with patch.object(main, "whisper_model", return_value=model), patch.object(
+            main, "audio_duration_seconds", return_value=10.0
+        ), patch.object(main, "peak_rss_mb", return_value=512.0):
+            result = main.transcribe_audio_payload(
+                "audio.wav",
+                "zh",
+                "accurate",
+                "物联网课程 https://private.invalid/secret",
+                "MQTT, ESP32",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([entry[2] for entry in result["entries"]], ["第一句", "第二句"])
+        self.assertEqual(len(model.calls), 2)
+        self.assertTrue(model.calls[0]["condition_on_previous_text"])
+        self.assertFalse(model.calls[1]["condition_on_previous_text"])
+        self.assertEqual(model.calls[0]["hotwords"], "MQTT, ESP32")
+        self.assertNotIn("https://", model.calls[0]["initial_prompt"])
+        self.assertEqual(model.calls[0]["vad_parameters"]["min_silence_duration_ms"], 700)
+        metadata = result["meta"]
+        self.assertTrue(metadata["context_retry_performed"])
+        self.assertTrue(metadata["context_retry_selected"])
+        self.assertEqual(metadata["asr_attempt_count"], 2)
+        self.assertEqual(metadata["audio_duration_seconds"], 10.0)
+        self.assertEqual(metadata["peak_rss_mb"], 512.0)
+        encoded = json.dumps(metadata, ensure_ascii=False)
+        self.assertNotIn("MQTT", encoded)
+        self.assertNotIn("物联网课程", encoded)
+
+    def test_transcription_error_redacts_prompt_and_hotwords(self) -> None:
+        class FailingModel:
+            def transcribe(self, *_args, **_kwargs):
+                raise RuntimeError("decode failed for 私人课程 and MQTT")
+
+        with patch.object(main, "whisper_model", return_value=FailingModel()):
+            result = main.transcribe_audio_payload(
+                "audio.wav",
+                "zh",
+                "accurate",
+                "私人课程",
+                "MQTT",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("私人课程", result["error"])
+        self.assertNotIn("MQTT", result["error"])
+        with self.assertLogs("app.main", level="WARNING") as captured, self.assertRaises(
+            main.ExtractionFailure
+        ):
+            main.parse_transcription_result(result)
+        self.assertNotIn("私人课程", " ".join(captured.output))
+        self.assertNotIn("MQTT", " ".join(captured.output))
+
+    def test_successful_prewarm_updates_worker_warm_state(self) -> None:
+        class FakeSemaphore:
+            def __init__(self) -> None:
+                self.released = False
+
+            def acquire(self, **_kwargs) -> bool:
+                return True
+
+            def release(self) -> None:
+                self.released = True
+
+        class FakeEvent:
+            def wait(self, _timeout: float) -> bool:
+                return True
+
+        class FakeQueue:
+            def get(self, timeout: float):
+                self.timeout = timeout
+                return {"kind": "prewarm", "ok": True}
+
+        original = (
+            main.ASR_WORKER_RESULT_QUEUE,
+            main.ASR_WORKER_READY_EVENT,
+            main.ASR_WORKER_WARM,
+        )
+        semaphore = FakeSemaphore()
+        main.ASR_WORKER_RESULT_QUEUE = FakeQueue()
+        main.ASR_WORKER_READY_EVENT = FakeEvent()
+        main.ASR_WORKER_WARM = False
+        try:
+            with patch.object(main, "ASR_SEMAPHORE", semaphore), patch.object(
+                main, "ensure_asr_ready"
+            ), patch.object(main, "ensure_persistent_asr_worker_locked"):
+                main.prewarm_asr_worker()
+
+            self.assertTrue(main.ASR_WORKER_WARM)
+            self.assertTrue(semaphore.released)
+        finally:
+            (
+                main.ASR_WORKER_RESULT_QUEUE,
+                main.ASR_WORKER_READY_EVENT,
+                main.ASR_WORKER_WARM,
+            ) = original
+
+    def test_long_audio_gets_dynamic_timeout_budget(self) -> None:
+        class FakeWave:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def getframerate(self) -> int:
+                return 100
+
+            def getnframes(self) -> int:
+                return 360_000
+
+        with patch.object(main.wave, "open", return_value=FakeWave()), patch.object(
+            main, "ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND", 1.5
+        ), patch.object(main, "ASR_MAX_TIMEOUT_SECONDS", 7200):
+            timeout = main.asr_task_timeout(Path("long.wav"), "accurate")
+
+        self.assertEqual(timeout, 5460)
+        self.assertGreater(timeout, main.ACCURATE_ASR_TIMEOUT_SECONDS)
+
+    def test_prewarm_failure_is_retried_by_first_real_task(self) -> None:
+        class FakeRequestQueue:
+            def __init__(self) -> None:
+                self.items = [
+                    {"task_id": "task-1", "audio_path": "audio.wav", "lang": "zh", "quality": "fast"},
+                    None,
+                ]
+
+            def get(self):
+                return self.items.pop(0)
+
+        class FakeResultQueue:
+            def __init__(self) -> None:
+                self.items = []
+
+            def put(self, value) -> None:
+                self.items.append(value)
+
+        class FakeEvent:
+            def __init__(self) -> None:
+                self.set_count = 0
+
+            def set(self) -> None:
+                self.set_count += 1
+
+        class FakeModel:
+            def transcribe(self, *_args, **_kwargs):
+                segment = type("Segment", (), {"start": 0.0, "end": 1.0, "text": "重试成功"})()
+                info = type("Info", (), {"language": "zh", "language_probability": 0.99})()
+                return [segment], info
+
+        request_queue = FakeRequestQueue()
+        result_queue = FakeResultQueue()
+        ready = FakeEvent()
+        with patch.object(main, "whisper_model", side_effect=[RuntimeError("prewarm failed"), FakeModel()]) as model:
+            main.persistent_asr_worker(request_queue, result_queue, ready)
+
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual(ready.set_count, 1)
+        self.assertEqual(result_queue.items[0]["kind"], "prewarm")
+        self.assertFalse(result_queue.items[0]["ok"])
+        self.assertEqual(result_queue.items[0]["model_key"], ["small", "int8", "cpu", 3])
+        self.assertTrue(result_queue.items[1]["ok"])
+        self.assertEqual(result_queue.items[1]["task_id"], "task-1")
+
+    def test_dead_persistent_worker_is_rebuilt_for_next_task(self) -> None:
+        class FakeQueue:
+            def cancel_join_thread(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class FakeEvent:
+            def set(self) -> None:
+                pass
+
+        class DeadProcess:
+            exitcode = -9
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self, _timeout=0) -> None:
+                pass
+
+        class NewProcess:
+            def __init__(self) -> None:
+                self.started = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def is_alive(self) -> bool:
+                return self.started
+
+        new_process = NewProcess()
+
+        class FakeContext:
+            def Queue(self, maxsize: int):
+                self.maxsize = maxsize
+                return FakeQueue()
+
+            def Event(self):
+                return FakeEvent()
+
+            def Process(self, **_kwargs):
+                return new_process
+
+        original = (
+            main.ASR_WORKER_PROCESS,
+            main.ASR_WORKER_REQUEST_QUEUE,
+            main.ASR_WORKER_RESULT_QUEUE,
+            main.ASR_WORKER_READY_EVENT,
+            main.ASR_WORKER_WARM,
+        )
+        main.ASR_WORKER_PROCESS = DeadProcess()
+        main.ASR_WORKER_REQUEST_QUEUE = FakeQueue()
+        main.ASR_WORKER_RESULT_QUEUE = FakeQueue()
+        main.ASR_WORKER_READY_EVENT = FakeEvent()
+        try:
+            with patch.object(main, "get_context", return_value=FakeContext()):
+                main.ensure_persistent_asr_worker_locked()
+            self.assertIs(main.ASR_WORKER_PROCESS, new_process)
+            self.assertTrue(new_process.started)
+        finally:
+            (
+                main.ASR_WORKER_PROCESS,
+                main.ASR_WORKER_REQUEST_QUEUE,
+                main.ASR_WORKER_RESULT_QUEUE,
+                main.ASR_WORKER_READY_EVENT,
+                main.ASR_WORKER_WARM,
+            ) = original
+
     def test_one_shot_worker_reads_result_before_joining_process(self) -> None:
         events: list[str] = []
 
@@ -715,9 +1671,12 @@ class AsrWorkerTests(unittest.TestCase):
             def Process(self, **_kwargs):
                 raise RuntimeError("process creation failed")
 
-        with patch.object(main, "get_context", return_value=FakeContext()), self.assertRaises(RuntimeError):
+        with patch.object(main, "get_context", return_value=FakeContext()), self.assertRaises(
+            main.ExtractionFailure
+        ) as raised:
             main.transcribe_audio_once(Path("audio.wav"), "zh", "fast")
 
+        self.assertEqual(raised.exception.reason, "asr_worker_crashed")
         self.assertEqual(closed, [True])
 
 
@@ -792,7 +1751,7 @@ class VideoSubtitleOcrTests(unittest.TestCase):
             main.shutil,
             "which",
             return_value="/usr/bin/ffmpeg",
-        ), patch.object(main.subprocess, "run", side_effect=fake_run) as run:
+        ), patch.object(main, "run_managed_process", side_effect=fake_run) as run:
             result = main.extract_embedded_text_subtitle(
                 Path(directory) / "video.mkv",
                 media_info,
@@ -807,7 +1766,35 @@ class VideoSubtitleOcrTests(unittest.TestCase):
         self.assertIn("0:5", run.call_args.args[0])
         self.assertIn(main.LOCAL_MEDIA_PROTOCOL_WHITELIST, run.call_args.args[0])
 
-    def test_burned_subtitle_worker_does_not_pipe_ffmpeg_stderr(self) -> None:
+    def test_embedded_text_track_defaults_to_chinese_language(self) -> None:
+        media_info = {
+            "subtitle_streams": [
+                {"index": 1, "codec_name": "subrip", "language": "en", "title": "English"},
+                {"index": 5, "codec_name": "subrip", "language": "zh-CN", "title": "Chinese"},
+            ]
+        }
+
+        def fake_run(command, **_kwargs):
+            Path(command[-1]).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n中文字幕\n",
+                encoding="utf-8",
+            )
+            return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main.shutil, "which", return_value="/usr/bin/ffmpeg"
+        ), patch.object(main, "run_managed_process", side_effect=fake_run) as run:
+            result = main.extract_embedded_text_subtitle(
+                Path(directory) / "video.mkv",
+                media_info,
+                Path(directory),
+                None,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertIn("0:5", run.call_args.args[0])
+
+    def test_burned_subtitle_worker_drains_bounded_ffmpeg_stderr(self) -> None:
         class EmptyStream:
             def read(self, _size: int) -> bytes:
                 return b""
@@ -815,6 +1802,8 @@ class VideoSubtitleOcrTests(unittest.TestCase):
         class FakeProcess:
             pid = 321
             stdout = EmptyStream()
+            stderr = EmptyStream()
+            returncode = 0
 
             def wait(self, timeout: float) -> int:
                 self.timeout = timeout
@@ -824,6 +1813,9 @@ class VideoSubtitleOcrTests(unittest.TestCase):
                 return 0
 
             def kill(self) -> None:
+                pass
+
+            def terminate(self) -> None:
                 pass
 
         class FakeQueue:
@@ -848,7 +1840,7 @@ class VideoSubtitleOcrTests(unittest.TestCase):
 
         command = popen.call_args.args[0]
         self.assertIn(main.LOCAL_MEDIA_PROTOCOL_WHITELIST, command)
-        self.assertEqual(popen.call_args.kwargs["stderr"], main.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stderr"], main.subprocess.PIPE)
         self.assertTrue(any(message.get("ok") for message in queue.messages if message.get("kind") == "result"))
 
     def test_ocr_failure_falls_back_when_video_has_audio(self) -> None:
@@ -905,9 +1897,10 @@ class VideoSubtitleOcrTests(unittest.TestCase):
             main,
             "get_context",
             side_effect=RuntimeError("spawn unavailable"),
-        ), self.assertRaises(RuntimeError):
+        ), self.assertRaises(main.ExtractionFailure) as raised:
             main.extract_burned_subtitles(Path("video.mp4"), 2.0)
 
+        self.assertEqual(raised.exception.reason, "ocr_failed")
         self.assertEqual(semaphore.releases, 1)
 
 

@@ -378,7 +378,8 @@ h2 {
 }
 
 textarea,
-select {
+select,
+.text-field {
   width: 100%;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
@@ -399,12 +400,14 @@ textarea::placeholder {
 }
 
 textarea:hover,
-select:hover {
+select:hover,
+.text-field:hover {
   border-color: #9fa9b5;
 }
 
 textarea:focus,
-select:focus {
+select:focus,
+.text-field:focus {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px rgba(47, 102, 163, 0.11);
   outline: none;
@@ -658,6 +661,19 @@ textarea.invalid {
 select {
   height: 42px;
   padding: 0 32px 0 11px;
+}
+
+.text-field {
+  height: 42px;
+  padding: 0 11px;
+}
+
+.text-field::placeholder {
+  color: #9aa3ad;
+}
+
+.hotwords-field {
+  margin-bottom: 14px;
 }
 
 .advanced {

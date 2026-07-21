@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#ffffff">
   <title>视频内容提取</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260717-3">
-  <script src="/static/app.js?v=20260717-3" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260721-4">
+  <script src="/static/app.js?v=20260721-4" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -127,15 +127,15 @@
           <legend>解析精度</legend>
           <div class="segmented-control quality-control">
             <label>
-              <input type="radio" name="quality" value="fast" checked>
+              <input type="radio" name="quality" value="fast">
               <span>快速</span>
             </label>
             <label>
-              <input type="radio" name="quality" value="accurate">
+              <input type="radio" name="quality" value="accurate" checked>
               <span>精确</span>
             </label>
           </div>
-          <p class="mode-caption" id="quality-caption">适合吐字清晰的视频，优先缩短等待时间</p>
+          <p class="mode-caption" id="quality-caption">保留跨段上下文并使用更细致的解码</p>
         </fieldset>
 
         <label class="toggle-row embedded-subtitle-row" id="embedded-subtitle-row">
@@ -161,7 +161,7 @@
             <label class="field-label" for="lang-select">语言提示</label>
             <select id="lang-select" name="lang">
               <option value="">自动识别</option>
-              <option value="zh">中文</option>
+              <option value="zh" selected>中文</option>
               <option value="en">English</option>
               <option value="ja">日本語</option>
               <option value="ko">한국어</option>
@@ -175,12 +175,23 @@
             <span class="chevron" aria-hidden="true"></span>
           </summary>
           <div class="advanced-body">
+            <div class="hotwords-field" id="hotwords-row">
+              <label class="field-label" for="hotwords-input">专业词汇</label>
+              <input
+                class="text-field"
+                id="hotwords-input"
+                type="text"
+                maxlength="300"
+                autocomplete="off"
+                placeholder="人名、地名、课程名或英文缩写"
+              >
+            </div>
             <label class="toggle-row" id="platform-ai-row">
               <span>
                 <strong>优先使用平台自动字幕</strong>
                 <small>不可用时再进行本地语音识别</small>
               </span>
-              <input id="allow-platform-ai" type="checkbox" role="switch" checked>
+              <input id="allow-platform-ai" type="checkbox" role="switch">
             </label>
             <label class="toggle-row" id="cookie-row" hidden>
               <span>
