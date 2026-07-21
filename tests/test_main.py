@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -10,6 +11,37 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app import main
+
+
+class RequestDefaultsTests(unittest.TestCase):
+    def test_linux_memory_parser_ignores_invalid_fields(self) -> None:
+        parsed = main.parse_linux_memory_kib(
+            "VmRSS: 153600 kB\nVmSwap: 2048 kB\nBroken: unavailable\n"
+        )
+
+        self.assertEqual(parsed["VmRSS"], 153600)
+        self.assertEqual(parsed["VmSwap"], 2048)
+        self.assertNotIn("Broken", parsed)
+
+    def test_subtitle_requests_default_to_local_quality_first_settings(self) -> None:
+        request = main.ExtractRequest(input="BV14jFvzbEvj")
+
+        self.assertEqual(request.source, "auto")
+        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.lang, "zh")
+        self.assertFalse(request.allow_platform_ai)
+
+    def test_upload_requests_use_the_same_quality_and_language_defaults(self) -> None:
+        request = main.UploadJobRequest(
+            upload_token="a" * 32,
+            stored_name="source.mp4",
+            filename="clip.mp4",
+            sha256="b" * 64,
+            size=123,
+        )
+
+        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.lang, "zh")
 
 
 class ResultCacheTests(unittest.TestCase):
@@ -52,6 +84,20 @@ class ResultCacheTests(unittest.TestCase):
         self.assertEqual(main.effective_quality("fast", embedded_subtitles=True), "accurate")
         self.assertEqual(main.asr_profile("fast")["model"], main.DEFAULT_ASR_MODEL)
         self.assertEqual(main.asr_profile("accurate")["model"], main.ACCURATE_ASR_MODEL)
+
+    def test_cache_key_includes_hashed_hotwords_and_audio_filter(self) -> None:
+        canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
+        first = main.ExtractRequest(input=canonical, source="asr", hotwords="MQTT, ESP32")
+        second = first.model_copy(update={"hotwords": "LoRa, Node-RED"})
+
+        with patch.dict(os.environ, {"ASR_AUDIO_FILTER": ""}):
+            first_key = main.result_cache_key(first, canonical)
+            second_key = main.result_cache_key(second, canonical)
+        with patch.dict(os.environ, {"ASR_AUDIO_FILTER": "highpass=f=70"}):
+            filtered_key = main.result_cache_key(first, canonical)
+
+        self.assertNotEqual(first_key, second_key)
+        self.assertNotEqual(first_key, filtered_key)
 
     def test_cached_entries_round_trip(self) -> None:
         entries = [main.SubtitleEntry(0.25, 1.5, "测试字幕")]
@@ -213,7 +259,7 @@ class UploadExtractionTests(unittest.TestCase):
         )
 
     def test_upload_job_transcribes_and_removes_staged_video(self) -> None:
-        request = self.staged_request()
+        request = self.staged_request().model_copy(update={"hotwords": "MQTT, ESP32"})
         directory = main.ASR_TMP_DIR / f"asr-upload-{request.upload_token}"
         updates = []
         with patch.object(main, "ensure_asr_ready"), patch.object(
@@ -228,7 +274,7 @@ class UploadExtractionTests(unittest.TestCase):
             main,
             "transcribe_audio",
             return_value=([main.SubtitleEntry(0, 1.5, "测试字幕")], {"detected_language": "zh"}),
-        ):
+        ) as transcribe:
             result = main.process_queued_job(
                 request.model_dump(mode="json"),
                 lambda stage, progress, message: updates.append((stage, progress, message)),
@@ -241,11 +287,15 @@ class UploadExtractionTests(unittest.TestCase):
         self.assertFalse(directory.exists())
         self.assertNotIn(request.upload_token, main.UPLOAD_RESERVATIONS)
         self.assertTrue(any(stage == "transcribe" for stage, _, _ in updates))
+        self.assertIn("会议录像", transcribe.call_args.args[3])
+        self.assertEqual(transcribe.call_args.args[4], "MQTT, ESP32")
 
-    def test_upload_cache_identity_uses_content_not_filename_or_format(self) -> None:
+    def test_upload_cache_reuses_formats_but_includes_filename_prompt(self) -> None:
         first = self.staged_request(token="c" * 32, filename="first.mp4")
-        second = first.model_copy(update={"filename": "second.mp4", "format": "json", "force_refresh": True})
+        second = first.model_copy(update={"format": "json", "force_refresh": True})
+        renamed = first.model_copy(update={"filename": "different-topic.mp4"})
         self.assertEqual(main.upload_result_cache_key(first), main.upload_result_cache_key(second))
+        self.assertNotEqual(main.upload_result_cache_key(first), main.upload_result_cache_key(renamed))
 
     def test_long_upload_filename_preserves_supported_extension(self) -> None:
         filename, extension = main.safe_upload_filename(f"{'x' * 240}.MP4")
@@ -488,6 +538,27 @@ class LocalMediaFixtureTests(unittest.TestCase):
 
 
 class ResourceSafetyTests(unittest.TestCase):
+    def test_audio_normalization_applies_only_the_configured_filter(self) -> None:
+        def fake_run(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"wav")
+            return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+        audio_filter = "highpass=f=70,lowpass=f=7800,loudnorm=I=-20:TP=-2:LRA=11"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"media")
+            with patch.dict(os.environ, {"ASR_AUDIO_FILTER": audio_filter}), patch.object(
+                main.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), patch.object(main, "ensure_disk_space"), patch.object(
+                main, "run_managed_process", side_effect=fake_run
+            ) as run:
+                normalized = main.normalize_audio_for_asr(source, root, "test")
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-af") + 1], audio_filter)
+        self.assertTrue(normalized.name.endswith(".asr.wav"))
+
     def test_isolated_ytdlp_spawn_failure_is_diagnostic_and_closes_queue(self) -> None:
         closed: list[str] = []
 
@@ -1222,6 +1293,131 @@ class RenderingTests(unittest.TestCase):
 
 
 class AsrWorkerTests(unittest.TestCase):
+    def test_fast_and_accurate_profiles_share_one_default_model_key(self) -> None:
+        fast = main.asr_profile("fast")
+        accurate = main.asr_profile("accurate")
+
+        for key in ("model", "compute_type", "device", "cpu_threads"):
+            self.assertEqual(fast[key], accurate[key])
+        self.assertEqual(fast["beam_size"], 3)
+        self.assertEqual(accurate["beam_size"], 5)
+        self.assertFalse(fast["condition_on_previous_text"])
+        self.assertTrue(accurate["condition_on_previous_text"])
+
+    def test_whisper_model_keeps_only_one_instance_and_unloads_on_switch(self) -> None:
+        created = []
+
+        class RuntimeModel:
+            def __init__(self) -> None:
+                self.unloads = 0
+
+            def unload_model(self) -> None:
+                self.unloads += 1
+
+        class FakeModel:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.model = RuntimeModel()
+
+        def factory(name: str, **_kwargs):
+            instance = FakeModel(name)
+            created.append(instance)
+            return instance
+
+        main.clear_whisper_model()
+        try:
+            with patch("faster_whisper.WhisperModel", side_effect=factory):
+                first = main.whisper_model("small", "int8", "cpu", 3)
+                reused = main.whisper_model("small", "int8", "cpu", 3)
+                switched = main.whisper_model("small", "int8", "cpu", 2)
+
+            self.assertIs(first, reused)
+            self.assertIsNot(first, switched)
+            self.assertEqual(len(created), 2)
+            self.assertEqual(first.model.unloads, 1)
+        finally:
+            main.clear_whisper_model()
+        self.assertEqual(created[-1].model.unloads, 1)
+
+    def test_accurate_transcription_uses_context_metrics_and_one_retry(self) -> None:
+        class Segment:
+            def __init__(self, start: float, text: str, logprob: float) -> None:
+                self.start = start
+                self.end = start + 1
+                self.text = text
+                self.avg_logprob = logprob
+                self.no_speech_prob = 0.05
+                self.compression_ratio = 1.2
+
+        class Info:
+            language = "zh"
+            language_probability = 0.98
+            duration_after_vad = 8.5
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def transcribe(self, _audio_path: str, **options):
+                self.calls.append(options)
+                if len(self.calls) == 1:
+                    return [Segment(float(index), "重复字幕", -1.4) for index in range(4)], Info()
+                return [Segment(0, "第一句", -0.2), Segment(1, "第二句", -0.3)], Info()
+
+        model = FakeModel()
+        with patch.object(main, "whisper_model", return_value=model), patch.object(
+            main, "audio_duration_seconds", return_value=10.0
+        ), patch.object(main, "peak_rss_mb", return_value=512.0):
+            result = main.transcribe_audio_payload(
+                "audio.wav",
+                "zh",
+                "accurate",
+                "物联网课程 https://private.invalid/secret",
+                "MQTT, ESP32",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([entry[2] for entry in result["entries"]], ["第一句", "第二句"])
+        self.assertEqual(len(model.calls), 2)
+        self.assertTrue(model.calls[0]["condition_on_previous_text"])
+        self.assertFalse(model.calls[1]["condition_on_previous_text"])
+        self.assertEqual(model.calls[0]["hotwords"], "MQTT, ESP32")
+        self.assertNotIn("https://", model.calls[0]["initial_prompt"])
+        self.assertEqual(model.calls[0]["vad_parameters"]["min_silence_duration_ms"], 700)
+        metadata = result["meta"]
+        self.assertTrue(metadata["context_retry_performed"])
+        self.assertTrue(metadata["context_retry_selected"])
+        self.assertEqual(metadata["asr_attempt_count"], 2)
+        self.assertEqual(metadata["audio_duration_seconds"], 10.0)
+        self.assertEqual(metadata["peak_rss_mb"], 512.0)
+        encoded = json.dumps(metadata, ensure_ascii=False)
+        self.assertNotIn("MQTT", encoded)
+        self.assertNotIn("物联网课程", encoded)
+
+    def test_transcription_error_redacts_prompt_and_hotwords(self) -> None:
+        class FailingModel:
+            def transcribe(self, *_args, **_kwargs):
+                raise RuntimeError("decode failed for 私人课程 and MQTT")
+
+        with patch.object(main, "whisper_model", return_value=FailingModel()):
+            result = main.transcribe_audio_payload(
+                "audio.wav",
+                "zh",
+                "accurate",
+                "私人课程",
+                "MQTT",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("私人课程", result["error"])
+        self.assertNotIn("MQTT", result["error"])
+        with self.assertLogs("app.main", level="WARNING") as captured, self.assertRaises(
+            main.ExtractionFailure
+        ):
+            main.parse_transcription_result(result)
+        self.assertNotIn("私人课程", " ".join(captured.output))
+        self.assertNotIn("MQTT", " ".join(captured.output))
+
     def test_successful_prewarm_updates_worker_warm_state(self) -> None:
         class FakeSemaphore:
             def __init__(self) -> None:
@@ -1327,7 +1523,9 @@ class AsrWorkerTests(unittest.TestCase):
 
         self.assertEqual(model.call_count, 2)
         self.assertEqual(ready.set_count, 1)
-        self.assertEqual(result_queue.items[0], {"kind": "prewarm", "ok": False})
+        self.assertEqual(result_queue.items[0]["kind"], "prewarm")
+        self.assertFalse(result_queue.items[0]["ok"])
+        self.assertEqual(result_queue.items[0]["model_key"], ["small", "int8", "cpu", 3])
         self.assertTrue(result_queue.items[1]["ok"])
         self.assertEqual(result_queue.items[1]["task_id"], "task-1")
 

@@ -7,7 +7,8 @@ A private, shareable FastAPI workspace for extracting subtitles, video, and audi
 - Bilibili: official/manual subtitle, optional platform AI subtitle, then selectable fast or accurate local ASR fallback.
 - Douyin: short-link normalization, anonymous browser session, signed metadata request, platform caption when available, then selectable fast or accurate local ASR fallback.
 - Upload: streamed file intake, real media validation, then selectable ASR or embedded/burned-in subtitle extraction. Uploaded video files are deleted after completion, failure, or queued cancellation.
-- Precise extraction: the `small` int8 Whisper model uses VAD and a wider beam. The embedded-subtitle option first reads text subtitle tracks, then uses RapidOCR on burned-in text, and falls back to precise ASR when an audio track is available.
+- Local ASR: fast and accurate modes share one resident `small` int8 model. Fast mode uses beam 3 without cross-window context; accurate mode uses beam 5, keeps context, and retries once without context only when repetition or low confidence is detected.
+- Precise extraction: VAD, title/author context, and optional user hotwords improve difficult Chinese speech. The embedded-subtitle option first reads text subtitle tracks, then uses RapidOCR on burned-in text, and falls back to precise ASR when an audio track is available.
 - Direct media: Bilibili video up to 1080p, Douyin video, or MP3 audio. Binary results use owner-scoped temporary artifacts instead of JSON payloads and are deleted when the job expires.
 - Successful results are cached as normalized entries, so TXT, SRT, VTT, Markdown, and JSON conversions do not repeat transcription.
 - Work runs through a bounded two-worker queue so platform subtitles can finish while another job uses ASR. Local ASR remains strictly single-concurrency for 4C/4G memory safety; a second ASR job waits and continues automatically.
@@ -48,7 +49,7 @@ Create a job:
 curl -b session.cookie -X POST https://HOST/api/jobs \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: UNIQUE-REQUEST-ID' \
-  -d '{"input":"https://www.douyin.com/video/...","source":"auto","quality":"accurate","format":"srt"}'
+  -d '{"input":"https://www.douyin.com/video/...","source":"auto","quality":"accurate","lang":"zh","hotwords":"MQTT, ESP32, Node-RED","format":"srt"}'
 ```
 
 Poll or cancel it:
@@ -83,54 +84,73 @@ curl -b session.cookie -X POST \
   --data-binary '@meeting.mp4'
 ```
 
-The upload endpoint accepts common video containers up to `UPLOAD_MAX_BYTES`. ASR requires an audio stream; embedded-subtitle extraction also accepts silent video. The original video is temporary; normalized subtitle entries can remain in the result cache for `RESULT_CACHE_TTL_SECONDS`, allowing the same video to be re-uploaded in another output format without repeating recognition.
+The upload endpoint accepts common video containers up to `UPLOAD_MAX_BYTES`. ASR requires an audio stream; embedded-subtitle extraction also accepts silent video. The web client sends upload hotwords through the percent-encoded `X-ASR-Hotwords` header so they are not placed in the request URL. The original video is temporary; normalized subtitle entries can remain in the result cache for `RESULT_CACHE_TTL_SECONDS`, allowing the same video to be re-uploaded in another output format without repeating recognition.
 
 Request parameters:
 
 - `source`: `auto`, `official`, or `asr`
 - `format`: `txt`, `srt`, `vtt`, `markdown`, or `json`
-- `lang`: optional ASR language hint
-- `quality`: `fast` (tiny model, speed first) or `accurate` (small model, VAD, wider beam)
+- `lang`: ASR language hint; defaults to `zh`, while an explicit null/empty value enables automatic detection
+- `hotwords`: optional names, terms, or abbreviations, limited to 300 characters and represented by a hash in cache metadata
+- `quality`: `fast` (shared small model, beam 3) or `accurate` (shared small model, beam 5 and cross-window context); defaults to `accurate`
 - `embedded_subtitles`: inspect an embedded text track or OCR burned-in video text; implies accurate processing
-- `allow_platform_ai`: use platform-generated captions when available
+- `allow_platform_ai`: use platform-generated captions when available; defaults to `false`
 - `force_refresh`: bypass the result cache
 - `use_cookie`: allow the optional server-side Bilibili login state
 
 ## Runtime limits
 
 ```env
-JOB_QUEUE_MAX_PENDING=8
+JOB_QUEUE_MAX_PENDING=4
 JOB_WORKER_COUNT=2
 JOB_RESULT_TTL_SECONDS=3600
 ASR_CONCURRENCY_LIMIT=1
-ASR_QUEUE_WAIT_SECONDS=900
-ASR_TIMEOUT_SECONDS=300
+ASR_QUEUE_WAIT_SECONDS=1800
+ASR_MODEL=small
+ASR_COMPUTE_TYPE=int8
+ASR_DEVICE=cpu
+ASR_CPU_THREADS=3
+ASR_TIMEOUT_SECONDS=1800
 ASR_TIMEOUT_PER_AUDIO_SECOND=0.5
-ASR_FAST_BEAM_SIZE=1
+ASR_FAST_BEAM_SIZE=3
+ASR_VAD_FILTER=true
+ASR_CONDITION_ON_PREVIOUS_TEXT=false
 ASR_ACCURATE_MODEL=small
 ASR_ACCURATE_COMPUTE_TYPE=int8
 ASR_ACCURATE_CPU_THREADS=3
 ASR_ACCURATE_BEAM_SIZE=5
 ASR_ACCURATE_VAD_FILTER=true
-ASR_ACCURATE_TIMEOUT_SECONDS=1800
+ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT=true
+ASR_ACCURATE_TIMEOUT_SECONDS=3600
 ASR_ACCURATE_TIMEOUT_PER_AUDIO_SECOND=1.5
 ASR_MAX_TIMEOUT_SECONDS=7200
 ASR_DOWNLOAD_TIMEOUT_SECONDS=300
 ASR_MAX_AUDIO_SECONDS=3600
+ASR_PROMPT_MAX_CHARS=300
+ASR_VAD_THRESHOLD=0.45
+ASR_VAD_MIN_SILENCE_MS=700
+ASR_VAD_SPEECH_PAD_MS=300
+ASR_LOW_LOGPROB_THRESHOLD=-1.0
+ASR_CONTEXT_RETRY_ENABLED=true
+ASR_RETRY_REPETITION_RATIO=0.25
+ASR_RETRY_LOW_CONFIDENCE_RATIO=0.65
+ASR_AUDIO_QUALITY=best
+ASR_AUDIO_FILTER=
 BILI_MAX_DOWNLOAD_BYTES=1000000000
 UPLOAD_MAX_BYTES=536870912
 UPLOAD_STAGING_MAX_BYTES=2147483648
 MEDIA_MAX_BYTES=1000000000
 MEDIA_STAGING_MAX_BYTES=8000000000
 MEDIA_ARTIFACT_TTL_SECONDS=3600
-MEDIA_FRAGMENT_CONCURRENCY=4
+MEDIA_FRAGMENT_CONCURRENCY=2
 ASR_PERSISTENT_WORKER=true
 ASR_PREWARM=true
+ASR_PREWARM_QUALITY=accurate
 OCR_TIMEOUT_SECONDS=1800
-OCR_SAMPLE_FPS=2.5
+OCR_SAMPLE_FPS=1.5
 OCR_CROP_TOP_RATIO=0.45
 OCR_MIN_CONFIDENCE=0.55
-OCR_CPU_THREADS=2
+OCR_CPU_THREADS=1
 OCR_MAX_FRAMES=12000
 MIN_FREE_DISK_BYTES=2147483648
 MIN_FREE_DISK_RATIO=0.05
@@ -138,15 +158,23 @@ PROCESS_ERROR_OUTPUT_BYTES=16384
 RESULT_CACHE_TTL_SECONDS=604800
 RESULT_CACHE_MAX_ITEMS=100
 LEGACY_WAIT_TIMEOUT_SECONDS=1200
+OMP_NUM_THREADS=3
+OPENBLAS_NUM_THREADS=1
+MKL_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1
 ```
 
-Fast ASR uses the CPU-friendly `tiny` int8 model. Accurate ASR uses `small` int8 with VAD and beam size 5. The configured ASR timeouts are minimums; long WAV inputs receive a duration-based budget capped by `ASR_MAX_TIMEOUT_SECONDS`. Models remain warm in a child process between jobs; prewarming, OCR, and ASR share the single heavy-work semaphore to stay within a 4 GB memory budget.
+Both ASR modes intentionally use the same model, compute type, device, and thread count. The ASR child retains exactly one model instance and unloads it before a differently keyed profile is loaded. The configured timeouts are minimums; long WAV inputs receive a duration-based budget capped by `ASR_MAX_TIMEOUT_SECONDS`. Prewarming, OCR, and ASR share the single heavy-work semaphore to stay within a 4 GB memory budget.
+
+`ASR_AUDIO_FILTER` is opt-in because filtering can damage quiet consonants. A conservative A/B candidate is `highpass=f=70,lowpass=f=7800,loudnorm=I=-20:TP=-2:LRA=11`; compare it against an empty filter on real source audio before enabling it in production.
+
+ASR metadata includes duration, transcription time, realtime factor, confidence/repetition ratios, peak worker RSS, retry status, and hashes for prompt/filter inputs. It never includes prompt or hotword plaintext.
 
 Uploads, media downloads, ASR normalization, and OCR preparation check both the absolute and proportional free-disk thresholds before starting. FFmpeg and ffprobe output is continuously drained but capped at `PROCESS_ERROR_OUTPUT_BYTES`, and timed-out processes are terminated, killed if necessary, and reaped.
 
 Run exactly one Uvicorn application worker. Job state and the warm ASR process are intentionally local to this single 4C/4G instance; additional Uvicorn workers would create inconsistent job views and duplicate model memory.
 
-`GET /api/health` reports worker, queue, FFmpeg/ffprobe, ASR warm-state, and disk-threshold status without returning paths, Cookie values, users, or environment variables.
+`GET /api/health` reports worker, queue, FFmpeg/ffprobe, ASR model key/restart count, process memory/swap, warm-state, and disk-threshold status without returning paths, Cookie values, users, or environment variables. Reading health never downloads or initializes a model.
 
 ## Douyin runtime
 

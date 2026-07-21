@@ -4,6 +4,7 @@ import copy
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 import errno
+import gc
 import hashlib
 from http.cookies import SimpleCookie
 import importlib.util
@@ -16,9 +17,12 @@ import os
 from pathlib import Path
 from queue import Empty, Full
 import re
+import resource
 import secrets
 import shutil
+import statistics
 import subprocess
+import sys
 import tempfile
 from threading import BoundedSemaphore, Lock, Thread, local
 import time
@@ -32,6 +36,7 @@ from urllib.parse import quote, urljoin
 import httpx
 import qrcode
 import qrcode.image.svg
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -88,6 +93,7 @@ from app.processes import (
 
 
 LOGGER = logging.getLogger(__name__)
+load_dotenv()
 
 
 @dataclass
@@ -97,7 +103,7 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2026-07-18-stability-1")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2026-07-21-asr-quality-2")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -112,21 +118,54 @@ RESULT_CACHE_DIR = Path(os.getenv("RESULT_CACHE_DIR", str(ASR_CACHE_DIR / "resul
 BILI_COOKIE_PATH = Path(
     os.getenv("BILI_COOKIE_PATH", "/opt/bili-subtitle-tool/var/auth/bili-cookie.txt")
 )
-DEFAULT_ASR_MODEL = os.getenv("ASR_MODEL", "tiny").strip() or "tiny"
+DEFAULT_ASR_MODEL = os.getenv("ASR_MODEL", "small").strip() or "small"
 ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8").strip() or "int8"
 ASR_DEVICE = os.getenv("ASR_DEVICE", "cpu").strip() or "cpu"
-ASR_CPU_THREADS = max(1, int(os.getenv("ASR_CPU_THREADS", "2")))
-ASR_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_TIMEOUT_SECONDS", "300")))
-ACCURATE_ASR_MODEL = os.getenv("ASR_ACCURATE_MODEL", "small").strip() or "small"
-ACCURATE_ASR_COMPUTE_TYPE = os.getenv("ASR_ACCURATE_COMPUTE_TYPE", "int8").strip() or "int8"
+ASR_CPU_THREADS = max(1, int(os.getenv("ASR_CPU_THREADS", "3")))
+ASR_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_TIMEOUT_SECONDS", "1800")))
+ACCURATE_ASR_MODEL = os.getenv("ASR_ACCURATE_MODEL", DEFAULT_ASR_MODEL).strip() or DEFAULT_ASR_MODEL
+ACCURATE_ASR_COMPUTE_TYPE = (
+    os.getenv("ASR_ACCURATE_COMPUTE_TYPE", ASR_COMPUTE_TYPE).strip() or ASR_COMPUTE_TYPE
+)
 ACCURATE_ASR_DEVICE = os.getenv("ASR_ACCURATE_DEVICE", ASR_DEVICE).strip() or ASR_DEVICE
-ACCURATE_ASR_CPU_THREADS = max(1, int(os.getenv("ASR_ACCURATE_CPU_THREADS", "3")))
-ACCURATE_ASR_TIMEOUT_SECONDS = max(ASR_TIMEOUT_SECONDS, int(os.getenv("ASR_ACCURATE_TIMEOUT_SECONDS", "1800")))
-ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "1"))))
+ACCURATE_ASR_CPU_THREADS = max(
+    1,
+    int(os.getenv("ASR_ACCURATE_CPU_THREADS", str(ASR_CPU_THREADS))),
+)
+ACCURATE_ASR_TIMEOUT_SECONDS = max(
+    ASR_TIMEOUT_SECONDS,
+    int(os.getenv("ASR_ACCURATE_TIMEOUT_SECONDS", "3600")),
+)
+ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "3"))))
 ACCURATE_ASR_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_ACCURATE_BEAM_SIZE", "5"))))
 ASR_DOWNLOAD_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_DOWNLOAD_TIMEOUT_SECONDS", "300")))
-ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "900")))
+ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "1800")))
 ASR_MAX_AUDIO_SECONDS = max(30, int(os.getenv("ASR_MAX_AUDIO_SECONDS", "3600")))
+ASR_PROMPT_MAX_CHARS = min(1000, max(50, int(os.getenv("ASR_PROMPT_MAX_CHARS", "300"))))
+try:
+    ASR_VAD_THRESHOLD = min(0.95, max(0.05, float(os.getenv("ASR_VAD_THRESHOLD", "0.45"))))
+except ValueError:
+    ASR_VAD_THRESHOLD = 0.45
+ASR_VAD_MIN_SILENCE_MS = max(100, int(os.getenv("ASR_VAD_MIN_SILENCE_MS", "700")))
+ASR_VAD_SPEECH_PAD_MS = max(0, int(os.getenv("ASR_VAD_SPEECH_PAD_MS", "300")))
+try:
+    ASR_LOW_LOGPROB_THRESHOLD = float(os.getenv("ASR_LOW_LOGPROB_THRESHOLD", "-1.0"))
+except ValueError:
+    ASR_LOW_LOGPROB_THRESHOLD = -1.0
+try:
+    ASR_RETRY_REPETITION_RATIO = min(
+        1.0,
+        max(0.0, float(os.getenv("ASR_RETRY_REPETITION_RATIO", "0.25"))),
+    )
+except ValueError:
+    ASR_RETRY_REPETITION_RATIO = 0.25
+try:
+    ASR_RETRY_LOW_CONFIDENCE_RATIO = min(
+        1.0,
+        max(0.0, float(os.getenv("ASR_RETRY_LOW_CONFIDENCE_RATIO", "0.65"))),
+    )
+except ValueError:
+    ASR_RETRY_LOW_CONFIDENCE_RATIO = 0.65
 BILI_MAX_DOWNLOAD_BYTES = max(10_000_000, int(os.getenv("BILI_MAX_DOWNLOAD_BYTES", "1000000000")))
 UPLOAD_MAX_BYTES = max(1_000_000, int(os.getenv("UPLOAD_MAX_BYTES", "536870912")))
 UPLOAD_STAGING_MAX_BYTES = max(
@@ -145,7 +184,7 @@ ASR_CONCURRENCY_LIMIT = max(1, int(os.getenv("ASR_CONCURRENCY_LIMIT", "1")))
 ASR_TMP_MAX_AGE_SECONDS = max(300, int(os.getenv("ASR_TMP_MAX_AGE_SECONDS", "86400")))
 RESULT_CACHE_TTL_SECONDS = max(0, int(os.getenv("RESULT_CACHE_TTL_SECONDS", "604800")))
 RESULT_CACHE_MAX_ITEMS = max(1, int(os.getenv("RESULT_CACHE_MAX_ITEMS", "100")))
-JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "8")))
+JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "4")))
 JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("JOB_RESULT_TTL_SECONDS", "3600")))
 MEDIA_ARTIFACT_TTL_SECONDS = max(
     60,
@@ -155,10 +194,10 @@ JOB_MAX_RECORDS = max(10, int(os.getenv("JOB_MAX_RECORDS", "100")))
 JOB_WORKER_COUNT = max(1, int(os.getenv("JOB_WORKER_COUNT", "2")))
 LEGACY_WAIT_TIMEOUT_SECONDS = max(30, int(os.getenv("LEGACY_WAIT_TIMEOUT_SECONDS", "1200")))
 OCR_TIMEOUT_SECONDS = max(60, int(os.getenv("OCR_TIMEOUT_SECONDS", "1800")))
-OCR_SAMPLE_FPS = min(5.0, max(0.5, float(os.getenv("OCR_SAMPLE_FPS", "2.5"))))
+OCR_SAMPLE_FPS = min(5.0, max(0.5, float(os.getenv("OCR_SAMPLE_FPS", "1.5"))))
 OCR_CROP_TOP_RATIO = min(0.75, max(0.2, float(os.getenv("OCR_CROP_TOP_RATIO", "0.45"))))
 OCR_MIN_CONFIDENCE = min(0.95, max(0.1, float(os.getenv("OCR_MIN_CONFIDENCE", "0.55"))))
-OCR_CPU_THREADS = max(1, int(os.getenv("OCR_CPU_THREADS", "2")))
+OCR_CPU_THREADS = max(1, int(os.getenv("OCR_CPU_THREADS", "1")))
 OCR_MAX_FRAMES = max(100, int(os.getenv("OCR_MAX_FRAMES", "12000")))
 MIN_FREE_DISK_BYTES = max(0, int(os.getenv("MIN_FREE_DISK_BYTES", "2147483648")))
 try:
@@ -181,8 +220,12 @@ ASR_MAX_TIMEOUT_SECONDS = max(
     ACCURATE_ASR_TIMEOUT_SECONDS,
     int(os.getenv("ASR_MAX_TIMEOUT_SECONDS", "7200")),
 )
-RESULT_CACHE_VERSION = 7
-ASR_PIPELINE_VERSION = 1
+RESULT_CACHE_VERSION = 8
+ASR_PIPELINE_VERSION = 2
+ASR_PROMPT_VERSION = 1
+ASR_VAD_PROFILE_VERSION = 1
+ASR_AUDIO_FILTER_VERSION = 1
+ASR_QUALITY_METRICS_VERSION = 1
 OCR_PIPELINE_VERSION = 1
 ASR_SEMAPHORE = BoundedSemaphore(ASR_CONCURRENCY_LIMIT)
 LEGACY_REQUEST_SEMAPHORE = BoundedSemaphore(max(1, min(2, JOB_WORKER_COUNT)))
@@ -194,7 +237,12 @@ ASR_WORKER_REQUEST_QUEUE: Any = None
 ASR_WORKER_RESULT_QUEUE: Any = None
 ASR_WORKER_READY_EVENT: Any = None
 ASR_WORKER_WARM = False
+ASR_WORKER_START_COUNT = 0
+ASR_WORKER_MODEL_KEY: tuple[str, str, str, int] | None = None
 ASR_PREWARM_THREAD: Thread | None = None
+_ASR_MODEL_KEY: tuple[str, str, str, int] | None = None
+_ASR_MODEL_INSTANCE: Any = None
+_ASR_MODEL_LOCK = Lock()
 PROGRESS_CONTEXT = local()
 UPLOAD_RESERVATION_LOCK = Lock()
 UPLOAD_RESERVATIONS: dict[str, int] = {}
@@ -202,6 +250,10 @@ MEDIA_RESERVATION_LOCK = Lock()
 MEDIA_RESERVATIONS: dict[str, int] = {}
 os.environ.setdefault("HF_HOME", str(ASR_CACHE_DIR / "hf"))
 os.environ.setdefault("XDG_CACHE_HOME", str(ASR_CACHE_DIR))
+os.environ.setdefault("OMP_NUM_THREADS", "3")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 if os.getenv("HF_ENDPOINT"):
     os.environ.setdefault("HF_ENDPOINT", os.getenv("HF_ENDPOINT", ""))
 if os.getenv("HF_HUB_DISABLE_XET"):
@@ -282,12 +334,13 @@ class ExtractRequest(BaseModel):
     use_cookie: bool = False
     format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = "txt"
     lang: str | None = Field(
-        default=None,
+        default="zh",
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     )
-    allow_platform_ai: bool = True
-    quality: Literal["fast", "accurate"] = "fast"
+    hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
+    allow_platform_ai: bool = False
+    quality: Literal["fast", "accurate"] = "accurate"
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -301,11 +354,12 @@ class UploadJobRequest(BaseModel):
     size: int = Field(..., gt=0)
     format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = "txt"
     lang: str | None = Field(
-        default=None,
+        default="zh",
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     )
-    quality: Literal["fast", "accurate"] = "fast"
+    hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
+    quality: Literal["fast", "accurate"] = "accurate"
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -464,11 +518,58 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def sanitize_asr_context(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"https?://\S+", " ", str(value), flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;，；")
+    return cleaned[:ASR_PROMPT_MAX_CHARS] or None
+
+
+def asr_context(
+    title: str | None = None,
+    author: str | None = None,
+    hotwords: str | None = None,
+) -> tuple[str | None, str | None]:
+    cleaned_hotwords = sanitize_asr_context(hotwords)
+    parts: list[str] = []
+    for candidate in (title, author, cleaned_hotwords):
+        cleaned = sanitize_asr_context(candidate)
+        if cleaned and cleaned not in parts:
+            parts.append(cleaned)
+    initial_prompt = sanitize_asr_context("，".join(parts))
+    return initial_prompt, cleaned_hotwords
+
+
+def asr_context_hash(value: str | None) -> str:
+    cleaned = sanitize_asr_context(value)
+    if not cleaned:
+        return "none"
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
+def stable_config_hash(value: str | None) -> str:
+    if not value:
+        return "none"
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def asr_audio_filter() -> str:
+    value = re.sub(r"[\x00-\x1f\x7f]+", "", os.getenv("ASR_AUDIO_FILTER", "").strip())
+    return value[:500]
+
+
 def effective_quality(quality: str, embedded_subtitles: bool = False) -> Literal["fast", "accurate"]:
     return "accurate" if embedded_subtitles or quality == "accurate" else "fast"
 
 
 def asr_profile(quality: str) -> dict[str, Any]:
+    vad_parameters = {
+        "threshold": ASR_VAD_THRESHOLD,
+        "min_silence_duration_ms": ASR_VAD_MIN_SILENCE_MS,
+        "speech_pad_ms": ASR_VAD_SPEECH_PAD_MS,
+    }
     if quality == "accurate":
         return {
             "quality": "accurate",
@@ -478,6 +579,11 @@ def asr_profile(quality: str) -> dict[str, Any]:
             "cpu_threads": ACCURATE_ASR_CPU_THREADS,
             "beam_size": ACCURATE_ASR_BEAM_SIZE,
             "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
+            "vad_parameters": vad_parameters,
+            "condition_on_previous_text": env_bool(
+                "ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT",
+                True,
+            ),
             "timeout_seconds": ACCURATE_ASR_TIMEOUT_SECONDS,
         }
     return {
@@ -487,7 +593,9 @@ def asr_profile(quality: str) -> dict[str, Any]:
         "device": ASR_DEVICE,
         "cpu_threads": ASR_CPU_THREADS,
         "beam_size": ASR_FAST_BEAM_SIZE,
-        "vad_filter": env_bool("ASR_VAD_FILTER", False),
+        "vad_filter": env_bool("ASR_VAD_FILTER", True),
+        "vad_parameters": vad_parameters,
+        "condition_on_previous_text": env_bool("ASR_CONDITION_ON_PREVIOUS_TEXT", False),
         "timeout_seconds": ASR_TIMEOUT_SECONDS,
     }
 
@@ -936,7 +1044,19 @@ def result_cache_key(req: ExtractRequest, canonical_input: str) -> str:
         "asr_device": profile["device"],
         "asr_beam_size": profile["beam_size"],
         "asr_vad_filter": profile["vad_filter"],
-        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower(),
+        "asr_vad_parameters": profile["vad_parameters"] if profile["vad_filter"] else None,
+        "asr_vad_profile_version": ASR_VAD_PROFILE_VERSION,
+        "asr_condition_on_previous_text": profile["condition_on_previous_text"],
+        "asr_context_retry_enabled": env_bool("ASR_CONTEXT_RETRY_ENABLED", True),
+        "asr_low_logprob_threshold": ASR_LOW_LOGPROB_THRESHOLD,
+        "asr_retry_repetition_ratio": ASR_RETRY_REPETITION_RATIO,
+        "asr_retry_low_confidence_ratio": ASR_RETRY_LOW_CONFIDENCE_RATIO,
+        "asr_prompt_version": ASR_PROMPT_VERSION,
+        "hotwords_hash": asr_context_hash(req.hotwords),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
+        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
+        "asr_audio_filter_version": ASR_AUDIO_FILTER_VERSION,
+        "asr_quality_metrics_version": ASR_QUALITY_METRICS_VERSION,
         "ocr_sample_fps": OCR_SAMPLE_FPS if req.embedded_subtitles else None,
         "ocr_pipeline_version": OCR_PIPELINE_VERSION if req.embedded_subtitles else None,
         "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO if req.embedded_subtitles else None,
@@ -962,6 +1082,20 @@ def upload_result_cache_key(req: UploadJobRequest) -> str:
         "asr_device": profile["device"],
         "asr_beam_size": profile["beam_size"],
         "asr_vad_filter": profile["vad_filter"],
+        "asr_vad_parameters": profile["vad_parameters"] if profile["vad_filter"] else None,
+        "asr_vad_profile_version": ASR_VAD_PROFILE_VERSION,
+        "asr_condition_on_previous_text": profile["condition_on_previous_text"],
+        "asr_context_retry_enabled": env_bool("ASR_CONTEXT_RETRY_ENABLED", True),
+        "asr_low_logprob_threshold": ASR_LOW_LOGPROB_THRESHOLD,
+        "asr_retry_repetition_ratio": ASR_RETRY_REPETITION_RATIO,
+        "asr_retry_low_confidence_ratio": ASR_RETRY_LOW_CONFIDENCE_RATIO,
+        "asr_prompt_version": ASR_PROMPT_VERSION,
+        "upload_prompt_hash": asr_context_hash(upload_display_title(req.filename)),
+        "hotwords_hash": asr_context_hash(req.hotwords),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
+        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
+        "asr_audio_filter_version": ASR_AUDIO_FILTER_VERSION,
+        "asr_quality_metrics_version": ASR_QUALITY_METRICS_VERSION,
         "ocr_sample_fps": OCR_SAMPLE_FPS if req.embedded_subtitles else None,
         "ocr_pipeline_version": OCR_PIPELINE_VERSION if req.embedded_subtitles else None,
         "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO if req.embedded_subtitles else None,
@@ -2070,28 +2204,32 @@ def normalize_audio_for_asr(
     except OSError:
         source_bytes = 0
     ensure_disk_space(tmp_dir, min(256 * 1024 * 1024, max(64 * 1024 * 1024, source_bytes // 2)))
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        LOCAL_MEDIA_PROTOCOL_WHITELIST,
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-sample_fmt",
+        "s16",
+    ]
+    audio_filter = asr_audio_filter()
+    if audio_filter:
+        command.extend(["-af", audio_filter])
+    command.append(str(normalized_path))
     try:
         proc = run_managed_process(
-            [
-                ffmpeg,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-protocol_whitelist",
-                LOCAL_MEDIA_PROTOCOL_WHITELIST,
-                "-i",
-                str(input_path),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-sample_fmt",
-                "s16",
-                str(normalized_path),
-            ],
+            command,
             timeout=max(1.0, timeout_seconds or ASR_DOWNLOAD_TIMEOUT_SECONDS),
             output_limit=PROCESS_ERROR_OUTPUT_BYTES,
         )
@@ -2710,7 +2848,7 @@ def run_isolated_ytdlp_download(
                         "timeout_seconds": max(1, int(timeout_seconds)),
                         "fragment_concurrency": max(
                             1,
-                            min(8, int(os.getenv("MEDIA_FRAGMENT_CONCURRENCY", "4"))),
+                            min(8, int(os.getenv("MEDIA_FRAGMENT_CONCURRENCY", "2"))),
                         ),
                     },
                     result_queue,
@@ -2808,7 +2946,7 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
                 terminal=True,
             )
         audio_items.sort(key=lambda item: int(item.get("bandwidth") or 0))
-        audio_quality = os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower()
+        audio_quality = os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower()
         if audio_quality == "best":
             selected_audio = audio_items[-1]
         elif audio_quality == "smallest":
@@ -3525,17 +3663,49 @@ def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
     return finalize_media_artifact(req, final_path, content_type, info, started)
 
 
-@lru_cache(maxsize=4)
-def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: int) -> Any:
-    from faster_whisper import WhisperModel
+def _release_whisper_model_locked() -> None:
+    global _ASR_MODEL_KEY, _ASR_MODEL_INSTANCE
+    instance = _ASR_MODEL_INSTANCE
+    _ASR_MODEL_INSTANCE = None
+    _ASR_MODEL_KEY = None
+    if instance is not None:
+        runtime_model = getattr(instance, "model", None)
+        unload = getattr(runtime_model, "unload_model", None)
+        if not callable(unload):
+            unload = getattr(instance, "unload_model", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception as exc:
+                LOGGER.warning("ASR model unload failed: %s", type(exc).__name__)
+    gc.collect()
 
-    return WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-        cpu_threads=cpu_threads,
-        download_root=str(ASR_MODEL_DIR),
-    )
+
+def clear_whisper_model() -> None:
+    with _ASR_MODEL_LOCK:
+        _release_whisper_model_locked()
+
+
+def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: int) -> Any:
+    global _ASR_MODEL_KEY, _ASR_MODEL_INSTANCE
+    key = (model_name, compute_type, device, cpu_threads)
+    with _ASR_MODEL_LOCK:
+        if _ASR_MODEL_INSTANCE is not None and _ASR_MODEL_KEY == key:
+            return _ASR_MODEL_INSTANCE
+        if _ASR_MODEL_INSTANCE is not None:
+            _release_whisper_model_locked()
+        from faster_whisper import WhisperModel
+
+        instance = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            download_root=str(ASR_MODEL_DIR),
+        )
+        _ASR_MODEL_INSTANCE = instance
+        _ASR_MODEL_KEY = key
+        return instance
 
 
 def classify_asr_worker_error(value: str) -> str:
@@ -3558,7 +3728,178 @@ def classify_asr_worker_error(value: str) -> str:
     return "asr_failed"
 
 
-def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "fast") -> dict[str, Any]:
+def audio_duration_seconds(audio_path: str) -> float:
+    try:
+        with wave.open(audio_path, "rb") as source:
+            frame_rate = source.getframerate()
+            return source.getnframes() / frame_rate if frame_rate > 0 else 0.0
+    except (OSError, EOFError, wave.Error):
+        return 0.0
+
+
+def peak_rss_mb() -> float | None:
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (OSError, ValueError):
+        return None
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return round(value / divisor, 1)
+
+
+def parse_linux_memory_kib(value: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for line in value.splitlines():
+        name, separator, raw = line.partition(":")
+        if not separator:
+            continue
+        fields = raw.strip().split()
+        try:
+            result[name] = int(fields[0]) if fields else 0
+        except ValueError:
+            continue
+    return result
+
+
+def runtime_memory_status() -> dict[str, float | None]:
+    process_values: dict[str, int] = {}
+    system_values: dict[str, int] = {}
+    if sys.platform.startswith("linux"):
+        try:
+            process_values = parse_linux_memory_kib(Path("/proc/self/status").read_text(encoding="utf-8"))
+        except OSError:
+            pass
+        try:
+            system_values = parse_linux_memory_kib(Path("/proc/meminfo").read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    swap_total = system_values.get("SwapTotal")
+    swap_free = system_values.get("SwapFree")
+    return {
+        "process_rss_mb": round(process_values["VmRSS"] / 1024, 1)
+        if "VmRSS" in process_values
+        else None,
+        "process_swap_mb": round(process_values["VmSwap"] / 1024, 1)
+        if "VmSwap" in process_values
+        else None,
+        "system_available_mb": round(system_values["MemAvailable"] / 1024, 1)
+        if "MemAvailable" in system_values
+        else None,
+        "swap_total_mb": round(swap_total / 1024, 1) if swap_total is not None else None,
+        "swap_used_mb": round(max(0, swap_total - (swap_free or 0)) / 1024, 1)
+        if swap_total is not None and swap_free is not None
+        else None,
+    }
+
+
+def segment_metric(segment: Any, name: str) -> float | None:
+    try:
+        value = float(getattr(segment, name))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def repeated_segment_ratio(texts: list[str]) -> float:
+    normalized = [re.sub(r"\W+", "", text, flags=re.UNICODE).lower() for text in texts]
+    normalized = [text for text in normalized if text]
+    if len(normalized) < 2:
+        return 0.0
+    repeats = 0
+    seen: list[str] = []
+    for text in normalized:
+        duplicate = text in seen
+        if not duplicate and seen:
+            duplicate = SequenceMatcher(None, seen[-1], text).ratio() >= 0.92
+        if duplicate:
+            repeats += 1
+        else:
+            seen.append(text)
+    return repeats / len(normalized)
+
+
+def run_whisper_transcription(
+    model: Any,
+    audio_path: str,
+    options: dict[str, Any],
+    audio_duration: float,
+) -> tuple[list[tuple[float, float, str]], Any, dict[str, Any]]:
+    started = time.monotonic()
+    segments, info = model.transcribe(audio_path, **options)
+    entries: list[tuple[float, float, str]] = []
+    avg_logprobs: list[float] = []
+    no_speech_probs: list[float] = []
+    compression_ratios: list[float] = []
+    texts: list[str] = []
+    for segment in segments:
+        text = str(segment.text or "").strip()
+        if not text:
+            continue
+        entries.append((float(segment.start), float(segment.end), text))
+        texts.append(text)
+        avg_logprob = segment_metric(segment, "avg_logprob")
+        no_speech_prob = segment_metric(segment, "no_speech_prob")
+        compression_ratio = segment_metric(segment, "compression_ratio")
+        if avg_logprob is not None:
+            avg_logprobs.append(avg_logprob)
+        if no_speech_prob is not None:
+            no_speech_probs.append(no_speech_prob)
+        if compression_ratio is not None:
+            compression_ratios.append(compression_ratio)
+    elapsed = max(0.0, time.monotonic() - started)
+    low_confidence = sum(value < ASR_LOW_LOGPROB_THRESHOLD for value in avg_logprobs)
+    duration_after_vad = getattr(info, "duration_after_vad", None)
+    try:
+        duration_after_vad = float(duration_after_vad) if duration_after_vad is not None else None
+    except (TypeError, ValueError):
+        duration_after_vad = None
+    metrics = {
+        "audio_duration_seconds": round(audio_duration, 3) if audio_duration > 0 else None,
+        "duration_after_vad": round(duration_after_vad, 3) if duration_after_vad is not None else None,
+        "transcribe_seconds": round(elapsed, 3),
+        "realtime_factor": round(elapsed / audio_duration, 4) if audio_duration > 0 else None,
+        "median_avg_logprob": round(statistics.median(avg_logprobs), 4) if avg_logprobs else None,
+        "median_no_speech_prob": round(statistics.median(no_speech_probs), 4) if no_speech_probs else None,
+        "median_compression_ratio": round(statistics.median(compression_ratios), 4)
+        if compression_ratios
+        else None,
+        "low_confidence_segment_ratio": round(low_confidence / len(avg_logprobs), 4)
+        if avg_logprobs
+        else 0.0,
+        "repeated_segment_ratio": round(repeated_segment_ratio(texts), 4),
+        "peak_rss_mb": peak_rss_mb(),
+    }
+    return entries, info, metrics
+
+
+def prefer_retry_result(first: dict[str, Any], retry: dict[str, Any]) -> bool:
+    first_repeat = float(first.get("repeated_segment_ratio") or 0.0)
+    retry_repeat = float(retry.get("repeated_segment_ratio") or 0.0)
+    if retry_repeat + 0.01 < first_repeat:
+        return True
+    first_low = float(first.get("low_confidence_segment_ratio") or 0.0)
+    retry_low = float(retry.get("low_confidence_segment_ratio") or 0.0)
+    if retry_repeat <= first_repeat + 0.01 and retry_low + 0.05 < first_low:
+        return True
+    first_logprob = first.get("median_avg_logprob")
+    retry_logprob = retry.get("median_avg_logprob")
+    return bool(
+        retry_repeat <= first_repeat + 0.01
+        and retry_low <= first_low + 0.05
+        and isinstance(first_logprob, (int, float))
+        and isinstance(retry_logprob, (int, float))
+        and retry_logprob > first_logprob + 0.1
+    )
+
+
+def transcribe_audio_payload(
+    audio_path: str,
+    lang: str | None,
+    quality: str = "accurate",
+    initial_prompt: str | None = None,
+    hotwords: str | None = None,
+) -> dict[str, Any]:
+    cleaned_prompt = sanitize_asr_context(initial_prompt)
+    cleaned_hotwords = sanitize_asr_context(hotwords)
     try:
         profile = asr_profile(quality)
         model = whisper_model(
@@ -3567,18 +3908,68 @@ def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "
             profile["device"],
             profile["cpu_threads"],
         )
-        segments, info = model.transcribe(
-            audio_path,
-            language=lang or None,
-            beam_size=profile["beam_size"],
-            vad_filter=profile["vad_filter"],
-            condition_on_previous_text=False,
+        options: dict[str, Any] = {
+            "language": lang or None,
+            "beam_size": profile["beam_size"],
+            "vad_filter": profile["vad_filter"],
+            "condition_on_previous_text": profile["condition_on_previous_text"],
+        }
+        if profile["vad_filter"]:
+            options["vad_parameters"] = profile["vad_parameters"]
+        if cleaned_prompt:
+            options["initial_prompt"] = cleaned_prompt
+        if cleaned_hotwords:
+            options["hotwords"] = cleaned_hotwords
+        duration = audio_duration_seconds(audio_path)
+        entries, info, metrics = run_whisper_transcription(model, audio_path, options, duration)
+        initial_seconds = float(metrics.get("transcribe_seconds") or 0.0)
+        repeated_ratio = float(metrics.get("repeated_segment_ratio") or 0.0)
+        low_confidence_ratio = float(metrics.get("low_confidence_segment_ratio") or 0.0)
+        retry_reason: str | None = None
+        if repeated_ratio >= ASR_RETRY_REPETITION_RATIO:
+            retry_reason = "repetition"
+        elif low_confidence_ratio >= ASR_RETRY_LOW_CONFIDENCE_RATIO:
+            retry_reason = "low_confidence"
+        retry_performed = bool(
+            entries
+            and retry_reason
+            and profile["quality"] == "accurate"
+            and profile["condition_on_previous_text"]
+            and env_bool("ASR_CONTEXT_RETRY_ENABLED", True)
         )
-        entries = []
-        for segment in segments:
-            text = str(segment.text or "").strip()
-            if text:
-                entries.append((float(segment.start), float(segment.end), text))
+        retry_selected = False
+        if retry_performed:
+            retry_options = dict(options)
+            retry_options["condition_on_previous_text"] = False
+            retry_entries, retry_info, retry_metrics = run_whisper_transcription(
+                model,
+                audio_path,
+                retry_options,
+                duration,
+            )
+            total_seconds = initial_seconds + float(retry_metrics.get("transcribe_seconds") or 0.0)
+            if retry_entries and prefer_retry_result(metrics, retry_metrics):
+                entries, info, metrics = retry_entries, retry_info, retry_metrics
+                retry_selected = True
+            metrics["transcribe_seconds"] = round(total_seconds, 3)
+            metrics["realtime_factor"] = round(total_seconds / duration, 4) if duration > 0 else None
+        metrics.update(
+            {
+                "asr_attempt_count": 2 if retry_performed else 1,
+                "context_retry_performed": retry_performed,
+                "context_retry_selected": retry_selected,
+                "context_retry_reason": retry_reason if retry_performed else None,
+                "quality_warning": (
+                    "repetition"
+                    if float(metrics.get("repeated_segment_ratio") or 0.0)
+                    >= ASR_RETRY_REPETITION_RATIO
+                    else "low_confidence"
+                    if float(metrics.get("low_confidence_segment_ratio") or 0.0)
+                    >= ASR_RETRY_LOW_CONFIDENCE_RATIO
+                    else None
+                ),
+            }
+        )
         return {
             "ok": True,
             "entries": entries,
@@ -3592,45 +3983,92 @@ def transcribe_audio_payload(audio_path: str, lang: str | None, quality: str = "
                 "cpu_threads": profile["cpu_threads"],
                 "beam_size": profile["beam_size"],
                 "vad_filter": profile["vad_filter"],
+                "vad_parameters": profile["vad_parameters"] if profile["vad_filter"] else None,
+                "condition_on_previous_text": (
+                    False if retry_selected else profile["condition_on_previous_text"]
+                ),
+                "initial_prompt_used": bool(cleaned_prompt),
+                "hotwords_used": bool(cleaned_hotwords),
+                "initial_prompt_hash": asr_context_hash(cleaned_prompt),
+                "hotwords_hash": asr_context_hash(cleaned_hotwords),
+                "audio_filter_enabled": bool(asr_audio_filter()),
+                "audio_filter_hash": stable_config_hash(asr_audio_filter()),
+                **metrics,
             },
         }
     except Exception as exc:
         error = str(exc)
+        for sensitive_value in (cleaned_prompt, cleaned_hotwords):
+            if sensitive_value:
+                error = error.replace(sensitive_value, "<redacted>")
         return {
             "ok": False,
             "error": redact_sensitive(error),
+            "error_type": type(exc).__name__,
             "reason": classify_asr_worker_error(error),
         }
 
 
-def transcribe_audio_worker(audio_path: str, lang: str | None, quality: str, result_queue: Any) -> None:
-    result_queue.put(transcribe_audio_payload(audio_path, lang, quality))
+def transcribe_audio_worker(
+    audio_path: str,
+    lang: str | None,
+    quality: str,
+    initial_prompt: str | None,
+    hotwords: str | None,
+    result_queue: Any,
+) -> None:
+    result_queue.put(transcribe_audio_payload(audio_path, lang, quality, initial_prompt, hotwords))
 
 
 def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: Any) -> None:
+    prewarm_quality = os.getenv("ASR_PREWARM_QUALITY", "accurate").strip().lower()
+    if prewarm_quality not in {"fast", "accurate"}:
+        prewarm_quality = "accurate"
+    prewarm_profile = asr_profile(prewarm_quality)
     prewarmed = False
     try:
-        whisper_model(DEFAULT_ASR_MODEL, ASR_COMPUTE_TYPE, ASR_DEVICE, ASR_CPU_THREADS)
+        whisper_model(
+            prewarm_profile["model"],
+            prewarm_profile["compute_type"],
+            prewarm_profile["device"],
+            prewarm_profile["cpu_threads"],
+        )
         prewarmed = True
     except Exception:
         # Prewarming is opportunistic. The first real request retries initialization
         # and returns the model error through the normal task result path.
-        whisper_model.cache_clear()
+        clear_whisper_model()
     finally:
-        result_queue.put({"kind": "prewarm", "ok": prewarmed})
-        ready_event.set()
-    while True:
-        task = request_queue.get()
-        if task is None:
-            return
-        task_id = str(task.get("task_id") or "")
-        result = transcribe_audio_payload(
-            str(task.get("audio_path") or ""),
-            task.get("lang"),
-            str(task.get("quality") or "fast"),
+        result_queue.put(
+            {
+                "kind": "prewarm",
+                "ok": prewarmed,
+                "model_key": [
+                    prewarm_profile["model"],
+                    prewarm_profile["compute_type"],
+                    prewarm_profile["device"],
+                    prewarm_profile["cpu_threads"],
+                ],
+            }
         )
-        result["task_id"] = task_id
-        result_queue.put(result)
+        ready_event.set()
+    try:
+        while True:
+            task = request_queue.get()
+            if task is None:
+                return
+            task_id = str(task.get("task_id") or "")
+            result = transcribe_audio_payload(
+                str(task.get("audio_path") or ""),
+                task.get("lang"),
+                str(task.get("quality") or "accurate"),
+                task.get("initial_prompt"),
+                task.get("hotwords"),
+            )
+            result["task_id"] = task_id
+            result_queue.put(result)
+    finally:
+        clear_whisper_model()
 
 
 def asr_worker_alive() -> bool:
@@ -3641,7 +4079,7 @@ def asr_worker_alive() -> bool:
 
 
 def stop_asr_worker_locked(graceful: bool = True) -> None:
-    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT, ASR_WORKER_WARM
+    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT, ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
     process = ASR_WORKER_PROCESS
     request_queue = ASR_WORKER_REQUEST_QUEUE
     if ASR_WORKER_READY_EVENT is not None:
@@ -3669,6 +4107,7 @@ def stop_asr_worker_locked(graceful: bool = True) -> None:
     ASR_WORKER_RESULT_QUEUE = None
     ASR_WORKER_READY_EVENT = None
     ASR_WORKER_WARM = False
+    ASR_WORKER_MODEL_KEY = None
 
 
 def stop_asr_worker() -> None:
@@ -3677,7 +4116,7 @@ def stop_asr_worker() -> None:
 
 
 def ensure_persistent_asr_worker_locked() -> None:
-    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT
+    global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT, ASR_WORKER_START_COUNT
     if asr_worker_alive():
         return
     stop_asr_worker_locked(graceful=False)
@@ -3693,6 +4132,7 @@ def ensure_persistent_asr_worker_locked() -> None:
             daemon=True,
         )
         ASR_WORKER_PROCESS.start()
+        ASR_WORKER_START_COUNT += 1
     except (OSError, RuntimeError) as exc:
         stop_asr_worker_locked(graceful=False)
         raise ExtractionFailure(
@@ -3704,7 +4144,7 @@ def ensure_persistent_asr_worker_locked() -> None:
 
 
 def prewarm_asr_worker() -> None:
-    global ASR_WORKER_WARM
+    global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
     acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
     if not acquired:
         return
@@ -3734,6 +4174,14 @@ def prewarm_asr_worker() -> None:
                 status = None
             if isinstance(status, dict) and status.get("kind") == "prewarm":
                 ASR_WORKER_WARM = bool(status.get("ok"))
+                model_key = status.get("model_key")
+                if isinstance(model_key, list) and len(model_key) == 4:
+                    ASR_WORKER_MODEL_KEY = (
+                        str(model_key[0]),
+                        str(model_key[1]),
+                        str(model_key[2]),
+                        int(model_key[3]),
+                    )
     finally:
         ASR_SEMAPHORE.release()
 
@@ -3748,9 +4196,9 @@ def start_asr_prewarm() -> None:
 
 def parse_transcription_result(result: dict[str, Any]) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     if not result.get("ok"):
-        error = str(result.get("error") or "unknown error")
         reason = str(result.get("reason") or "asr_failed")
-        LOGGER.warning("ASR worker task failed: %s", redact_sensitive(error))
+        error_type = re.sub(r"[^A-Za-z0-9_.-]", "", str(result.get("error_type") or "ASRWorkerError"))
+        LOGGER.warning("ASR worker task failed reason=%s error_type=%s", reason, error_type)
         message = USER_ERROR_MESSAGES.get(reason, USER_ERROR_MESSAGES["asr_failed"])
         status_code = 503 if reason in {"asr_model_download_failed", "asr_worker_crashed"} else 502
         raise ExtractionFailure(status_code, message, reason, retryable=True)
@@ -3763,10 +4211,51 @@ def parse_transcription_result(result: dict[str, Any]) -> tuple[list[SubtitleEnt
     return entries, meta
 
 
+def asr_public_diagnostics(meta: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "audio_duration_seconds",
+        "duration_after_vad",
+        "transcribe_seconds",
+        "realtime_factor",
+        "median_avg_logprob",
+        "median_no_speech_prob",
+        "median_compression_ratio",
+        "low_confidence_segment_ratio",
+        "repeated_segment_ratio",
+        "peak_rss_mb",
+        "asr_attempt_count",
+        "context_retry_performed",
+        "context_retry_selected",
+        "context_retry_reason",
+        "quality_warning",
+        "initial_prompt_used",
+        "hotwords_used",
+        "initial_prompt_hash",
+        "hotwords_hash",
+        "audio_filter_enabled",
+        "audio_filter_hash",
+        "condition_on_previous_text",
+        "vad_parameters",
+        "asr_worker_restart_count",
+    }
+    return {key: meta[key] for key in allowed if key in meta}
+
+
+def asr_quality_user_note(meta: dict[str, Any]) -> str | None:
+    warning = meta.get("quality_warning")
+    if warning == "repetition":
+        return "识别结果仍检测到较多重复片段，建议核对原音频或补充专业词汇后重试。"
+    if warning == "low_confidence":
+        return "部分片段识别置信度偏低，建议核对原音频或补充专业词汇后重试。"
+    return None
+
+
 def transcribe_audio_once(
     audio_path: Path,
     lang: str | None,
-    quality: str = "fast",
+    quality: str = "accurate",
+    initial_prompt: str | None = None,
+    hotwords: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     profile = asr_profile(quality)
     timeout_seconds = asr_task_timeout(audio_path, profile["quality"])
@@ -3778,7 +4267,14 @@ def transcribe_audio_once(
             result_queue = ctx.Queue(maxsize=1)
             process = ctx.Process(
                 target=transcribe_audio_worker,
-                args=(str(audio_path), lang, profile["quality"], result_queue),
+                args=(
+                    str(audio_path),
+                    lang,
+                    profile["quality"],
+                    initial_prompt,
+                    hotwords,
+                    result_queue,
+                ),
             )
             process.start()
         except (OSError, RuntimeError) as exc:
@@ -3820,6 +4316,7 @@ def transcribe_audio_once(
             raise ExtractionFailure(502, "Local ASR returned an invalid result.", "asr_failed")
         entries, meta = parse_transcription_result(result)
         meta["asr_worker_reused"] = False
+        meta["asr_worker_restart_count"] = 0
         meta["timeout_seconds"] = timeout_seconds
         return entries, meta
     finally:
@@ -3834,13 +4331,21 @@ def transcribe_audio_once(
 def transcribe_audio(
     audio_path: Path,
     lang: str | None,
-    quality: str = "fast",
+    quality: str = "accurate",
+    initial_prompt: str | None = None,
+    hotwords: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
-    global ASR_WORKER_WARM
+    global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
     profile = asr_profile(quality)
     timeout_seconds = asr_task_timeout(audio_path, profile["quality"])
     if not env_bool("ASR_PERSISTENT_WORKER", True):
-        return transcribe_audio_once(audio_path, lang, profile["quality"])
+        return transcribe_audio_once(
+            audio_path,
+            lang,
+            profile["quality"],
+            initial_prompt,
+            hotwords,
+        )
 
     with ASR_WORKER_LOCK:
         worker_reused = asr_worker_alive()
@@ -3856,6 +4361,8 @@ def transcribe_audio(
                 "audio_path": str(audio_path),
                 "lang": lang,
                 "quality": profile["quality"],
+                "initial_prompt": sanitize_asr_context(initial_prompt),
+                "hotwords": sanitize_asr_context(hotwords),
             }
         )
         deadline = time.monotonic() + timeout_seconds
@@ -3883,12 +4390,29 @@ def transcribe_audio(
                 continue
             if isinstance(result, dict) and result.get("kind") == "prewarm":
                 ASR_WORKER_WARM = bool(result.get("ok"))
+                model_key = result.get("model_key")
+                if isinstance(model_key, list) and len(model_key) == 4:
+                    ASR_WORKER_MODEL_KEY = (
+                        str(model_key[0]),
+                        str(model_key[1]),
+                        str(model_key[2]),
+                        int(model_key[3]),
+                    )
+                continue
+            if not isinstance(result, dict):
                 continue
             if result.get("task_id") != task_id:
                 continue
             entries, meta = parse_transcription_result(result)
             ASR_WORKER_WARM = True
+            ASR_WORKER_MODEL_KEY = (
+                str(meta.get("model") or profile["model"]),
+                str(meta.get("compute_type") or profile["compute_type"]),
+                str(meta.get("device") or profile["device"]),
+                int(meta.get("cpu_threads") or profile["cpu_threads"]),
+            )
             meta["asr_worker_reused"] = reused
+            meta["asr_worker_restart_count"] = max(0, ASR_WORKER_START_COUNT - 1)
             meta["timeout_seconds"] = timeout_seconds
             return entries, meta
 
@@ -3947,7 +4471,18 @@ def video_pixel_subtitle(
             if not acquired:
                 raise ExtractionFailure(429, "Local ASR wait exceeded the queue timeout.", "asr_busy")
             try:
-                entries, fallback_asr_info = transcribe_audio(audio_path, req.lang, "accurate")
+                initial_prompt, hotwords = asr_context(
+                    str(info.get("title") or ""),
+                    str(info.get("author") or ""),
+                    req.hotwords,
+                )
+                entries, fallback_asr_info = transcribe_audio(
+                    audio_path,
+                    req.lang,
+                    "accurate",
+                    initial_prompt,
+                    hotwords,
+                )
             finally:
                 ASR_SEMAPHORE.release()
         if not entries:
@@ -3970,6 +4505,9 @@ def video_pixel_subtitle(
         track_source_type = "burned_in_ocr"
         subtitle_format = "ocr"
         note = "已通过画面文字识别提取视频中的烧录字幕。"
+    quality_note = asr_quality_user_note(fallback_asr_info)
+    if quality_note:
+        note = f"{note} {quality_note}"
     profile = asr_profile("accurate")
     meta = {
         "title": info.get("title"),
@@ -4006,6 +4544,7 @@ def video_pixel_subtitle(
                 "asr_language_probability": fallback_asr_info.get("language_probability"),
             }
         )
+        meta.update(asr_public_diagnostics(fallback_asr_info))
     return entries, meta
 
 
@@ -4071,7 +4610,14 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
                 68,
                 "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
             )
-            entries, asr_info = transcribe_audio(audio_path, req.lang, quality)
+            initial_prompt, hotwords = asr_context(view.title, view.author, req.hotwords)
+            entries, asr_info = transcribe_audio(
+                audio_path,
+                req.lang,
+                quality,
+                initial_prompt,
+                hotwords,
+            )
     finally:
         ASR_SEMAPHORE.release()
     if not entries:
@@ -4079,6 +4625,9 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
     note = "未找到可用的平台字幕，本次使用本地语音识别。"
     if prior_note:
         note = f"{redact_sensitive(prior_note)} 已改用本地语音识别。"
+    quality_note = asr_quality_user_note(asr_info)
+    if quality_note:
+        note = f"{note} {quality_note}"
     meta = {
         "title": view.title or info.get("title"),
         "id": view.video_id or info.get("id"),
@@ -4112,6 +4661,7 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
         "audio_quality_strategy": info.get("audio_quality_strategy"),
         "asr_language_probability": asr_info.get("language_probability"),
         "available_tracks": [],
+        **asr_public_diagnostics(asr_info),
     }
     return entries, meta
 
@@ -4195,7 +4745,18 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                         68,
                         "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
                     )
-                    return transcribe_audio(normalized_path, req.lang, quality)
+                    initial_prompt, hotwords = asr_context(
+                        upload_display_title(req.filename),
+                        None,
+                        req.hotwords,
+                    )
+                    return transcribe_audio(
+                        normalized_path,
+                        req.lang,
+                        quality,
+                        initial_prompt,
+                        hotwords,
+                    )
                 finally:
                     ASR_SEMAPHORE.release()
 
@@ -4234,6 +4795,9 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 track_source_type = "burned_in_ocr"
                 subtitle_format = "ocr"
                 note = "已通过画面文字识别提取上传视频中的烧录字幕。"
+            quality_note = asr_quality_user_note(asr_info)
+            if quality_note:
+                note = f"{note} {quality_note}"
             meta = {
                 "title": upload_display_title(req.filename),
                 "id": f"upload-{req.sha256[:12]}",
@@ -4274,6 +4838,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 "cache_hit": False,
                 "cache_age_seconds": 0,
                 **subtitle_info,
+                **asr_public_diagnostics(asr_info),
             }
             apply_upload_metadata(meta, req)
             meta["entry_count"] = len(entries)
@@ -4406,7 +4971,12 @@ def extract_subtitle_data(req: ExtractRequest) -> tuple[list[SubtitleEntry], dic
         canonical_input = normalize_input(req.input)
     except ExtractionFailure as exc:
         raise extraction_http_error(req, exc, []) from exc
-    canonical_req = req.model_copy(update={"input": canonical_input})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical_input,
+            "hotwords": sanitize_asr_context(req.hotwords),
+        }
+    )
     key = result_cache_key(canonical_req, canonical_input)
 
     with result_key_guard(key):
@@ -4487,7 +5057,12 @@ def cached_extraction_payload(
         return None
     started = time.monotonic()
     canonical = canonical_input or normalize_input(req.input)
-    canonical_req = req.model_copy(update={"input": canonical})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical,
+            "hotwords": sanitize_asr_context(req.hotwords),
+        }
+    )
     key = result_cache_key(canonical_req, canonical)
     with result_key_guard(key, blocking=False) as acquired:
         if not acquired:
@@ -4596,7 +5171,12 @@ def submit_extraction_job(req: ExtractRequest, owner_id: int, idempotency_key: s
         canonical_input = normalize_input(req.input)
     except ExtractionFailure as exc:
         raise extraction_http_error(req, exc, []) from exc
-    canonical_req = req.model_copy(update={"input": canonical_input})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical_input,
+            "hotwords": sanitize_asr_context(req.hotwords),
+        }
+    )
     cached_payload = cached_extraction_payload(canonical_req, canonical_input)
     try:
         if cached_payload is not None:
@@ -4648,10 +5228,46 @@ def request_content_length(request: Request) -> int | None:
     return value
 
 
+def request_asr_hotwords(request: Request) -> str | None:
+    encoded = request.headers.get("x-asr-hotwords", "").strip()
+    if not encoded:
+        return None
+    if re.search(r"%(?![0-9A-Fa-f]{2})", encoded):
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "invalid_hotwords", "message": "专业词汇编码无效。"},
+        )
+    if len(encoded) > ASR_PROMPT_MAX_CHARS * 12:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "reason": "hotwords_too_long",
+                "message": f"专业词汇最多输入 {ASR_PROMPT_MAX_CHARS} 个字符。",
+            },
+        )
+    try:
+        decoded = urllib.parse.unquote(encoded, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "invalid_hotwords", "message": "专业词汇编码无效。"},
+        ) from exc
+    if len(decoded) > ASR_PROMPT_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "reason": "hotwords_too_long",
+                "message": f"专业词汇最多输入 {ASR_PROMPT_MAX_CHARS} 个字符。",
+            },
+        )
+    return sanitize_asr_context(decoded)
+
+
 def upload_idempotency_fingerprint(
     filename: str,
     output_format: str,
     lang: str | None,
+    hotwords: str | None,
     quality: str,
     embedded_subtitles: bool,
     force_refresh: bool,
@@ -4664,6 +5280,7 @@ def upload_idempotency_fingerprint(
             "filename": safe_name,
             "format": output_format,
             "lang": (lang or "").lower().replace("_", "-"),
+            "hotwords_hash": asr_context_hash(hotwords),
             "quality": quality,
             "embedded_subtitles": embedded_subtitles,
             "force_refresh": force_refresh,
@@ -4765,6 +5382,7 @@ async def stage_uploaded_video(
     quality: Literal["fast", "accurate"],
     embedded_subtitles: bool,
     force_refresh: bool,
+    hotwords: str | None = None,
 ) -> UploadJobRequest:
     safe_name, extension = safe_upload_filename(filename)
     content_length = request_content_length(request)
@@ -4817,6 +5435,7 @@ async def stage_uploaded_video(
             size=written,
             format=output_format,
             lang=lang,
+            hotwords=sanitize_asr_context(hotwords),
             quality=quality,
             embedded_subtitles=embedded_subtitles,
             force_refresh=force_refresh,
@@ -5072,20 +5691,37 @@ def health() -> dict[str, Any]:
         "ffmpeg_available": ffmpeg_available,
         "ffprobe_available": ffprobe_available,
         "disk": disk_payload,
-        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "speech").strip().lower(),
+        "memory": runtime_memory_status(),
+        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
+        "asr_audio_filter_enabled": bool(asr_audio_filter()),
+        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
         "max_audio_seconds": ASR_MAX_AUDIO_SECONDS,
         "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
         "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
+        "asr_single_model_instance": True,
+        "asr_prewarm_quality": os.getenv("ASR_PREWARM_QUALITY", "accurate").strip().lower(),
+        "asr_worker_restart_count": max(0, ASR_WORKER_START_COUNT - 1),
+        "asr_worker_model_key": list(ASR_WORKER_MODEL_KEY) if ASR_WORKER_MODEL_KEY else None,
+        "default_request": {
+            "quality": "accurate",
+            "language": "zh",
+            "allow_platform_ai": False,
+        },
         "extraction_modes": {
             "fast": {
                 "model": DEFAULT_ASR_MODEL,
                 "beam_size": ASR_FAST_BEAM_SIZE,
-                "vad_filter": env_bool("ASR_VAD_FILTER", False),
+                "vad_filter": env_bool("ASR_VAD_FILTER", True),
+                "condition_on_previous_text": env_bool("ASR_CONDITION_ON_PREVIOUS_TEXT", False),
             },
             "accurate": {
                 "model": ACCURATE_ASR_MODEL,
                 "beam_size": ACCURATE_ASR_BEAM_SIZE,
                 "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
+                "condition_on_previous_text": env_bool(
+                    "ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT",
+                    True,
+                ),
             },
         },
         "ocr": {
@@ -5320,15 +5956,16 @@ async def api_create_upload_job(
         alias="format",
     ),
     lang: str | None = Query(
-        default=None,
+        default="zh",
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     ),
-    quality: Literal["fast", "accurate"] = Query("fast"),
+    quality: Literal["fast", "accurate"] = Query("accurate"),
     embedded_subtitles: bool = Query(False),
     force_refresh: bool = Query(False),
 ) -> JSONResponse:
     user = require_auth_user(request)
+    hotwords = request_asr_hotwords(request)
     idempotency_key = request_idempotency_key(request)
     content_length = request_content_length(request)
     idempotency_fingerprint = (
@@ -5336,6 +5973,7 @@ async def api_create_upload_job(
             filename,
             output_format,
             lang,
+            hotwords,
             quality,
             embedded_subtitles,
             force_refresh,
@@ -5372,6 +6010,7 @@ async def api_create_upload_job(
         filename=filename,
         output_format=output_format,
         lang=lang,
+        hotwords=hotwords,
         quality=quality,
         embedded_subtitles=embedded_subtitles,
         force_refresh=force_refresh,

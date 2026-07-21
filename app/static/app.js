@@ -28,6 +28,8 @@
     platformAiRow: $("platform-ai-row"),
     format: $("format-select"),
     lang: $("lang-select"),
+    hotwordsRow: $("hotwords-row"),
+    hotwords: $("hotwords-input"),
     allowPlatformAi: $("allow-platform-ai"),
     cookieRow: $("cookie-row"),
     useCookie: $("use-cookie"),
@@ -231,8 +233,9 @@
     setInputMode(payload.kind === "upload" ? "upload" : "link");
     if (payload.kind !== "media") {
       elements.format.value = payload.format || "txt";
-      elements.lang.value = payload.lang || "";
-      setSelectedQuality(payload.quality || "fast");
+      elements.lang.value = payload.lang || "zh";
+      elements.hotwords.value = payload.hotwords || "";
+      setSelectedQuality(payload.quality || "accurate");
       elements.embeddedSubtitles.checked = Boolean(payload.embedded_subtitles);
     }
     elements.forceRefresh.checked = Boolean(payload.force_refresh);
@@ -246,7 +249,7 @@
     }
     if (!payload.input) return;
     elements.input.value = payload.input;
-    if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai !== false;
+    if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai === true;
     elements.useCookie.checked = Boolean(payload.use_cookie);
     if (payload.kind !== "media") setSelectedSource(payload.source || "auto");
     updatePlatformDetect();
@@ -326,7 +329,7 @@
 
   function selectedQuality() {
     const selected = elements.form.querySelector('input[name="quality"]:checked');
-    return selected ? selected.value : "fast";
+    return selected ? selected.value : "accurate";
   }
 
   function selectedEmbeddedSubtitles() {
@@ -422,11 +425,13 @@
       radio.disabled = state.busy || embedded;
     });
     elements.allowPlatformAi.disabled = state.busy || embedded;
+    elements.hotwords.disabled = state.busy || !subtitleMode;
+    elements.hotwordsRow.hidden = !subtitleMode;
     elements.qualityCaption.textContent = embedded
       ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
       : selectedQuality() === "accurate"
-        ? "使用更强模型和更细致解码，处理时间更长"
-        : "适合吐字清晰的视频，优先缩短等待时间";
+        ? "保留跨段上下文并使用更细致的解码"
+        : "使用同一常驻模型，以较窄搜索缩短等待时间";
     elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
   }
 
@@ -504,6 +509,7 @@
           source: selectedSource(),
           format: elements.format.value,
           lang: elements.lang.value || null,
+          hotwords: elements.hotwords.value.trim() || null,
           quality: selectedQuality(),
           embedded_subtitles: selectedEmbeddedSubtitles(),
           use_cookie: elements.useCookie.checked,
@@ -752,10 +758,11 @@
       title: meta.title || sourceId,
       operation,
       source: payload.source,
-      quality: payload.quality || "fast",
+      quality: payload.quality || "accurate",
       embeddedSubtitles: Boolean(payload.embedded_subtitles),
       format: payload.format || (operation === "audio" ? "mp3" : "mp4"),
       lang: payload.lang || "",
+      hotwords: payload.hotwords || "",
       platform: meta.platform || detectPlatform(payload.input),
       time: Date.now()
     };
@@ -788,9 +795,10 @@
         elements.input.value = item.input;
         if ((item.operation || "subtitle") === "subtitle") {
           elements.format.value = item.format;
-          elements.lang.value = item.lang || "";
+          elements.lang.value = item.lang || "zh";
+          elements.hotwords.value = item.hotwords || "";
           setSelectedSource(item.source || "auto");
-          setSelectedQuality(item.quality || "fast");
+          setSelectedQuality(item.quality || "accurate");
           elements.embeddedSubtitles.checked = Boolean(item.embeddedSubtitles);
           syncInputMode();
         }
@@ -942,6 +950,7 @@
       last_modified: file.lastModified || 0,
       format: elements.format.value,
       lang: elements.lang.value || null,
+      hotwords: elements.hotwords.value.trim() || null,
       quality: selectedQuality(),
       embedded_subtitles: selectedEmbeddedSubtitles(),
       force_refresh: elements.forceRefresh.checked
@@ -971,6 +980,7 @@
     xhr.open("POST", `/api/upload-jobs?${params.toString()}`);
     xhr.withCredentials = true;
     xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+    if (payload.hotwords) xhr.setRequestHeader("X-ASR-Hotwords", encodeURIComponent(payload.hotwords));
     xhr.upload.addEventListener("progress", (event) => {
       if (!event.lengthComputable || state.uploadXhr !== xhr) return;
       const percent = Math.min(100, Math.max(2, Math.round((event.loaded / event.total) * 100)));
