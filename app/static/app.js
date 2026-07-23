@@ -38,8 +38,14 @@
     forceRefreshHint: $("force-refresh-hint"),
     extractButton: $("extract-button"),
     extractButtonLabel: $("extract-button-label"),
-    serviceState: $("service-state"),
+    serviceState: $("health-trigger"),
     serviceLabel: $("service-label"),
+    healthTrigger: $("health-trigger"),
+    healthPopover: $("health-popover"),
+    healthVersion: $("health-version"),
+    healthQueue: $("health-queue"),
+    healthAsr: $("health-asr"),
+    healthDisk: $("health-disk"),
     bilibiliChip: $("bilibili-chip"),
     douyinChip: $("douyin-chip"),
     uploadChip: $("upload-chip"),
@@ -50,6 +56,7 @@
     resultKicker: $("result-kicker"),
     resultTitle: $("result-title"),
     resultActions: $("result-actions"),
+    retryAccurate: $("retry-accurate"),
     copyResult: $("copy-result"),
     downloadResult: $("download-result"),
     statusPanel: $("status-panel"),
@@ -61,12 +68,16 @@
     cancelJob: $("cancel-job"),
     progressTrack: $("progress-track"),
     progressValue: $("progress-value"),
+    stageTrack: $("stage-track"),
     metadataStrip: $("metadata-strip"),
     notice: $("result-notice"),
     outputShell: $("output-shell"),
     output: $("output"),
     outputFormat: $("output-format-label"),
     outputStats: $("output-stats-label"),
+    resultSearch: $("result-search"),
+    searchCount: $("search-count"),
+    toggleWrap: $("toggle-wrap"),
     mediaResult: $("media-result"),
     mediaFileMark: $("media-file-mark"),
     mediaFilename: $("media-filename"),
@@ -78,6 +89,11 @@
     loginStart: $("login-start"),
     loginStatus: $("login-status"),
     qrImage: $("qr-image"),
+    composerPane: $("composer-pane"),
+    resultPane: $("result-pane"),
+    mobileCompose: $("mobile-tab-compose"),
+    mobileResult: $("mobile-tab-result"),
+    mobileResultDot: $("mobile-result-dot"),
     toast: $("toast")
   };
 
@@ -102,7 +118,10 @@
     uploadMaxBytes: 512 * 1024 * 1024,
     uploadExtensions: [],
     mediaEnabled: true,
-    mediaMaxBytes: 1000 * 1000 * 1000
+    mediaMaxBytes: 1000 * 1000 * 1000,
+    wrapOutput: true,
+    mobileView: "compose",
+    preferencesLoaded: false
   };
 
   const sourceLabels = {
@@ -182,6 +201,54 @@
     return `video-workspace-history-v4:${userId}`;
   }
 
+  function preferencesStorageKey(userId) {
+    return `video-workspace-preferences-v1:${userId}`;
+  }
+
+  function loadPreferences(userId) {
+    let value = {};
+    try {
+      value = JSON.parse(localStorage.getItem(preferencesStorageKey(userId)) || "{}");
+    } catch (_) {
+      value = {};
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) value = {};
+    setSelectedOperation(["subtitle", "video", "audio"].includes(value.operation) ? value.operation : "subtitle");
+    setInputMode(value.inputMode === "upload" ? "upload" : "link");
+    setSelectedSource(["auto", "official", "asr"].includes(value.source) ? value.source : "auto");
+    setSelectedQuality(value.quality === "fast" ? "fast" : "accurate");
+    if (["txt", "srt", "vtt", "markdown", "json"].includes(value.format)) elements.format.value = value.format;
+    elements.lang.value = ["", "zh", "en", "ja", "ko"].includes(value.lang) ? value.lang : "zh";
+    elements.embeddedSubtitles.checked = value.embeddedSubtitles === true;
+    elements.allowPlatformAi.checked = value.allowPlatformAi === true;
+    elements.useCookie.checked = value.useCookie === true;
+    state.wrapOutput = value.wrapOutput !== false;
+    applyWrapPreference();
+    state.preferencesLoaded = true;
+    syncInputMode();
+  }
+
+  function savePreferences() {
+    if (!state.user || !state.preferencesLoaded) return;
+    const value = {
+      operation: selectedOperation(),
+      inputMode: selectedInputMode(),
+      source: selectedSource(),
+      quality: selectedQuality(),
+      format: elements.format.value,
+      lang: elements.lang.value,
+      embeddedSubtitles: selectedEmbeddedSubtitles(),
+      allowPlatformAi: elements.allowPlatformAi.checked,
+      useCookie: elements.useCookie.checked,
+      wrapOutput: state.wrapOutput
+    };
+    try {
+      localStorage.setItem(preferencesStorageKey(state.user.id), JSON.stringify(value));
+    } catch (_) {
+      return;
+    }
+  }
+
   function loadHistory(userId) {
     try {
       const value = JSON.parse(localStorage.getItem(historyStorageKey(userId)) || "[]");
@@ -216,9 +283,11 @@
   function saveActiveJob() {
     if (!state.user || !state.jobId || !state.currentPayload) return;
     try {
+      const persistedPayload = Object.assign({}, state.currentPayload);
+      delete persistedPayload.hotwords;
       localStorage.setItem(activeJobStorageKey(state.user.id), JSON.stringify({
         jobId: state.jobId,
-        payload: state.currentPayload,
+        payload: persistedPayload,
         startedAt: state.startedAt || Date.now(),
         savedAt: Date.now()
       }));
@@ -300,6 +369,7 @@
       elements.accountAvatar.textContent = String(data.user.username || "?").charAt(0).toUpperCase();
       elements.logoutAccount.disabled = false;
       elements.accountArea.setAttribute("aria-busy", "false");
+      loadPreferences(data.user.id);
       state.history = loadHistory(data.user.id);
       renderHistory();
       if (state.jobId && state.busy) saveActiveJob();
@@ -344,6 +414,100 @@
   function selectedInputMode() {
     const selected = elements.form.querySelector('input[name="input-mode"]:checked');
     return selected ? selected.value : "link";
+  }
+
+  function setMobileView(view) {
+    const next = view === "result" ? "result" : "compose";
+    state.mobileView = next;
+    document.body.classList.toggle("view-compose", next === "compose");
+    document.body.classList.toggle("view-result", next === "result");
+    elements.mobileCompose.setAttribute("aria-pressed", String(next === "compose"));
+    elements.mobileResult.setAttribute("aria-pressed", String(next === "result"));
+    if (next === "result") elements.mobileResultDot.hidden = true;
+  }
+
+  function applyWrapPreference() {
+    elements.output.classList.toggle("wrap", state.wrapOutput);
+    elements.toggleWrap.classList.toggle("active", state.wrapOutput);
+    elements.toggleWrap.setAttribute("aria-pressed", String(state.wrapOutput));
+    elements.toggleWrap.title = state.wrapOutput ? "关闭自动换行" : "开启自动换行";
+  }
+
+  function renderOutputContent() {
+    const content = state.current && state.current.kind === "subtitle" ? state.current.content : "";
+    const query = elements.resultSearch.value.trim();
+    elements.output.textContent = "";
+    elements.searchCount.textContent = "";
+    if (!query || !content) {
+      elements.output.textContent = content;
+      return;
+    }
+
+    const source = content.toLocaleLowerCase();
+    const needle = query.toLocaleLowerCase();
+    let cursor = 0;
+    let count = 0;
+    while (cursor < source.length) {
+      const index = source.indexOf(needle, cursor);
+      if (index < 0) break;
+      count += 1;
+      cursor = index + Math.max(needle.length, 1);
+    }
+
+    cursor = 0;
+    let highlighted = 0;
+    while (cursor < content.length && highlighted < 200) {
+      const index = source.indexOf(needle, cursor);
+      if (index < 0) break;
+      elements.output.appendChild(document.createTextNode(content.slice(cursor, index)));
+      const mark = document.createElement("mark");
+      mark.textContent = content.slice(index, index + needle.length);
+      elements.output.appendChild(mark);
+      cursor = index + Math.max(needle.length, 1);
+      highlighted += 1;
+    }
+    elements.output.appendChild(document.createTextNode(content.slice(cursor)));
+    elements.searchCount.textContent = count ? `${count} 处` : "未找到";
+    const firstMatch = elements.output.querySelector("mark");
+    if (firstMatch) firstMatch.scrollIntoView({ block: "center" });
+  }
+
+  function updateStageTrack(stage, progress, status) {
+    const stageGroups = {
+      starting: "prepare",
+      validating: "prepare",
+      cache: "prepare",
+      discover: "fetch",
+      platform: "fetch",
+      download: "fetch",
+      media_download: "fetch",
+      embedded_subtitle: "fetch",
+      ocr_wait: "recognize",
+      ocr: "recognize",
+      ocr_fallback: "recognize",
+      asr_wait: "recognize",
+      transcribe: "recognize",
+      media_convert: "recognize",
+      render: "render",
+      media_finalize: "render"
+    };
+    const order = ["prepare", "fetch", "recognize", "render"];
+    let current = stageGroups[stage];
+    if (!current) {
+      const numericProgress = Number(progress);
+      current = numericProgress >= 85
+        ? "render"
+        : numericProgress >= 45
+          ? "recognize"
+          : numericProgress >= 12 ? "fetch" : "prepare";
+    }
+    const currentIndex = order.indexOf(current);
+    elements.stageTrack.querySelectorAll("li").forEach((item) => {
+      const index = order.indexOf(item.dataset.stage);
+      item.classList.toggle("done", index >= 0 && index < currentIndex);
+      item.classList.toggle("active", index === currentIndex);
+    });
+    elements.stageTrack.hidden = !["queued", "running", "processing"].includes(status || "processing");
   }
 
   function updateSubmitLabel() {
@@ -552,6 +716,7 @@
     elements.extractButton.classList.toggle("loading", busy);
     elements.extractButtonLabel.textContent = busy ? "任务处理中" : "";
     elements.resultActions.hidden = busy || !state.current;
+    elements.retryAccurate.hidden = busy || elements.retryAccurate.hidden;
     elements.copyResult.hidden = Boolean(state.current && state.current.kind === "media");
     syncInputMode();
     if (state.elapsedTimer) clearInterval(state.elapsedTimer);
@@ -580,6 +745,11 @@
     elements.progressValue.style.width = Number.isFinite(numericProgress)
       ? `${Math.min(100, Math.max(2, numericProgress))}%`
       : "0%";
+    if (["queued", "processing"].includes(kind)) {
+      updateStageTrack("", numericProgress, kind === "queued" ? "queued" : "processing");
+    } else {
+      elements.stageTrack.hidden = true;
+    }
     elements.outputShell.hidden = true;
     elements.mediaResult.hidden = true;
     elements.metadataStrip.hidden = true;
@@ -678,6 +848,15 @@
     return "";
   }
 
+  function shouldOfferAccurateRetry(meta, payload) {
+    if (!payload || payload.kind === "upload" || payload.kind === "media") return false;
+    if (payload.quality === "fast") return true;
+    if (meta.track_source_type === "platform_ai") return true;
+    if (meta.quality_warning) return true;
+    if (Number(meta.low_confidence_segment_ratio || 0) >= 0.25) return true;
+    return Number(meta.repeated_segment_ratio || 0) >= 0.1;
+  }
+
   function renderResult(data, payload) {
     if (data.kind === "media" || data.download_url) {
       renderMediaResult(data, payload);
@@ -703,16 +882,20 @@
     const notice = friendlyNotice(meta);
     elements.notice.textContent = notice;
     elements.notice.hidden = !notice;
-    elements.output.textContent = state.current.content;
+    elements.resultSearch.value = "";
+    renderOutputContent();
+    applyWrapPreference();
     elements.outputFormat.textContent = state.current.format.toUpperCase();
     const lineCount = state.current.content ? state.current.content.split("\n").filter(Boolean).length : 0;
     elements.outputStats.textContent = `${lineCount} 行 · ${state.current.content.length.toLocaleString("zh-CN")} 字符`;
     elements.outputShell.hidden = false;
     elements.mediaResult.hidden = true;
     elements.copyResult.hidden = false;
+    elements.retryAccurate.hidden = !shouldOfferAccurateRetry(meta, payload);
     elements.resultActions.hidden = false;
     elements.forceRefresh.checked = false;
     if (payload.kind !== "upload") addHistory(payload, meta);
+    setMobileView("result");
   }
 
   function renderMediaResult(data, payload) {
@@ -735,6 +918,7 @@
     renderMetadata(meta);
     elements.notice.hidden = true;
     elements.outputShell.hidden = true;
+    elements.retryAccurate.hidden = true;
     elements.mediaFileMark.textContent = state.current.mediaType === "audio"
       ? "MP3"
       : (state.current.filename.split(".").pop() || "VIDEO").toUpperCase();
@@ -746,6 +930,7 @@
     elements.resultActions.hidden = false;
     elements.forceRefresh.checked = false;
     addHistory(payload, meta);
+    setMobileView("result");
   }
 
   function addHistory(payload, meta) {
@@ -762,7 +947,6 @@
       embeddedSubtitles: Boolean(payload.embedded_subtitles),
       format: payload.format || (operation === "audio" ? "mp3" : "mp4"),
       lang: payload.lang || "",
-      hotwords: payload.hotwords || "",
       platform: meta.platform || detectPlatform(payload.input),
       time: Date.now()
     };
@@ -796,7 +980,7 @@
         if ((item.operation || "subtitle") === "subtitle") {
           elements.format.value = item.format;
           elements.lang.value = item.lang || "zh";
-          elements.hotwords.value = item.hotwords || "";
+          elements.hotwords.value = "";
           setSelectedSource(item.source || "auto");
           setSelectedQuality(item.quality || "accurate");
           elements.embeddedSubtitles.checked = Boolean(item.embeddedSubtitles);
@@ -825,6 +1009,7 @@
     clearUnavailableUploadSelection();
     showStatus("error", "未能完成任务", message, NaN, "!");
     setBusy(false);
+    setMobileView("result");
     showToast(message, true);
     loadHealth();
   }
@@ -839,6 +1024,7 @@
       elements.cancelJob.textContent = "取消排队";
       elements.cancelJob.hidden = false;
       showStatus("queued", "任务正在排队", job.message || "等待处理资源", job.progress || 3, "…");
+      updateStageTrack("starting", job.progress || 3, "queued");
       return;
     }
     elements.queueBadge.hidden = true;
@@ -847,6 +1033,7 @@
     if (job.status === "running") {
       const detail = stageDetails[job.stage] || "服务器正在处理当前任务";
       showStatus("processing", job.message || "正在处理视频", detail, job.progress || 8, "…");
+      updateStageTrack(job.stage, job.progress || 8, "running");
       return;
     }
     if (job.status === "completed") {
@@ -915,6 +1102,7 @@
     elements.resultTitle.textContent = "正在创建任务";
     elements.resultActions.hidden = true;
     showStatus("processing", "正在提交任务", "正在连接处理服务", 2, "…");
+    setMobileView("result");
     try {
       const response = await apiFetch(endpoint, {
         method: "POST",
@@ -974,6 +1162,7 @@
     elements.cancelJob.textContent = "取消上传";
     elements.cancelJob.hidden = false;
     showStatus("processing", "正在上传视频", `正在发送 ${formatBytes(file.size)}`, 2, "…");
+    setMobileView("result");
 
     const xhr = new XMLHttpRequest();
     state.uploadXhr = xhr;
@@ -992,6 +1181,7 @@
         percent,
         "…"
       );
+      updateStageTrack("download", percent, "running");
       elements.cancelJob.hidden = false;
     });
     xhr.addEventListener("load", () => {
@@ -1117,6 +1307,26 @@
     showToast("已开始下载", false);
   }
 
+  function retryAccurate() {
+    if (state.busy || !state.current || state.current.kind !== "subtitle") return;
+    setSelectedOperation("subtitle");
+    setInputMode("link");
+    setSelectedQuality("accurate");
+    setSelectedSource("asr");
+    elements.embeddedSubtitles.checked = false;
+    elements.allowPlatformAi.checked = false;
+    elements.forceRefresh.checked = true;
+    syncInputMode();
+    savePreferences();
+    runExtraction({
+      source: "asr",
+      quality: "accurate",
+      embedded_subtitles: false,
+      allow_platform_ai: false,
+      force_refresh: true
+    });
+  }
+
   async function pasteInput() {
     try {
       const text = await navigator.clipboard.readText();
@@ -1129,6 +1339,18 @@
     }
   }
 
+  function setHealthValue(element, text, level) {
+    element.textContent = text;
+    element.classList.toggle("warn", level === "warn");
+    element.classList.toggle("error", level === "error");
+  }
+
+  function setHealthPopover(open) {
+    const visible = Boolean(open);
+    elements.healthPopover.hidden = !visible;
+    elements.healthTrigger.setAttribute("aria-expanded", String(visible));
+  }
+
   async function loadHealth() {
     try {
       const response = await fetch("/api/health", { cache: "no-store" });
@@ -1139,6 +1361,30 @@
       elements.serviceLabel.textContent = jobs.running || jobs.queued
         ? `队列 ${Number(jobs.running || 0) + Number(jobs.queued || 0)}/${jobs.max_pending || 8}`
         : "服务在线";
+      elements.healthVersion.textContent = state.health.service_version || "1.0 Beta";
+      const queueTotal = Number(jobs.running || 0) + Number(jobs.queued || 0);
+      setHealthValue(
+        elements.healthQueue,
+        queueTotal ? `${queueTotal} 个处理中` : "空闲",
+        Number(jobs.queued || 0) >= Number(jobs.max_pending || 8) ? "warn" : ""
+      );
+      if (state.health.asr_enabled === false) {
+        setHealthValue(elements.healthAsr, "未启用", "error");
+      } else if (state.health.asr_worker_warm) {
+        setHealthValue(elements.healthAsr, "模型已预热", "");
+      } else if (state.health.asr_persistent_worker && !state.health.asr_worker_alive) {
+        setHealthValue(elements.healthAsr, "正在启动", "warn");
+      } else {
+        setHealthValue(elements.healthAsr, "可用", "");
+      }
+      const disk = state.health.disk || {};
+      if (disk.available === false) {
+        setHealthValue(elements.healthDisk, "空间偏低", "error");
+      } else if (disk.free_bytes == null) {
+        setHealthValue(elements.healthDisk, "无法读取", "warn");
+      } else {
+        setHealthValue(elements.healthDisk, `正常 · ${formatBytes(disk.free_bytes)}`, "");
+      }
       const platforms = state.health.platforms || {};
       elements.bilibiliChip.classList.toggle("unavailable", platforms.bilibili && platforms.bilibili.status !== "ready");
       elements.douyinChip.classList.toggle(
@@ -1147,9 +1393,11 @@
       );
       const uploads = state.health.uploads || {};
       const uploadsEnabled = uploads.enabled !== false;
-      state.uploadMaxBytes = Number(uploads.max_bytes || state.uploadMaxBytes);
+      state.uploadMaxBytes = Number(uploads.client_max_bytes || uploads.max_bytes || state.uploadMaxBytes);
       state.uploadExtensions = Array.isArray(uploads.allowed_extensions) ? uploads.allowed_extensions : [];
-      elements.uploadLimit.textContent = `最大 ${formatBytes(state.uploadMaxBytes)}`;
+      elements.uploadLimit.textContent = uploads.edge_limited
+        ? `公网最大 ${formatBytes(state.uploadMaxBytes)}`
+        : `最大 ${formatBytes(state.uploadMaxBytes)}`;
       elements.uploadChip.classList.toggle("unavailable", !uploadsEnabled);
       const media = state.health.media || {};
       state.mediaEnabled = media.enabled !== false;
@@ -1161,6 +1409,10 @@
     } catch (_) {
       elements.serviceState.className = "service-state offline";
       elements.serviceLabel.textContent = "服务异常";
+      elements.healthVersion.textContent = "连接失败";
+      setHealthValue(elements.healthQueue, "无法读取", "error");
+      setHealthValue(elements.healthAsr, "无法读取", "error");
+      setHealthValue(elements.healthDisk, "无法读取", "error");
       elements.bilibiliChip.classList.add("unavailable");
       elements.douyinChip.classList.add("unavailable");
       elements.uploadChip.classList.add("unavailable");
@@ -1221,13 +1473,25 @@
     else runExtraction();
   });
   elements.form.querySelectorAll('input[name="input-mode"]').forEach((radio) => {
-    radio.addEventListener("change", syncInputMode);
+    radio.addEventListener("change", () => {
+      syncInputMode();
+      savePreferences();
+    });
   });
   elements.form.querySelectorAll('input[name="operation"]').forEach((radio) => {
-    radio.addEventListener("change", syncInputMode);
+    radio.addEventListener("change", () => {
+      syncInputMode();
+      savePreferences();
+    });
   });
   elements.form.querySelectorAll('input[name="quality"]').forEach((radio) => {
-    radio.addEventListener("change", syncPrecisionOptions);
+    radio.addEventListener("change", () => {
+      syncPrecisionOptions();
+      savePreferences();
+    });
+  });
+  elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
+    radio.addEventListener("change", savePreferences);
   });
   elements.embeddedSubtitles.addEventListener("change", () => {
     if (elements.embeddedSubtitles.checked) {
@@ -1235,6 +1499,7 @@
       setSelectedSource("auto");
     }
     syncInputMode();
+    savePreferences();
   });
   elements.input.addEventListener("input", () => {
     updatePlatformDetect();
@@ -1281,11 +1546,34 @@
   });
   elements.copyResult.addEventListener("click", copyResult);
   elements.downloadResult.addEventListener("click", downloadResult);
+  elements.retryAccurate.addEventListener("click", retryAccurate);
   elements.cancelJob.addEventListener("click", cancelCurrentJob);
   elements.format.addEventListener("change", () => {
+    savePreferences();
     if (selectedOperation() === "subtitle" && selectedInputMode() === "link" && !state.busy && state.current && state.current.input === elements.input.value.trim()) {
       runExtraction({ force_refresh: false });
     }
+  });
+  elements.lang.addEventListener("change", savePreferences);
+  elements.allowPlatformAi.addEventListener("change", savePreferences);
+  elements.useCookie.addEventListener("change", savePreferences);
+  elements.resultSearch.addEventListener("input", renderOutputContent);
+  elements.toggleWrap.addEventListener("click", () => {
+    state.wrapOutput = !state.wrapOutput;
+    applyWrapPreference();
+    savePreferences();
+  });
+  elements.mobileCompose.addEventListener("click", () => setMobileView("compose"));
+  elements.mobileResult.addEventListener("click", () => setMobileView("result"));
+  elements.healthTrigger.addEventListener("click", () => {
+    setHealthPopover(elements.healthPopover.hidden);
+  });
+  document.addEventListener("click", (event) => {
+    if (elements.healthPopover.hidden) return;
+    if (!event.target.closest(".health-menu")) setHealthPopover(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setHealthPopover(false);
   });
   elements.clearHistory.addEventListener("click", () => {
     state.history = [];
@@ -1296,6 +1584,8 @@
   elements.logoutAccount.addEventListener("click", logoutAccount);
 
   renderHistory();
+  applyWrapPreference();
+  setMobileView("compose");
   updatePlatformDetect();
   syncInputMode();
   loadAccount();

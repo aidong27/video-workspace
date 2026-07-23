@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 import unittest
@@ -25,7 +26,11 @@ class ApiIntegrationTests(unittest.TestCase):
             main.BILI_COOKIE_PATH,
             main.MEDIA_ARTIFACT_DIR,
         )
-        self.original_upload_limits = (main.UPLOAD_MAX_BYTES, main.UPLOAD_STAGING_MAX_BYTES)
+        self.original_upload_limits = (
+            main.UPLOAD_MAX_BYTES,
+            main.PUBLIC_UPLOAD_MAX_BYTES,
+            main.UPLOAD_STAGING_MAX_BYTES,
+        )
         self.original_media_limits = (
             main.MEDIA_MAX_BYTES,
             main.MEDIA_STAGING_MAX_BYTES,
@@ -88,7 +93,11 @@ class ApiIntegrationTests(unittest.TestCase):
             main.UPLOAD_RESERVATIONS.clear()
         with main.MEDIA_RESERVATION_LOCK:
             main.MEDIA_RESERVATIONS.clear()
-        main.UPLOAD_MAX_BYTES, main.UPLOAD_STAGING_MAX_BYTES = self.original_upload_limits
+        (
+            main.UPLOAD_MAX_BYTES,
+            main.PUBLIC_UPLOAD_MAX_BYTES,
+            main.UPLOAD_STAGING_MAX_BYTES,
+        ) = self.original_upload_limits
         (
             main.MEDIA_MAX_BYTES,
             main.MEDIA_STAGING_MAX_BYTES,
@@ -149,6 +158,11 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertTrue(health.json()["asr_single_model_instance"])
         self.assertEqual(health.json()["default_request"]["quality"], "accurate")
         self.assertTrue(health.json()["asr_audio_filter_enabled"])
+        self.assertEqual(health.json()["uploads"]["client_max_bytes"], main.PUBLIC_UPLOAD_MAX_BYTES)
+        self.assertEqual(
+            health.json()["uploads"]["edge_limited"],
+            main.PUBLIC_UPLOAD_MAX_BYTES < main.UPLOAD_MAX_BYTES,
+        )
         encoded = json.dumps(health.json())
         self.assertNotIn(str(self.root), encoded)
         self.assertNotIn("AUTH_DB_PATH", encoded)
@@ -363,6 +377,59 @@ class FrontendRecoveryTests(unittest.TestCase):
 
         self.assertIn("clearActiveJob();", finish_block)
         self.assertIn("finishWithError(data, response.status);", poll_block)
+
+    def test_beta_workspace_exposes_operational_result_controls(self) -> None:
+        page = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        css = (main.STATIC_DIR / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("1.0 Beta", page)
+        for element_id in (
+            "health-trigger",
+            "health-popover",
+            "mobile-tab-compose",
+            "mobile-tab-result",
+            "retry-accurate",
+            "stage-track",
+            "result-search",
+            "toggle-wrap",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn("function renderOutputContent()", script)
+        self.assertIn("function updateStageTrack(", script)
+        self.assertIn("function retryAccurate()", script)
+        self.assertIn("uploads.client_max_bytes", script)
+        self.assertNotIn("linear-gradient", css)
+
+    def test_user_preferences_exclude_links_and_hotwords(self) -> None:
+        script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        preference_block = script.split("function savePreferences()", 1)[1].split(
+            "function loadHistory", 1
+        )[0]
+        active_job_block = script.split("function saveActiveJob()", 1)[1].split(
+            "function restoreForm", 1
+        )[0]
+
+        self.assertNotIn("elements.input", preference_block)
+        self.assertNotIn("hotwords", preference_block)
+        self.assertIn("delete persistedPayload.hotwords", active_job_block)
+
+    def test_auth_page_has_password_visibility_and_caps_lock_feedback(self) -> None:
+        page = (main.STATIC_DIR / "auth.html").read_text(encoding="utf-8")
+        script = (main.STATIC_DIR / "auth.js").read_text(encoding="utf-8")
+        css = (main.STATIC_DIR / "auth.css").read_text(encoding="utf-8")
+
+        self.assertIn("1.0 Beta", page)
+        self.assertIn('id="toggle-password"', page)
+        self.assertIn('id="toggle-confirm-password"', page)
+        self.assertIn('id="caps-warning"', page)
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn('getModifierState("CapsLock")', script)
+        self.assertIn("setupPasswordToggle(", script)
+        self.assertNotIn("linear-gradient", css)
 
 
 if __name__ == "__main__":

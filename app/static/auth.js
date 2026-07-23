@@ -10,10 +10,13 @@
     registerTab: $("register-tab"),
     username: $("username"),
     password: $("password"),
+    togglePassword: $("toggle-password"),
     inviteField: $("invite-field"),
     inviteCode: $("invite-code"),
     confirmField: $("confirm-field"),
     confirmPassword: $("confirm-password"),
+    toggleConfirmPassword: $("toggle-confirm-password"),
+    capsWarning: $("caps-warning"),
     error: $("form-error"),
     submit: $("submit-button"),
     submitLabel: $("submit-label"),
@@ -25,7 +28,7 @@
   let registrationEnabled = true;
 
   function setMode() {
-    document.title = `${isRegister ? "注册" : "登录"} - 视频字幕提取`;
+    document.title = `${isRegister ? "注册" : "登录"} - 字幕工作台`;
     elements.title.textContent = isRegister ? "创建账号" : "登录";
     elements.kicker.textContent = isRegister ? "邀请注册" : "账号访问";
     elements.submitLabel.textContent = isRegister ? "注册并进入" : "登录";
@@ -46,6 +49,22 @@
   function setLoading(loading) {
     elements.submit.disabled = loading || (isRegister && !registrationEnabled);
     elements.submit.classList.toggle("loading", loading);
+  }
+
+  function setupPasswordToggle(button, input, label) {
+    button.addEventListener("click", () => {
+      const visible = input.type === "text";
+      input.type = visible ? "password" : "text";
+      button.classList.toggle("visible", !visible);
+      button.setAttribute("aria-label", `${visible ? "显示" : "隐藏"}${label}`);
+      button.title = `${visible ? "显示" : "隐藏"}${label}`;
+      input.focus();
+    });
+  }
+
+  function updateCapsLock(event) {
+    const enabled = Boolean(event.getModifierState && event.getModifierState("CapsLock"));
+    elements.capsWarning.hidden = !enabled;
   }
 
   function showError(message, field) {
@@ -122,7 +141,8 @@
       const health = await response.json();
       registrationEnabled = Boolean(health.auth && health.auth.registration_enabled);
       elements.serviceStatus.className = "service-status online";
-      elements.serviceStatus.querySelector("strong").textContent = "服务在线";
+      const version = health.service_version ? ` · ${health.service_version}` : "";
+      elements.serviceStatus.querySelector("strong").textContent = `服务在线${version}`;
       if (isRegister && !registrationEnabled) {
         showError("服务器尚未开放邀请注册。");
         elements.submit.disabled = true;
@@ -140,6 +160,12 @@
       if (elements.error.textContent) elements.error.textContent = "";
     });
   });
+  [elements.password, elements.confirmPassword].forEach((input) => {
+    input.addEventListener("keydown", updateCapsLock);
+    input.addEventListener("keyup", updateCapsLock);
+  });
+  setupPasswordToggle(elements.togglePassword, elements.password, "密码");
+  setupPasswordToggle(elements.toggleConfirmPassword, elements.confirmPassword, "确认密码");
 
   setMode();
   loadStatus();

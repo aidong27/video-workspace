@@ -84,7 +84,7 @@ curl -b session.cookie -X POST \
   --data-binary '@meeting.mp4'
 ```
 
-The upload endpoint accepts common video containers up to `UPLOAD_MAX_BYTES`. ASR requires an audio stream; embedded-subtitle extraction also accepts silent video. The web client sends upload hotwords through the percent-encoded `X-ASR-Hotwords` header so they are not placed in the request URL. The original video is temporary; normalized subtitle entries can remain in the result cache for `RESULT_CACHE_TTL_SECONDS`, allowing the same video to be re-uploaded in another output format without repeating recognition.
+The upload endpoint accepts common video containers up to `UPLOAD_MAX_BYTES`. `PUBLIC_UPLOAD_MAX_BYTES` can expose a lower browser-side limit when a reverse proxy or CDN rejects smaller requests (for example, use a value below the edge limit); the API's own hard limit remains `UPLOAD_MAX_BYTES`. ASR requires an audio stream; embedded-subtitle extraction also accepts silent video. The web client sends upload hotwords through the percent-encoded `X-ASR-Hotwords` header so they are not placed in the request URL. The original video is temporary; normalized subtitle entries can remain in the result cache for `RESULT_CACHE_TTL_SECONDS`, allowing the same video to be re-uploaded in another output format without repeating recognition.
 
 Request parameters:
 
@@ -138,6 +138,7 @@ ASR_AUDIO_QUALITY=best
 ASR_AUDIO_FILTER=
 BILI_MAX_DOWNLOAD_BYTES=1000000000
 UPLOAD_MAX_BYTES=536870912
+PUBLIC_UPLOAD_MAX_BYTES=536870912
 UPLOAD_STAGING_MAX_BYTES=2147483648
 MEDIA_MAX_BYTES=1000000000
 MEDIA_STAGING_MAX_BYTES=8000000000

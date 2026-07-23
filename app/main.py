@@ -103,7 +103,7 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2026-07-21-asr-quality-2")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.1")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -168,6 +168,10 @@ except ValueError:
     ASR_RETRY_LOW_CONFIDENCE_RATIO = 0.65
 BILI_MAX_DOWNLOAD_BYTES = max(10_000_000, int(os.getenv("BILI_MAX_DOWNLOAD_BYTES", "1000000000")))
 UPLOAD_MAX_BYTES = max(1_000_000, int(os.getenv("UPLOAD_MAX_BYTES", "536870912")))
+PUBLIC_UPLOAD_MAX_BYTES = min(
+    UPLOAD_MAX_BYTES,
+    max(1_000_000, int(os.getenv("PUBLIC_UPLOAD_MAX_BYTES", str(UPLOAD_MAX_BYTES)))),
+)
 UPLOAD_STAGING_MAX_BYTES = max(
     UPLOAD_MAX_BYTES,
     int(os.getenv("UPLOAD_STAGING_MAX_BYTES", "2147483648")),
@@ -5738,6 +5742,8 @@ def health() -> dict[str, Any]:
         "uploads": {
             "enabled": env_bool("ASR_ENABLED", True),
             "max_bytes": UPLOAD_MAX_BYTES,
+            "client_max_bytes": PUBLIC_UPLOAD_MAX_BYTES,
+            "edge_limited": PUBLIC_UPLOAD_MAX_BYTES < UPLOAD_MAX_BYTES,
             "staging_max_bytes": UPLOAD_STAGING_MAX_BYTES,
             "staging_reserved_bytes": upload_staging_bytes(),
             "allowed_extensions": sorted(UPLOAD_ALLOWED_EXTENSIONS),
