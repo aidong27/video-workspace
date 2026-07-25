@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import Path
+import secrets
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -23,6 +25,7 @@ from app.network import ensure_public_http_url, validate_public_request
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"}
 ACTIVE_STATUSES = {"PENDING", "RUNNING", "QUEUED"}
 LOGGER = logging.getLogger(__name__)
+DASHSCOPE_UPLOAD_POLICY_URL = "https://dashscope.aliyuncs.com/api/v1/uploads"
 
 
 def validate_dashscope_base_url(value: str) -> str:
@@ -153,6 +156,216 @@ def normalize_transcript_payload(
             "transcript_count": len(transcript_items),
         },
     )
+
+
+class AliyunTemporaryFileUploader:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        timeout_seconds: float = 300,
+        max_retries: int = 2,
+        client: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not api_key.strip():
+            raise ValueError("DASHSCOPE_API_KEY is required")
+        timeout = httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds))
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        self.max_retries = max(0, max_retries)
+        self.sleep = sleep
+        self._owns_client = client is None
+        self.client = client or httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+        )
+
+    def close(self) -> None:
+        if self._owns_client:
+            self.client.close()
+
+    @staticmethod
+    def _response_error(response: httpx.Response) -> AsrProviderError:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+        code = str(payload.get("code") or payload.get("error_code") or "")
+        marker = f"{code} {payload.get('message') or ''}".lower()
+        if response.status_code in {401, 403}:
+            return AsrProviderError(
+                "asr_provider_auth_failed",
+                "云端临时文件凭证无效或权限不足。",
+                retryable=False,
+                status_code=503,
+            )
+        if response.status_code == 429 or "throttl" in marker:
+            return AsrProviderError(
+                "asr_rate_limited",
+                "云端临时文件上传请求过于频繁，请稍后重试。",
+                retryable=True,
+                status_code=429,
+            )
+        retryable = response.status_code >= 500
+        return AsrProviderError(
+            "asr_provider_unavailable" if retryable else "asr_temp_upload_failed",
+            "云端临时文件服务暂时不可用。"
+            if retryable
+            else "云端临时音频上传失败。",
+            retryable=retryable,
+            status_code=503 if retryable else 502,
+        )
+
+    def _get_policy(self, model: str) -> dict[str, Any]:
+        last_error: AsrProviderError | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.get(
+                    DASHSCOPE_UPLOAD_POLICY_URL,
+                    params={"action": "getPolicy", "model": model},
+                    headers=self._headers,
+                )
+            except httpx.RequestError as exc:
+                last_error = AsrProviderError(
+                    "asr_provider_unavailable",
+                    "无法连接云端临时文件服务。",
+                    retryable=True,
+                    status_code=503,
+                )
+                if attempt >= self.max_retries:
+                    raise last_error from exc
+            else:
+                if 200 <= response.status_code < 300:
+                    try:
+                        payload = response.json()
+                    except ValueError as exc:
+                        raise AsrProviderError(
+                            "asr_provider_response_invalid",
+                            "云端临时文件服务返回了无法解析的数据。",
+                            retryable=True,
+                        ) from exc
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if isinstance(data, dict):
+                        return data
+                    raise AsrProviderError(
+                        "asr_provider_response_invalid",
+                        "云端临时文件服务返回了异常数据结构。",
+                        retryable=True,
+                    )
+                last_error = self._response_error(response)
+                if not last_error.retryable or attempt >= self.max_retries:
+                    raise last_error
+            self.sleep(min(4.0, 0.5 * (2**attempt)))
+        raise last_error or AsrProviderError(
+            "asr_provider_unavailable",
+            "云端临时文件服务暂时不可用。",
+            retryable=True,
+        )
+
+    def upload(self, path: Path, *, model: str) -> str:
+        try:
+            if path.is_symlink():
+                raise OSError("symbolic links are not accepted")
+            resolved = path.resolve(strict=True)
+            is_file = resolved.is_file()
+            file_size = resolved.stat().st_size
+        except OSError as exc:
+            raise AsrProviderError(
+                "asr_temp_upload_failed",
+                "待上传的临时音频不可用。",
+                retryable=False,
+            ) from exc
+        if not is_file:
+            raise AsrProviderError(
+                "asr_temp_upload_failed",
+                "待上传的临时音频不可用。",
+                retryable=False,
+            )
+        policy = self._get_policy(model)
+        required = {
+            "policy",
+            "signature",
+            "upload_dir",
+            "upload_host",
+            "oss_access_key_id",
+            "x_oss_object_acl",
+            "x_oss_forbid_overwrite",
+        }
+        if any(not str(policy.get(key) or "").strip() for key in required):
+            raise AsrProviderError(
+                "asr_provider_response_invalid",
+                "云端临时文件凭证不完整。",
+                retryable=True,
+            )
+        upload_host = str(policy["upload_host"]).strip()
+        parsed_host = urlparse(upload_host)
+        if (
+            parsed_host.scheme != "https"
+            or not (parsed_host.hostname or "").endswith(".oss-cn-beijing.aliyuncs.com")
+            or parsed_host.username is not None
+            or parsed_host.password is not None
+            or parsed_host.query
+            or parsed_host.fragment
+            or parsed_host.path not in {"", "/"}
+        ):
+            raise AsrProviderError(
+                "asr_provider_response_invalid",
+                "云端临时文件上传地址无效。",
+                retryable=False,
+            )
+        upload_dir = str(policy["upload_dir"]).strip().strip("/")
+        if (
+            not upload_dir.startswith("dashscope-instant/")
+            or ".." in upload_dir.split("/")
+            or "\\" in upload_dir
+        ):
+            raise AsrProviderError(
+                "asr_provider_response_invalid",
+                "云端临时文件路径无效。",
+                retryable=False,
+            )
+        max_size_mb = _safe_float(policy.get("max_file_size_mb"))
+        if max_size_mb is not None and file_size > max_size_mb * 1024 * 1024:
+            raise AsrProviderError(
+                "media_too_large",
+                "音频文件超过云端临时上传限制。",
+                retryable=False,
+                status_code=413,
+            )
+        object_key = f"{upload_dir}/{secrets.token_hex(24)}.mp3"
+        form = {
+            "OSSAccessKeyId": str(policy["oss_access_key_id"]),
+            "Signature": str(policy["signature"]),
+            "policy": str(policy["policy"]),
+            "x-oss-object-acl": str(policy["x_oss_object_acl"]),
+            "x-oss-forbid-overwrite": str(policy["x_oss_forbid_overwrite"]),
+            "key": object_key,
+            "success_action_status": "200",
+        }
+        try:
+            with resolved.open("rb") as source:
+                response = self.client.post(
+                    upload_host,
+                    data=form,
+                    files={"file": ("audio.mp3", source, "audio/mpeg")},
+                )
+        except (httpx.RequestError, OSError) as exc:
+            raise AsrProviderError(
+                "asr_provider_unavailable"
+                if isinstance(exc, httpx.RequestError)
+                else "asr_temp_upload_failed",
+                "云端临时音频上传连接失败。"
+                if isinstance(exc, httpx.RequestError)
+                else "待上传的临时音频不可用。",
+                retryable=isinstance(exc, httpx.RequestError),
+                status_code=503 if isinstance(exc, httpx.RequestError) else 502,
+            ) from exc
+        if not 200 <= response.status_code < 300:
+            raise self._response_error(response)
+        return f"oss://{object_key}"
 
 
 class _AliyunAsyncProvider(AsrProvider):
@@ -324,13 +537,22 @@ class _AliyunAsyncProvider(AsrProvider):
             task_id=status.task_id,
         )
 
-    def _request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        resolve_oss: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         last_error: AsrProviderError | None = None
         normalized_method = method.upper()
         retry_count = self.max_retries if normalized_method in {"GET", "HEAD"} else 0
         request_headers = dict(self._headers)
         if normalized_method == "POST":
             request_headers["X-DashScope-Async"] = "enable"
+        if resolve_oss:
+            request_headers["X-DashScope-OssResourceResolve"] = "enable"
         for attempt in range(retry_count + 1):
             try:
                 response = self.client.request(
@@ -395,7 +617,15 @@ class _AliyunAsyncProvider(AsrProvider):
             )
         transcripts: list[Transcript] = []
         for result_url in status.result_urls:
-            self.result_url_validator(result_url)
+            try:
+                self.result_url_validator(result_url)
+            except Exception as exc:
+                raise AsrProviderError(
+                    "asr_provider_response_invalid",
+                    "云端语音识别返回了不安全的结果地址。",
+                    retryable=False,
+                    task_id=status.task_id,
+                ) from exc
             try:
                 with self.result_client.stream("GET", result_url) as response:
                     response.raise_for_status()
@@ -478,6 +708,7 @@ class AliyunQwenFileTransProvider(_AliyunAsyncProvider):
         payload = self._request_json(
             "POST",
             "/services/audio/asr/transcription",
+            resolve_oss=file_url.startswith("oss://"),
             json={
                 "model": self.model,
                 "input": {"file_url": file_url},
@@ -500,6 +731,8 @@ class AliyunQwenFileTransProvider(_AliyunAsyncProvider):
         output = output if isinstance(output, dict) else {}
         status = str(output.get("task_status") or "").upper()
         usage = output.get("usage")
+        if not isinstance(usage, dict):
+            usage = payload.get("usage")
         usage = usage if isinstance(usage, dict) else {}
         result_url = output.get("result", {}).get("transcription_url") if isinstance(output.get("result"), dict) else None
         error_code = output.get("code") or payload.get("code")
@@ -536,6 +769,7 @@ class AliyunParaformerProvider(_AliyunAsyncProvider):
         payload = self._request_json(
             "POST",
             "/services/audio/asr/transcription",
+            resolve_oss=file_url.startswith("oss://"),
             json={
                 "model": self.model,
                 "input": {"file_urls": [file_url]},
@@ -558,6 +792,8 @@ class AliyunParaformerProvider(_AliyunAsyncProvider):
         output = output if isinstance(output, dict) else {}
         status = str(output.get("task_status") or "").upper()
         usage = output.get("usage")
+        if not isinstance(usage, dict):
+            usage = payload.get("usage")
         usage = usage if isinstance(usage, dict) else {}
         results = output.get("results")
         results = results if isinstance(results, list) else []

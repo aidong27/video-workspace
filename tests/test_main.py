@@ -11,7 +11,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app import main
-from app.asr.base import Transcript, TranscriptSegment
+from app.asr.base import AsrProviderError, Transcript, TranscriptSegment
 from app.asr.mock import MockAsrProvider
 from app.asr.signing import SignedAudioStore
 from app.asr.usage import UsageLedger
@@ -70,6 +70,48 @@ class CloudAsrPipelineTests(unittest.TestCase):
             finally:
                 main.CLOUD_ASR_INIT_ERROR = None
                 main.CLOUD_SIGNED_AUDIO_STORE = None
+                main.CLOUD_TEMP_FILE_UPLOADER = None
+                main.CLOUD_USAGE_LEDGER = None
+
+    def test_cloud_configuration_supports_aliyun_temp_without_public_audio_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "CLOUD_ASR_ENABLED": "true",
+                "ASR_ALLOW_PAID": "false",
+                "DASHSCOPE_API_KEY": "test-key",
+                "DASHSCOPE_BASE_URL": "https://ws-test.cn-beijing.maas.aliyuncs.com/api/v1",
+                "DASHSCOPE_WORKSPACE_ID": "ws-test",
+                "AUDIO_SIGNING_SECRET": "",
+                "PUBLIC_BASE_URL": "",
+            },
+        ), patch.object(
+            main, "CLOUD_ASR_AUDIO_DELIVERY", "aliyun_temp"
+        ), patch.object(
+            main, "CLOUD_ASR_MONTHLY_FREE_SECONDS", 1000
+        ), patch.object(
+            main, "CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS", 900
+        ), patch.object(
+            main, "CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS", 900
+        ), patch.object(
+            main, "CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS", 100
+        ), patch.object(
+            main, "CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS", 60
+        ), patch.object(
+            main, "CLOUD_ASR_USAGE_DB_PATH", Path(directory) / "usage.db"
+        ):
+            try:
+                main.initialize_cloud_services()
+
+                self.assertIsNone(main.CLOUD_ASR_INIT_ERROR)
+                self.assertIsNone(main.CLOUD_SIGNED_AUDIO_STORE)
+                self.assertIsNotNone(main.CLOUD_TEMP_FILE_UPLOADER)
+                self.assertIsNotNone(main.CLOUD_USAGE_LEDGER)
+                self.assertTrue(main.cloud_audio_delivery_ready())
+            finally:
+                main.close_cloud_providers()
+                main.CLOUD_ASR_INIT_ERROR = None
+                main.CLOUD_SIGNED_AUDIO_STORE = None
                 main.CLOUD_USAGE_LEDGER = None
 
     def test_cloud_pipeline_records_usage_and_revokes_signed_audio(self) -> None:
@@ -101,7 +143,9 @@ class CloudAsrPipelineTests(unittest.TestCase):
                     ],
                 )
             )
-            with patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", store), patch.object(
+            with patch.object(main, "CLOUD_ASR_AUDIO_DELIVERY", "signed_url"), patch.object(
+                main, "CLOUD_SIGNED_AUDIO_STORE", store
+            ), patch.object(
                 main, "CLOUD_USAGE_LEDGER", ledger
             ), patch.object(main, "ensure_cloud_asr_ready"), patch.object(
                 main,
@@ -130,6 +174,8 @@ class CloudAsrPipelineTests(unittest.TestCase):
             self.assertEqual([entry.text for entry in entries], ["测试字幕"])
             self.assertEqual(metadata["provider_seconds"], 5.5)
             self.assertEqual(metadata["asr_mode"], "high_accuracy")
+            self.assertEqual(metadata["audio_delivery"], "signed_url")
+            self.assertEqual(metadata["provider_temporary_retention_seconds"], 0)
             self.assertGreater(metadata["estimated_cost_cny"], 0)
             self.assertEqual(store.records, {})
             self.assertEqual(ledger.stats()["daily_seconds"], 5.5)
@@ -153,7 +199,9 @@ class CloudAsrPipelineTests(unittest.TestCase):
             provider = MockAsrProvider(
                 Transcript("aliyun", "qwen", "zh", 5000, [])
             )
-            with patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", store), patch.object(
+            with patch.object(main, "CLOUD_ASR_AUDIO_DELIVERY", "signed_url"), patch.object(
+                main, "CLOUD_SIGNED_AUDIO_STORE", store
+            ), patch.object(
                 main, "CLOUD_USAGE_LEDGER", ledger
             ), patch.object(main, "ensure_cloud_asr_ready"), patch.object(
                 main,
@@ -177,6 +225,111 @@ class CloudAsrPipelineTests(unittest.TestCase):
             self.assertEqual(raised.exception.reason, "asr_daily_limit_reached")
             self.assertEqual(provider.submissions, [])
             self.assertEqual(store.records, {})
+
+    def test_cloud_pipeline_uses_aliyun_temporary_upload_and_releases_failures(self) -> None:
+        class TemporaryUploader:
+            def __init__(self, failure: AsrProviderError | None = None) -> None:
+                self.failure = failure
+                self.calls: list[tuple[Path, str]] = []
+
+            def upload(self, path: Path, *, model: str) -> str:
+                self.calls.append((path, model))
+                if self.failure is not None:
+                    raise self.failure
+                return "oss://dashscope-instant/test/random.mp3"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            ledger = UsageLedger(
+                root / "usage.db",
+                daily_limit_seconds=100,
+                monthly_limit_seconds=1000,
+                user_daily_limit_seconds=60,
+            )
+            provider = MockAsrProvider(
+                Transcript(
+                    provider="aliyun",
+                    model="qwen3-asr-flash-filetrans",
+                    language="zh",
+                    duration_ms=5000,
+                    provider_seconds=5,
+                    segments=[TranscriptSegment(0, 1200, "临时上传测试")],
+                )
+            )
+            uploader = TemporaryUploader()
+            preparation = (
+                audio,
+                {
+                    "duration": 5,
+                    "size": 5,
+                    "format_name": "mp3",
+                    "codec_name": "mp3",
+                    "channels": 1,
+                    "sample_rate": 16000,
+                },
+            )
+            with patch.object(main, "CLOUD_ASR_AUDIO_DELIVERY", "aliyun_temp"), patch.object(
+                main, "CLOUD_TEMP_FILE_UPLOADER", uploader
+            ), patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", None), patch.object(
+                main, "CLOUD_USAGE_LEDGER", ledger
+            ), patch.object(main, "ensure_cloud_asr_ready"), patch.object(
+                main, "prepare_audio_for_cloud", return_value=preparation
+            ), patch.object(
+                main, "cloud_provider_for_mode", return_value=provider
+            ):
+                entries, metadata = main.transcribe_media_with_cloud(
+                    audio,
+                    root,
+                    language="zh",
+                    mode="high_accuracy",
+                )
+
+            self.assertEqual(entries[0].text, "临时上传测试")
+            self.assertEqual(
+                provider.submissions[0]["file_url"],
+                "oss://dashscope-instant/test/random.mp3",
+            )
+            self.assertEqual(uploader.calls[0][1], main.CLOUD_ASR_DEFAULT_MODEL)
+            self.assertEqual(metadata["audio_delivery"], "aliyun_temp")
+            self.assertEqual(
+                metadata["provider_temporary_retention_seconds"],
+                48 * 60 * 60,
+            )
+
+            failed_uploader = TemporaryUploader(
+                AsrProviderError(
+                    "asr_temp_upload_failed",
+                    "upload failed",
+                    retryable=False,
+                )
+            )
+            failure_ledger = UsageLedger(
+                root / "failed-usage.db",
+                daily_limit_seconds=100,
+                monthly_limit_seconds=1000,
+                user_daily_limit_seconds=60,
+            )
+            with patch.object(main, "CLOUD_ASR_AUDIO_DELIVERY", "aliyun_temp"), patch.object(
+                main, "CLOUD_TEMP_FILE_UPLOADER", failed_uploader
+            ), patch.object(main, "CLOUD_USAGE_LEDGER", failure_ledger), patch.object(
+                main, "ensure_cloud_asr_ready"
+            ), patch.object(
+                main, "prepare_audio_for_cloud", return_value=preparation
+            ), patch.object(
+                main, "cloud_provider_for_mode", return_value=provider
+            ), self.assertRaises(main.ExtractionFailure) as raised:
+                main.transcribe_media_with_cloud(
+                    audio,
+                    root,
+                    language="zh",
+                    mode="high_accuracy",
+                )
+
+            self.assertEqual(raised.exception.reason, "asr_temp_upload_failed")
+            self.assertEqual(failure_ledger.stats()["reserved_seconds"], 0)
+            self.assertEqual(failure_ledger.stats()["daily_seconds"], 0)
 
     def test_upload_requests_use_the_same_quality_and_language_defaults(self) -> None:
         request = main.UploadJobRequest(

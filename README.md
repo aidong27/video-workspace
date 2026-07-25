@@ -127,6 +127,8 @@ ASR_ECONOMY_FALLBACK_ENABLED=false
 CLOUD_ASR_TIMEOUT_SECONDS=1800
 CLOUD_ASR_HTTP_TIMEOUT_SECONDS=30
 CLOUD_ASR_MAX_FILE_BYTES=268435456
+CLOUD_ASR_AUDIO_DELIVERY=signed_url
+CLOUD_ASR_UPLOAD_TIMEOUT_SECONDS=300
 ASR_USAGE_DB_PATH=./var/cache/cloud-usage.db
 AUDIO_SIGNING_SECRET=RANDOM_SECRET_AT_LEAST_32_BYTES
 PUBLIC_BASE_URL=https://caption.example.com
@@ -163,7 +165,9 @@ NUMEXPR_NUM_THREADS=1
 
 `ASR_ALLOW_PAID=false` is the required default. The server refuses to enable cloud ASR unless the free allowance and a lifetime hard limit are explicitly configured. It reserves predicted audio seconds in SQLite before submitting a provider task, enforces lifetime, global daily/monthly, and per-user daily limits atomically, and records provider-reported seconds after completion. Provider submission `POST` requests are never retried automatically, avoiding duplicate billable jobs when a response is lost. Prices are configurable estimates only; the Aliyun bill remains authoritative.
 
-Cloud input is converted to a bounded mono MP3 only after media validation. A random HMAC-signed HTTPS URL exposes that file to the provider for at most `TEMP_AUDIO_TTL_SECONDS`; the token is revoked immediately when the task ends and the task directory is removed.
+Cloud input is converted to a bounded mono MP3 only after media validation. `CLOUD_ASR_AUDIO_DELIVERY=signed_url` exposes it through a random HMAC-signed HTTPS URL for at most `TEMP_AUDIO_TTL_SECONDS`; the token is revoked immediately when the task ends and the task directory is removed.
+
+`CLOUD_ASR_AUDIO_DELIVERY=aliyun_temp` uses Bailian's official temporary-file upload and submits the returned `oss://` URL. This is useful when an edge security policy blocks Bailian's Java downloader and is appropriate for the conservative, single-concurrency beta deployment. The local task file is still deleted immediately, while the provider-side temporary copy expires automatically within 48 hours. For higher-volume production, prefer a private OSS bucket or an explicit edge exception after a separate cost and security review.
 
 `ASR_AUDIO_FILTER` is opt-in because filtering can damage quiet consonants. A conservative A/B candidate is `highpass=f=70,lowpass=f=7800,loudnorm=I=-20:TP=-2:LRA=11`; compare it against an empty filter on real source audio before enabling it in production.
 

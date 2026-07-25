@@ -175,6 +175,14 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(health.json()["default_request"]["asr_mode"], "auto")
         self.assertTrue(health.json()["default_request"]["allow_platform_ai"])
         self.assertTrue(health.json()["asr_audio_filter_enabled"])
+        self.assertIn(
+            health.json()["cloud_asr"]["audio_delivery"],
+            {"signed_url", "aliyun_temp"},
+        )
+        self.assertIn(
+            "provider_temporary_retention_seconds",
+            health.json()["cloud_asr"],
+        )
         self.assertEqual(health.json()["uploads"]["client_max_bytes"], main.PUBLIC_UPLOAD_MAX_BYTES)
         self.assertEqual(
             health.json()["uploads"]["edge_limited"],

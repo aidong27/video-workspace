@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
 import httpx
@@ -6,6 +8,7 @@ import httpx
 from app.asr.aliyun import (
     AliyunParaformerProvider,
     AliyunQwenFileTransProvider,
+    AliyunTemporaryFileUploader,
     normalize_transcript_payload,
     validate_dashscope_base_url,
 )
@@ -43,8 +46,8 @@ class AliyunProviderTests(unittest.TestCase):
                         "task_id": "task-1",
                         "task_status": "SUCCEEDED",
                         "result": {"transcription_url": "https://result.example.test/qwen.json"},
-                        "usage": {"seconds": 12.5},
                     },
+                    "usage": {"seconds": 12.5},
                 },
             )
 
@@ -94,6 +97,7 @@ class AliyunProviderTests(unittest.TestCase):
         body = json.loads(requests[0].content)
         self.assertIn("Bearer sk-test", requests[0].headers["authorization"])
         self.assertEqual(requests[0].headers["x-dashscope-async"], "enable")
+        self.assertNotIn("x-dashscope-ossresourceresolve", requests[0].headers)
         self.assertNotIn("x-dashscope-async", requests[1].headers)
         self.assertEqual(body["input"], {"file_url": body["input"]["file_url"]})
         self.assertEqual(body["parameters"]["language"], "zh")
@@ -115,14 +119,14 @@ class AliyunProviderTests(unittest.TestCase):
                 {
                     "output": {
                         "task_status": "SUCCEEDED",
-                        "usage": {"duration": 8},
                         "results": [
                             {
                                 "subtask_status": "SUCCEEDED",
                                 "transcription_url": "https://result.example.test/para.json",
                             }
                         ],
-                    }
+                    },
+                    "usage": {"duration": 8},
                 },
             )
 
@@ -148,10 +152,21 @@ class AliyunProviderTests(unittest.TestCase):
             sleep=lambda _: None,
         )
 
-        transcript = provider.transcribe("https://caption.example.test/audio", language="zh", sleep=lambda _: None)
+        transcript = provider.transcribe(
+            "oss://dashscope-instant/test/audio.mp3",
+            language="zh",
+            sleep=lambda _: None,
+        )
 
         body = json.loads(requests[0].content)
-        self.assertEqual(body["input"], {"file_urls": ["https://caption.example.test/audio"]})
+        self.assertEqual(
+            body["input"],
+            {"file_urls": ["oss://dashscope-instant/test/audio.mp3"]},
+        )
+        self.assertEqual(
+            requests[0].headers["x-dashscope-ossresourceresolve"],
+            "enable",
+        )
         self.assertEqual(body["parameters"]["language_hints"], ["zh", "en"])
         self.assertNotIn("enable_words", body["parameters"])
         self.assertEqual(transcript.provider_seconds, 8)
@@ -264,6 +279,32 @@ class AliyunProviderTests(unittest.TestCase):
             provider.download_result(status)
         self.assertEqual(raised.exception.code, "asr_provider_response_invalid")
 
+        unsafe_status = ProviderStatus(
+            "SUCCEEDED",
+            "unsafe-task",
+            result_urls=("https://unsafe.example.test/result.json",),
+        )
+
+        def reject_result_url(_: str) -> None:
+            raise ValueError("unsafe")
+
+        unsafe_provider = AliyunQwenFileTransProvider(
+            api_key="sk-test",
+            base_url=BASE_URL,
+            model="qwen3-asr-flash-filetrans",
+            client=httpx.Client(
+                transport=httpx.MockTransport(lambda request: json_response(request, {}))
+            ),
+            result_client=httpx.Client(
+                transport=httpx.MockTransport(lambda request: json_response(request, {}))
+            ),
+            result_url_validator=reject_result_url,
+        )
+        with self.assertRaises(AsrProviderError) as unsafe:
+            unsafe_provider.download_result(unsafe_status)
+        self.assertEqual(unsafe.exception.code, "asr_provider_response_invalid")
+        self.assertEqual(unsafe.exception.task_id, "unsafe-task")
+
     def test_quota_and_audio_fetch_task_failures_are_normalized(self) -> None:
         provider = AliyunQwenFileTransProvider(
             api_key="test-key",
@@ -295,6 +336,88 @@ class AliyunProviderTests(unittest.TestCase):
         )
         self.assertEqual(fetch.code, "asr_audio_fetch_failed")
         self.assertTrue(fetch.retryable)
+
+    def test_temporary_uploader_streams_random_named_audio_to_trusted_oss(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.host == "dashscope.aliyuncs.com":
+                self.assertEqual(request.url.params["action"], "getPolicy")
+                self.assertEqual(request.url.params["model"], "qwen3-asr-flash-filetrans")
+                return json_response(
+                    request,
+                    {
+                        "data": {
+                            "policy": "policy-value",
+                            "signature": "signature-value",
+                            "upload_dir": "dashscope-instant/account/session",
+                            "upload_host": (
+                                "https://dashscope-file-upload."
+                                "oss-cn-beijing.aliyuncs.com"
+                            ),
+                            "oss_access_key_id": "temporary-access-key",
+                            "x_oss_object_acl": "private",
+                            "x_oss_forbid_overwrite": "true",
+                            "max_file_size_mb": 10,
+                        }
+                    },
+                )
+            body = request.read()
+            self.assertNotIn("authorization", request.headers)
+            self.assertIn(b"audio-test-bytes", body)
+            self.assertNotIn(b"user-supplied-name.mp3", body)
+            self.assertIn(b"dashscope-instant/account/session/", body)
+            return httpx.Response(200, request=request)
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "user-supplied-name.mp3"
+            audio.write_bytes(b"audio-test-bytes")
+            uploader = AliyunTemporaryFileUploader(
+                api_key="sk-test",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+                sleep=lambda _: None,
+            )
+            file_url = uploader.upload(
+                audio,
+                model="qwen3-asr-flash-filetrans",
+            )
+
+        self.assertRegex(
+            file_url,
+            r"^oss://dashscope-instant/account/session/[0-9a-f]{48}\.mp3$",
+        )
+        self.assertEqual(len(requests), 2)
+
+    def test_temporary_uploader_rejects_untrusted_upload_host(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return json_response(
+                request,
+                {
+                    "data": {
+                        "policy": "policy-value",
+                        "signature": "signature-value",
+                        "upload_dir": "dashscope-instant/account/session",
+                        "upload_host": "https://evil.example.test",
+                        "oss_access_key_id": "temporary-access-key",
+                        "x_oss_object_acl": "private",
+                        "x_oss_forbid_overwrite": "true",
+                    }
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "audio.mp3"
+            audio.write_bytes(b"audio")
+            uploader = AliyunTemporaryFileUploader(
+                api_key="sk-test",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+                sleep=lambda _: None,
+            )
+            with self.assertRaises(AsrProviderError) as raised:
+                uploader.upload(audio, model="qwen3-asr-flash-filetrans")
+
+        self.assertEqual(raised.exception.code, "asr_provider_response_invalid")
 
 
 if __name__ == "__main__":

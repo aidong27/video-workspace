@@ -48,6 +48,7 @@ from yt_dlp import YoutubeDL
 from app.asr.aliyun import (
     AliyunParaformerProvider,
     AliyunQwenFileTransProvider,
+    AliyunTemporaryFileUploader,
 )
 from app.asr.base import AsrProvider, AsrProviderError, Transcript
 from app.asr.postprocess import normalize_segments
@@ -264,6 +265,15 @@ CLOUD_ASR_MAX_FILE_BYTES = max(
     1_000_000,
     int(os.getenv("CLOUD_ASR_MAX_FILE_BYTES", "268435456")),
 )
+CLOUD_ASR_AUDIO_DELIVERY = (
+    os.getenv("CLOUD_ASR_AUDIO_DELIVERY", "signed_url").strip().lower()
+    or "signed_url"
+)
+CLOUD_ASR_UPLOAD_TIMEOUT_SECONDS = max(
+    30,
+    int(os.getenv("CLOUD_ASR_UPLOAD_TIMEOUT_SECONDS", "300")),
+)
+CLOUD_TEMP_AUDIO_RETENTION_SECONDS = 48 * 60 * 60
 CLOUD_ASR_USAGE_DB_PATH = Path(
     os.getenv("ASR_USAGE_DB_PATH", str(ASR_CACHE_DIR / "cloud-usage.db"))
 )
@@ -305,9 +315,9 @@ try:
     )
 except ValueError:
     CLOUD_ASR_PARAFORMER_PRICE_PER_SECOND = 0.00008
-RESULT_CACHE_VERSION = 9
+RESULT_CACHE_VERSION = 10
 ASR_PIPELINE_VERSION = 2
-CLOUD_ASR_PIPELINE_VERSION = 1
+CLOUD_ASR_PIPELINE_VERSION = 2
 ASR_PROMPT_VERSION = 1
 ASR_VAD_PROFILE_VERSION = 1
 ASR_AUDIO_FILTER_VERSION = 1
@@ -332,6 +342,7 @@ _ASR_MODEL_LOCK = Lock()
 CLOUD_PROVIDER_LOCK = Lock()
 CLOUD_PROVIDER_INSTANCES: dict[str, AsrProvider] = {}
 CLOUD_SIGNED_AUDIO_STORE: SignedAudioStore | None = None
+CLOUD_TEMP_FILE_UPLOADER: AliyunTemporaryFileUploader | None = None
 CLOUD_USAGE_LEDGER: UsageLedger | None = None
 CLOUD_ASR_INIT_ERROR: str | None = None
 PROGRESS_CONTEXT = local()
@@ -636,9 +647,12 @@ def cloud_model_price(model: str) -> float:
 
 
 def close_cloud_providers() -> None:
+    global CLOUD_TEMP_FILE_UPLOADER
     with CLOUD_PROVIDER_LOCK:
         providers = list(CLOUD_PROVIDER_INSTANCES.values())
         CLOUD_PROVIDER_INSTANCES.clear()
+        uploader = CLOUD_TEMP_FILE_UPLOADER
+        CLOUD_TEMP_FILE_UPLOADER = None
     for provider in providers:
         close = getattr(provider, "close", None)
         if callable(close):
@@ -646,14 +660,29 @@ def close_cloud_providers() -> None:
                 close()
             except Exception:
                 pass
+    if uploader is not None:
+        try:
+            uploader.close()
+        except Exception:
+            pass
+
+
+def cloud_audio_delivery_ready() -> bool:
+    if CLOUD_ASR_AUDIO_DELIVERY == "signed_url":
+        return CLOUD_SIGNED_AUDIO_STORE is not None
+    if CLOUD_ASR_AUDIO_DELIVERY == "aliyun_temp":
+        return CLOUD_TEMP_FILE_UPLOADER is not None
+    return False
 
 
 def initialize_cloud_services() -> None:
-    global CLOUD_ASR_INIT_ERROR, CLOUD_SIGNED_AUDIO_STORE, CLOUD_USAGE_LEDGER
+    global CLOUD_ASR_INIT_ERROR, CLOUD_SIGNED_AUDIO_STORE
+    global CLOUD_TEMP_FILE_UPLOADER, CLOUD_USAGE_LEDGER
+    close_cloud_providers()
     CLOUD_ASR_INIT_ERROR = None
     CLOUD_SIGNED_AUDIO_STORE = None
+    CLOUD_TEMP_FILE_UPLOADER = None
     CLOUD_USAGE_LEDGER = None
-    close_cloud_providers()
     if not cloud_asr_enabled():
         return
     try:
@@ -679,12 +708,20 @@ def initialize_cloud_services() -> None:
             raise ValueError("ASR_DAILY_HARD_LIMIT_SECONDS must be configured")
         if not CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS:
             raise ValueError("ASR_USER_DAILY_HARD_LIMIT_SECONDS must be configured")
-        CLOUD_SIGNED_AUDIO_STORE = SignedAudioStore(
-            root=ASR_TMP_DIR,
-            public_base_url=public_base_url,
-            secret=signing_secret,
-            default_ttl_seconds=CLOUD_AUDIO_TTL_SECONDS,
-        )
+        if CLOUD_ASR_AUDIO_DELIVERY == "signed_url":
+            CLOUD_SIGNED_AUDIO_STORE = SignedAudioStore(
+                root=ASR_TMP_DIR,
+                public_base_url=public_base_url,
+                secret=signing_secret,
+                default_ttl_seconds=CLOUD_AUDIO_TTL_SECONDS,
+            )
+        elif CLOUD_ASR_AUDIO_DELIVERY == "aliyun_temp":
+            CLOUD_TEMP_FILE_UPLOADER = AliyunTemporaryFileUploader(
+                api_key=api_key,
+                timeout_seconds=CLOUD_ASR_UPLOAD_TIMEOUT_SECONDS,
+            )
+        else:
+            raise ValueError("CLOUD_ASR_AUDIO_DELIVERY is invalid")
         CLOUD_USAGE_LEDGER = UsageLedger(
             CLOUD_ASR_USAGE_DB_PATH,
             daily_limit_seconds=CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS,
@@ -695,6 +732,9 @@ def initialize_cloud_services() -> None:
         )
         CLOUD_USAGE_LEDGER.initialize()
     except Exception as exc:
+        close_cloud_providers()
+        CLOUD_SIGNED_AUDIO_STORE = None
+        CLOUD_USAGE_LEDGER = None
         CLOUD_ASR_INIT_ERROR = type(exc).__name__
         LOGGER.error("cloud ASR initialization failed error_type=%s", type(exc).__name__)
 
@@ -707,7 +747,11 @@ def ensure_cloud_asr_ready() -> None:
             "asr_disabled",
             retryable=False,
         )
-    if CLOUD_ASR_INIT_ERROR or CLOUD_SIGNED_AUDIO_STORE is None or CLOUD_USAGE_LEDGER is None:
+    if (
+        CLOUD_ASR_INIT_ERROR
+        or not cloud_audio_delivery_ready()
+        or CLOUD_USAGE_LEDGER is None
+    ):
         raise ExtractionFailure(
             503,
             "Cloud ASR configuration is incomplete.",
@@ -1245,6 +1289,7 @@ USER_ERROR_MESSAGES = {
     "asr_provider_not_configured": "云端语音识别尚未完成配置。",
     "asr_provider_auth_failed": "云端语音识别凭证无效或模型权限不足。",
     "asr_provider_unavailable": "云端语音识别服务暂时不可用，请稍后重试。",
+    "asr_temp_upload_failed": "云端临时音频上传失败，请稍后重试。",
     "asr_provider_rejected": "云端语音识别无法处理这个音频。",
     "asr_provider_failed": "云端语音识别任务失败，请稍后重试。",
     "asr_provider_response_invalid": "云端语音识别返回的数据异常，请稍后重试。",
@@ -5080,7 +5125,6 @@ def transcribe_media_with_cloud(
     mode: str,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     ensure_cloud_asr_ready()
-    assert CLOUD_SIGNED_AUDIO_STORE is not None
     assert CLOUD_USAGE_LEDGER is not None
     report_progress("preprocessing", 45, "正在准备云端识别音频")
     audio_path, audio_info = prepare_audio_for_cloud(media_path, tmp_dir)
@@ -5091,11 +5135,15 @@ def transcribe_media_with_cloud(
         and env_bool("ASR_ECONOMY_FALLBACK_ENABLED", False)
     ):
         modes.append("economy")
-    token, signed_url = CLOUD_SIGNED_AUDIO_STORE.register(
-        audio_path,
-        content_type="audio/mpeg",
-        ttl_seconds=CLOUD_AUDIO_TTL_SECONDS,
-    )
+    token: str | None = None
+    signed_url: str | None = None
+    if CLOUD_ASR_AUDIO_DELIVERY == "signed_url":
+        assert CLOUD_SIGNED_AUDIO_STORE is not None
+        token, signed_url = CLOUD_SIGNED_AUDIO_STORE.register(
+            audio_path,
+            content_type="audio/mpeg",
+            ttl_seconds=CLOUD_AUDIO_TTL_SECONDS,
+        )
     failures: list[str] = []
     try:
         for index, current_mode in enumerate(modes):
@@ -5114,10 +5162,21 @@ def transcribe_media_with_cloud(
                     exc.code,
                     retryable=False,
                 ) from exc
-            submitted = False
+            submission_started = False
             try:
+                if CLOUD_ASR_AUDIO_DELIVERY == "aliyun_temp":
+                    assert CLOUD_TEMP_FILE_UPLOADER is not None
+                    report_progress("preprocessing", 52, "正在安全上传临时音频")
+                    file_url = CLOUD_TEMP_FILE_UPLOADER.upload(
+                        audio_path,
+                        model=model,
+                    )
+                else:
+                    assert signed_url is not None
+                    file_url = signed_url
+                submission_started = True
                 transcript = provider.transcribe(
-                    signed_url,
+                    file_url,
                     language=language,
                     enable_words=True,
                     timeout_seconds=CLOUD_ASR_TIMEOUT_SECONDS,
@@ -5125,7 +5184,6 @@ def transcribe_media_with_cloud(
                     poll_max_seconds=5,
                     progress=report_progress,
                 )
-                submitted = bool(transcript.provider_task_id)
             except AsrProviderError as exc:
                 submitted = bool(exc.task_id)
                 estimated_seconds = float(audio_info["duration"])
@@ -5153,6 +5211,19 @@ def transcribe_media_with_cloud(
                     report_progress("waiting_for_provider", 62, "高精度服务暂不可用，正在切换经济模式")
                     continue
                 raise cloud_provider_failure(exc) from exc
+            except Exception:
+                estimated_seconds = float(audio_info["duration"])
+                if submission_started:
+                    CLOUD_USAGE_LEDGER.commit(
+                        reservation.reservation_id,
+                        actual_seconds=estimated_seconds,
+                        estimated_cost_cny=estimated_seconds * cloud_model_price(model),
+                        outcome="provider_internal_error",
+                        metadata={"provider": "aliyun", "model": model, "fallback": index > 0},
+                    )
+                else:
+                    CLOUD_USAGE_LEDGER.release(reservation.reservation_id)
+                raise
             actual_seconds = float(
                 transcript.provider_seconds
                 if transcript.provider_seconds is not None
@@ -5185,11 +5256,18 @@ def transcribe_media_with_cloud(
                     "audio_codec": audio_info["codec_name"],
                     "audio_channels": audio_info["channels"],
                     "audio_sample_rate": audio_info["sample_rate"],
+                    "audio_delivery": CLOUD_ASR_AUDIO_DELIVERY,
+                    "provider_temporary_retention_seconds": (
+                        CLOUD_TEMP_AUDIO_RETENTION_SECONDS
+                        if CLOUD_ASR_AUDIO_DELIVERY == "aliyun_temp"
+                        else 0
+                    ),
                 }
             )
             return entries, transcript_info
     finally:
-        CLOUD_SIGNED_AUDIO_STORE.revoke(token)
+        if token is not None and CLOUD_SIGNED_AUDIO_STORE is not None:
+            CLOUD_SIGNED_AUDIO_STORE.revoke(token)
 
     raise ExtractionFailure(
         502,
@@ -6628,17 +6706,28 @@ def health() -> dict[str, Any]:
             "configured": bool(
                 cloud_asr_enabled()
                 and CLOUD_ASR_INIT_ERROR is None
-                and CLOUD_SIGNED_AUDIO_STORE is not None
+                and cloud_audio_delivery_ready()
                 and CLOUD_USAGE_LEDGER is not None
             ),
             "state": (
                 "ready"
-                if cloud_asr_enabled() and CLOUD_ASR_INIT_ERROR is None
+                if (
+                    cloud_asr_enabled()
+                    and CLOUD_ASR_INIT_ERROR is None
+                    and cloud_audio_delivery_ready()
+                    and CLOUD_USAGE_LEDGER is not None
+                )
                 else ("disabled" if not cloud_asr_enabled() else "configuration_error")
             ),
             "provider": "aliyun",
             "default_model": CLOUD_ASR_DEFAULT_MODEL,
             "economy_model": CLOUD_ASR_ECONOMY_MODEL,
+            "audio_delivery": CLOUD_ASR_AUDIO_DELIVERY,
+            "provider_temporary_retention_seconds": (
+                CLOUD_TEMP_AUDIO_RETENTION_SECONDS
+                if CLOUD_ASR_AUDIO_DELIVERY == "aliyun_temp"
+                else 0
+            ),
             "allow_paid": env_bool("ASR_ALLOW_PAID", False),
             "monthly_free_seconds": CLOUD_ASR_MONTHLY_FREE_SECONDS,
             "usage": cloud_usage_stats(),
