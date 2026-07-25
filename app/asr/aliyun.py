@@ -183,7 +183,6 @@ class _AliyunAsyncProvider(AsrProvider):
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "X-DashScope-Async": "enable",
         }
         timeout = httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds))
         self._owns_client = client is None
@@ -309,13 +308,17 @@ class _AliyunAsyncProvider(AsrProvider):
 
     def _request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         last_error: AsrProviderError | None = None
-        retry_count = self.max_retries if method.upper() in {"GET", "HEAD"} else 0
+        normalized_method = method.upper()
+        retry_count = self.max_retries if normalized_method in {"GET", "HEAD"} else 0
+        request_headers = dict(self._headers)
+        if normalized_method == "POST":
+            request_headers["X-DashScope-Async"] = "enable"
         for attempt in range(retry_count + 1):
             try:
                 response = self.client.request(
                     method,
                     f"{self.base_url}{path}",
-                    headers=self._headers,
+                    headers=request_headers,
                     **kwargs,
                 )
             except httpx.RequestError as exc:

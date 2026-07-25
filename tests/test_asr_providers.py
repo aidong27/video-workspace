@@ -93,6 +93,8 @@ class AliyunProviderTests(unittest.TestCase):
 
         body = json.loads(requests[0].content)
         self.assertIn("Bearer sk-test", requests[0].headers["authorization"])
+        self.assertEqual(requests[0].headers["x-dashscope-async"], "enable")
+        self.assertNotIn("x-dashscope-async", requests[1].headers)
         self.assertEqual(body["input"], {"file_url": body["input"]["file_url"]})
         self.assertEqual(body["parameters"]["language"], "zh")
         self.assertTrue(body["parameters"]["enable_words"])
