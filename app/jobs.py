@@ -4,7 +4,10 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+import os
+from pathlib import Path
 from queue import Empty, Queue
+import sqlite3
 from threading import Event, Lock, Thread
 import time
 from typing import Any, Callable
@@ -69,6 +72,7 @@ class JobManager:
         max_records: int = 100,
         worker_count: int = 1,
         discarder: JobDiscarder | None = None,
+        state_path: Path | None = None,
     ) -> None:
         self.processor = processor
         self.max_pending = max(1, max_pending)
@@ -76,6 +80,7 @@ class JobManager:
         self.max_records = max(10, max_records)
         self.worker_count = max(1, worker_count)
         self.discarder = discarder
+        self.state_path = state_path
         # Capacity is enforced against live queued records under self.lock. An
         # unbounded transport queue prevents cancelled IDs from causing false
         # queue-full responses before workers have consumed those stale IDs.
@@ -84,11 +89,15 @@ class JobManager:
         self.lock = Lock()
         self.stop_event = Event()
         self.workers: list[Thread] = []
+        self._restored = False
 
     def start(self) -> None:
         with self.lock:
             if any(worker.is_alive() for worker in self.workers):
                 return
+            if self.state_path is not None and not self._restored:
+                self._restore_locked()
+                self._restored = True
             self.stop_event.clear()
             self.workers = [
                 Thread(target=self._run, name=f"caption-job-worker-{index + 1}", daemon=True)
@@ -115,6 +124,7 @@ class JobManager:
                 item.message = "服务停止，排队任务已取消"
                 item.updated_at = time.time()
                 item.done_event.set()
+                self._persist_locked(item)
                 abandoned.append(dict(item.request))
         for request in abandoned:
             self._discard(request)
@@ -150,6 +160,7 @@ class JobManager:
             if queued >= self.max_pending:
                 raise JobQueueFull
             self.records[record.job_id] = record
+            self._persist_locked(record)
         self.queue.put_nowait(record.job_id)
         payload = self.get(record.job_id, owner_id=owner_id)
         payload["reused"] = False
@@ -193,6 +204,7 @@ class JobManager:
                 payload["reused"] = True
                 return payload
             self.records[record.job_id] = record
+            self._persist_locked(record)
             payload = self._public_locked(record)
             payload["reused"] = False
             return payload
@@ -245,6 +257,7 @@ class JobManager:
                 record.message = "任务已取消"
                 record.updated_at = time.time()
                 record.done_event.set()
+                self._persist_locked(record)
                 discarded_request = dict(record.request)
             payload = self._public_locked(record)
         if discarded_request is not None:
@@ -276,6 +289,7 @@ class JobManager:
             for item in finished:
                 if now - item.updated_at > self.result_ttl_seconds:
                     self.records.pop(item.job_id, None)
+                    self._delete_persisted_locked(item.job_id)
                     discarded.append(dict(item.request))
                     removed += 1
             if len(self.records) > self.max_records:
@@ -289,6 +303,7 @@ class JobManager:
                 )
                 for item in removable[: max(0, len(self.records) - self.max_records)]:
                     self.records.pop(item.job_id, None)
+                    self._delete_persisted_locked(item.job_id)
                     discarded.append(dict(item.request))
                     removed += 1
         for request in discarded:
@@ -358,6 +373,7 @@ class JobManager:
             record.progress = max(record.progress, min(99, max(1, int(progress))))
             record.message = message
             record.updated_at = time.time()
+            self._persist_locked(record)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -375,6 +391,7 @@ class JobManager:
                 record.progress = 5
                 record.message = "正在启动任务"
                 record.updated_at = time.time()
+                self._persist_locked(record)
                 request = dict(record.request)
             try:
                 result = self.processor(
@@ -393,6 +410,7 @@ class JobManager:
                         record.error_status = exc.status_code
                         record.updated_at = time.time()
                         record.done_event.set()
+                        self._persist_locked(record)
             except Exception as exc:
                 LOGGER.error("caption job failed error_type=%s", type(exc).__name__)
                 with self.lock:
@@ -406,6 +424,7 @@ class JobManager:
                         record.error_status = 500
                         record.updated_at = time.time()
                         record.done_event.set()
+                        self._persist_locked(record)
             else:
                 with self.lock:
                     record = self.records.get(job_id)
@@ -417,5 +436,160 @@ class JobManager:
                         record.result = result
                         record.updated_at = time.time()
                         record.done_event.set()
+                        self._persist_locked(record)
             finally:
                 self.queue.task_done()
+
+    def _connect_state(self) -> sqlite3.Connection:
+        if self.state_path is None:
+            raise RuntimeError("job state persistence is disabled")
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.state_path.parent, 0o700)
+        except OSError:
+            pass
+        connection = sqlite3.connect(self.state_path, timeout=10)
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                updated_at REAL NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+        try:
+            os.chmod(self.state_path, 0o600)
+        except OSError:
+            pass
+        return connection
+
+    def _persist_locked(self, record: JobRecord) -> None:
+        if self.state_path is None:
+            return
+        payload = {
+            "job_id": record.job_id,
+            "request": record.request,
+            "owner_id": record.owner_id,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "status": record.status,
+            "stage": record.stage,
+            "progress": record.progress,
+            "message": record.message,
+            "result": record.result,
+            "error": record.error,
+            "error_status": record.error_status,
+            "idempotency_key": record.idempotency_key,
+            "idempotency_fingerprint": record.idempotency_fingerprint,
+        }
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+            with self._connect_state() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO jobs (job_id, updated_at, payload_json)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        updated_at = excluded.updated_at,
+                        payload_json = excluded.payload_json
+                    """,
+                    (record.job_id, record.updated_at, encoded),
+                )
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            LOGGER.error("job state persistence failed error_type=%s", type(exc).__name__)
+
+    def _delete_persisted_locked(self, job_id: str) -> None:
+        if self.state_path is None:
+            return
+        try:
+            with self._connect_state() as connection:
+                connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+        except (OSError, sqlite3.Error):
+            return
+
+    def _restore_locked(self) -> None:
+        if self.state_path is None:
+            return
+        now = time.time()
+        try:
+            with self._connect_state() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT job_id, payload_json
+                    FROM jobs
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (self.max_records,),
+                ).fetchall()
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.error("job state restore failed error_type=%s", type(exc).__name__)
+            return
+        restored_queue: list[str] = []
+        invalid_ids: list[str] = []
+        for job_id, encoded in rows:
+            try:
+                payload = json.loads(encoded)
+                updated_at = float(payload["updated_at"])
+                status = str(payload["status"])
+                request = payload["request"]
+                if not isinstance(request, dict):
+                    raise ValueError("invalid request")
+                if status in {"completed", "failed", "cancelled"} and now - updated_at > self.result_ttl_seconds:
+                    invalid_ids.append(str(job_id))
+                    continue
+                record = JobRecord(
+                    job_id=str(payload["job_id"]),
+                    request=request,
+                    owner_id=int(payload["owner_id"]) if payload.get("owner_id") is not None else None,
+                    created_at=float(payload["created_at"]),
+                    updated_at=updated_at,
+                    status=status,
+                    stage=str(payload.get("stage") or status),
+                    progress=int(payload.get("progress") or 0),
+                    message=str(payload.get("message") or ""),
+                    result=payload.get("result"),
+                    error=payload.get("error"),
+                    error_status=int(payload.get("error_status") or 500),
+                    idempotency_key=payload.get("idempotency_key"),
+                    idempotency_fingerprint=payload.get("idempotency_fingerprint"),
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                invalid_ids.append(str(job_id))
+                continue
+            if record.status in {"queued", "running"}:
+                if record.status == "running" or record.request.get("kind") in {"upload", "media"}:
+                    record.status = "failed"
+                    record.stage = "failed"
+                    record.progress = 100
+                    record.message = "任务因服务重启中断"
+                    record.error = {
+                        "reason": "job_interrupted",
+                        "code": "job_expired",
+                        "message": "服务已重启，执行中的任务需要重新提交。",
+                        "retryable": True,
+                    }
+                    record.error_status = 410
+                    record.updated_at = now
+                    record.done_event.set()
+                else:
+                    record.status = "queued"
+                    record.stage = "queued"
+                    record.progress = 2
+                    record.message = "服务重启后已恢复排队"
+                    record.updated_at = now
+                    restored_queue.append(record.job_id)
+            elif record.status in {"completed", "failed", "cancelled"}:
+                record.done_event.set()
+            else:
+                invalid_ids.append(str(job_id))
+                continue
+            self.records[record.job_id] = record
+            self._persist_locked(record)
+        for job_id in invalid_ids:
+            self._delete_persisted_locked(job_id)
+        for job_id in reversed(restored_queue):
+            self.queue.put_nowait(job_id)

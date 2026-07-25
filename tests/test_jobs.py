@@ -1,3 +1,5 @@
+from pathlib import Path
+import tempfile
 import time
 from threading import Event
 import unittest
@@ -253,6 +255,88 @@ class JobManagerTests(unittest.TestCase):
         finally:
             release.set()
             manager.stop()
+
+    def test_persistent_completed_result_survives_manager_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "jobs.db"
+            first = JobManager(lambda payload, update: payload, state_path=state_path)
+            submitted = first.submit_completed(
+                {"value": 1},
+                {"ok": True, "content": "cached"},
+                owner_id=7,
+            )
+
+            restored = JobManager(lambda payload, update: payload, state_path=state_path)
+            restored.start()
+            try:
+                result = restored.get(submitted["id"], owner_id=7)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["result"]["content"], "cached")
+            finally:
+                restored.stop()
+
+    def test_persistent_link_job_is_requeued_after_unclean_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "jobs.db"
+            first = JobManager(lambda payload, update: payload, state_path=state_path)
+            submitted = first.submit({"input": "BV14jFvzbEvj"}, owner_id=7)
+
+            restored = JobManager(
+                lambda payload, update: {"ok": True, "input": payload["input"]},
+                state_path=state_path,
+            )
+            restored.start()
+            try:
+                result = restored.wait(submitted["id"], owner_id=7, timeout=2)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["result"]["input"], "BV14jFvzbEvj")
+            finally:
+                restored.stop()
+
+    def test_persistent_upload_job_reports_restart_interruption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "jobs.db"
+            first = JobManager(lambda payload, update: payload, state_path=state_path)
+            submitted = first.submit(
+                {"kind": "upload", "upload_token": "a" * 32},
+                owner_id=7,
+            )
+
+            restored = JobManager(lambda payload, update: payload, state_path=state_path)
+            restored.start()
+            try:
+                result = restored.get(submitted["id"], owner_id=7)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error_status"], 410)
+                self.assertEqual(result["error"]["code"], "job_expired")
+            finally:
+                restored.stop()
+
+    def test_persistent_running_link_job_is_not_resubmitted_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "jobs.db"
+            first = JobManager(lambda payload, update: payload, state_path=state_path)
+            submitted = first.submit({"input": "BV14jFvzbEvj"}, owner_id=7)
+            with first.lock:
+                record = first.records[submitted["id"]]
+                record.status = "running"
+                record.stage = "waiting_for_provider"
+                first._persist_locked(record)
+
+            calls = []
+            restored = JobManager(
+                lambda payload, update: calls.append(payload) or payload,
+                state_path=state_path,
+            )
+            restored.start()
+            try:
+                result = restored.get(submitted["id"], owner_id=7)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error_status"], 410)
+                self.assertEqual(result["error"]["code"], "job_expired")
+                self.assertEqual(calls, [])
+            finally:
+                restored.stop()
 
 
 if __name__ == "__main__":

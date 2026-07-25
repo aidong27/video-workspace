@@ -45,6 +45,14 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 from yt_dlp import YoutubeDL
 
+from app.asr.aliyun import (
+    AliyunParaformerProvider,
+    AliyunQwenFileTransProvider,
+)
+from app.asr.base import AsrProvider, AsrProviderError, Transcript
+from app.asr.postprocess import normalize_segments
+from app.asr.signing import SignedAudioError, SignedAudioStore
+from app.asr.usage import UsageLedger, UsageLimitExceeded
 from app.auth import (
     AuthFailure,
     SESSION_COOKIE_NAME,
@@ -103,7 +111,7 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.1")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.2")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -184,12 +192,24 @@ MEDIA_STAGING_MAX_BYTES = max(
     MEDIA_MAX_BYTES,
     int(os.getenv("MEDIA_STAGING_MAX_BYTES", "8000000000")),
 )
-ASR_CONCURRENCY_LIMIT = max(1, int(os.getenv("ASR_CONCURRENCY_LIMIT", "1")))
+ASR_CONCURRENCY_LIMIT = max(
+    1,
+    int(os.getenv("ASR_JOB_CONCURRENCY", os.getenv("ASR_CONCURRENCY_LIMIT", "1"))),
+)
 ASR_TMP_MAX_AGE_SECONDS = max(300, int(os.getenv("ASR_TMP_MAX_AGE_SECONDS", "86400")))
-RESULT_CACHE_TTL_SECONDS = max(0, int(os.getenv("RESULT_CACHE_TTL_SECONDS", "604800")))
+RESULT_CACHE_TTL_SECONDS = max(
+    0,
+    int(
+        os.getenv(
+            "RESULT_CACHE_TTL_SECONDS",
+            str(max(1, int(os.getenv("TRANSCRIPT_RETENTION_DAYS", "7"))) * 86400),
+        )
+    ),
+)
 RESULT_CACHE_MAX_ITEMS = max(1, int(os.getenv("RESULT_CACHE_MAX_ITEMS", "100")))
 JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "4")))
 JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("JOB_RESULT_TTL_SECONDS", "3600")))
+JOB_STATE_DB_PATH = Path(os.getenv("JOB_STATE_DB_PATH", str(ASR_CACHE_DIR / "jobs.db")))
 MEDIA_ARTIFACT_TTL_SECONDS = max(
     60,
     int(os.getenv("MEDIA_ARTIFACT_TTL_SECONDS", str(JOB_RESULT_TTL_SECONDS))),
@@ -224,8 +244,70 @@ ASR_MAX_TIMEOUT_SECONDS = max(
     ACCURATE_ASR_TIMEOUT_SECONDS,
     int(os.getenv("ASR_MAX_TIMEOUT_SECONDS", "7200")),
 )
-RESULT_CACHE_VERSION = 8
+CLOUD_ASR_DEFAULT_MODEL = (
+    os.getenv("ASR_DEFAULT_MODEL", "qwen3-asr-flash-filetrans").strip()
+    or "qwen3-asr-flash-filetrans"
+)
+CLOUD_ASR_ECONOMY_MODEL = (
+    os.getenv("ASR_ECONOMY_MODEL", "paraformer-v2").strip()
+    or "paraformer-v2"
+)
+CLOUD_ASR_TIMEOUT_SECONDS = max(
+    60,
+    int(os.getenv("CLOUD_ASR_TIMEOUT_SECONDS", "1800")),
+)
+CLOUD_ASR_HTTP_TIMEOUT_SECONDS = max(
+    5,
+    int(os.getenv("CLOUD_ASR_HTTP_TIMEOUT_SECONDS", "30")),
+)
+CLOUD_ASR_MAX_FILE_BYTES = max(
+    1_000_000,
+    int(os.getenv("CLOUD_ASR_MAX_FILE_BYTES", "268435456")),
+)
+CLOUD_ASR_USAGE_DB_PATH = Path(
+    os.getenv("ASR_USAGE_DB_PATH", str(ASR_CACHE_DIR / "cloud-usage.db"))
+)
+CLOUD_ASR_MONTHLY_FREE_SECONDS = max(
+    0,
+    int(os.getenv("ASR_MONTHLY_FREE_SECONDS", "0")),
+)
+CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS = max(
+    0,
+    int(os.getenv("ASR_MONTHLY_HARD_LIMIT_SECONDS", "0")),
+)
+CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS = max(
+    0,
+    int(os.getenv("ASR_TOTAL_HARD_LIMIT_SECONDS", "0")),
+)
+CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS = max(
+    0,
+    int(os.getenv("ASR_DAILY_HARD_LIMIT_SECONDS", "0")),
+)
+CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS = max(
+    0,
+    int(os.getenv("ASR_USER_DAILY_HARD_LIMIT_SECONDS", "0")),
+)
+CLOUD_AUDIO_TTL_SECONDS = max(
+    60,
+    min(3600, int(os.getenv("TEMP_AUDIO_TTL_SECONDS", "1800"))),
+)
+try:
+    CLOUD_ASR_QWEN_PRICE_PER_SECOND = max(
+        0.0,
+        float(os.getenv("ASR_QWEN_PRICE_PER_SECOND", "0.00022")),
+    )
+except ValueError:
+    CLOUD_ASR_QWEN_PRICE_PER_SECOND = 0.00022
+try:
+    CLOUD_ASR_PARAFORMER_PRICE_PER_SECOND = max(
+        0.0,
+        float(os.getenv("ASR_PARAFORMER_PRICE_PER_SECOND", "0.00008")),
+    )
+except ValueError:
+    CLOUD_ASR_PARAFORMER_PRICE_PER_SECOND = 0.00008
+RESULT_CACHE_VERSION = 9
 ASR_PIPELINE_VERSION = 2
+CLOUD_ASR_PIPELINE_VERSION = 1
 ASR_PROMPT_VERSION = 1
 ASR_VAD_PROFILE_VERSION = 1
 ASR_AUDIO_FILTER_VERSION = 1
@@ -247,7 +329,13 @@ ASR_PREWARM_THREAD: Thread | None = None
 _ASR_MODEL_KEY: tuple[str, str, str, int] | None = None
 _ASR_MODEL_INSTANCE: Any = None
 _ASR_MODEL_LOCK = Lock()
+CLOUD_PROVIDER_LOCK = Lock()
+CLOUD_PROVIDER_INSTANCES: dict[str, AsrProvider] = {}
+CLOUD_SIGNED_AUDIO_STORE: SignedAudioStore | None = None
+CLOUD_USAGE_LEDGER: UsageLedger | None = None
+CLOUD_ASR_INIT_ERROR: str | None = None
 PROGRESS_CONTEXT = local()
+JOB_OWNER_CONTEXT = local()
 UPLOAD_RESERVATION_LOCK = Lock()
 UPLOAD_RESERVATIONS: dict[str, int] = {}
 MEDIA_RESERVATION_LOCK = Lock()
@@ -289,6 +377,7 @@ BILI_URL_RE = re.compile(
 )
 TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？、)]}）】》"
 SENSITIVE_PATTERNS = (
+    re.compile(r"(?i)\bsk-[A-Za-z0-9._-]{8,}\b"),
     re.compile(r"(?i)\b(authorization|cookie)\s*:\s*[^\r\n]+"),
     re.compile(
         r"(?i)\b("
@@ -343,8 +432,9 @@ class ExtractRequest(BaseModel):
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     )
     hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
-    allow_platform_ai: bool = False
+    allow_platform_ai: bool = True
     quality: Literal["fast", "accurate"] = "accurate"
+    asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto"
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -364,6 +454,7 @@ class UploadJobRequest(BaseModel):
     )
     hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
     quality: Literal["fast", "accurate"] = "accurate"
+    asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto"
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -522,6 +613,168 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def local_asr_enabled() -> bool:
+    return env_bool("LOCAL_ASR_ENABLED", env_bool("ASR_ENABLED", False))
+
+
+def cloud_asr_enabled() -> bool:
+    return env_bool("CLOUD_ASR_ENABLED", False)
+
+
+def any_asr_enabled() -> bool:
+    return cloud_asr_enabled() or local_asr_enabled()
+
+
+def cloud_model_for_mode(mode: str) -> str:
+    return CLOUD_ASR_ECONOMY_MODEL if mode == "economy" else CLOUD_ASR_DEFAULT_MODEL
+
+
+def cloud_model_price(model: str) -> float:
+    if model == CLOUD_ASR_ECONOMY_MODEL:
+        return CLOUD_ASR_PARAFORMER_PRICE_PER_SECOND
+    return CLOUD_ASR_QWEN_PRICE_PER_SECOND
+
+
+def close_cloud_providers() -> None:
+    with CLOUD_PROVIDER_LOCK:
+        providers = list(CLOUD_PROVIDER_INSTANCES.values())
+        CLOUD_PROVIDER_INSTANCES.clear()
+    for provider in providers:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+def initialize_cloud_services() -> None:
+    global CLOUD_ASR_INIT_ERROR, CLOUD_SIGNED_AUDIO_STORE, CLOUD_USAGE_LEDGER
+    CLOUD_ASR_INIT_ERROR = None
+    CLOUD_SIGNED_AUDIO_STORE = None
+    CLOUD_USAGE_LEDGER = None
+    close_cloud_providers()
+    if not cloud_asr_enabled():
+        return
+    try:
+        api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        base_url = os.getenv("DASHSCOPE_BASE_URL", "").strip()
+        workspace_id = os.getenv("DASHSCOPE_WORKSPACE_ID", "").strip()
+        signing_secret = os.getenv("AUDIO_SIGNING_SECRET", "")
+        public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+        if not api_key or not base_url or not workspace_id:
+            raise ValueError("DashScope credentials are incomplete")
+        if not env_bool("ASR_ALLOW_PAID", False):
+            if not CLOUD_ASR_MONTHLY_FREE_SECONDS:
+                raise ValueError("ASR_MONTHLY_FREE_SECONDS must be configured when paid calls are disabled")
+            if CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS > CLOUD_ASR_MONTHLY_FREE_SECONDS:
+                raise ValueError("monthly hard limit exceeds the configured free allowance")
+            if not CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS:
+                raise ValueError("ASR_TOTAL_HARD_LIMIT_SECONDS must be configured when paid calls are disabled")
+            if CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS > CLOUD_ASR_MONTHLY_FREE_SECONDS:
+                raise ValueError("total hard limit exceeds the configured free allowance")
+        if not CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS:
+            raise ValueError("ASR_MONTHLY_HARD_LIMIT_SECONDS must be configured")
+        if not CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS:
+            raise ValueError("ASR_DAILY_HARD_LIMIT_SECONDS must be configured")
+        if not CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS:
+            raise ValueError("ASR_USER_DAILY_HARD_LIMIT_SECONDS must be configured")
+        CLOUD_SIGNED_AUDIO_STORE = SignedAudioStore(
+            root=ASR_TMP_DIR,
+            public_base_url=public_base_url,
+            secret=signing_secret,
+            default_ttl_seconds=CLOUD_AUDIO_TTL_SECONDS,
+        )
+        CLOUD_USAGE_LEDGER = UsageLedger(
+            CLOUD_ASR_USAGE_DB_PATH,
+            daily_limit_seconds=CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS,
+            monthly_limit_seconds=CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS,
+            user_daily_limit_seconds=CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS,
+            total_limit_seconds=CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS,
+            reservation_ttl_seconds=CLOUD_ASR_TIMEOUT_SECONDS + 900,
+        )
+        CLOUD_USAGE_LEDGER.initialize()
+    except Exception as exc:
+        CLOUD_ASR_INIT_ERROR = type(exc).__name__
+        LOGGER.error("cloud ASR initialization failed error_type=%s", type(exc).__name__)
+
+
+def ensure_cloud_asr_ready() -> None:
+    if not cloud_asr_enabled():
+        raise ExtractionFailure(
+            503,
+            "Cloud ASR is disabled.",
+            "asr_disabled",
+            retryable=False,
+        )
+    if CLOUD_ASR_INIT_ERROR or CLOUD_SIGNED_AUDIO_STORE is None or CLOUD_USAGE_LEDGER is None:
+        raise ExtractionFailure(
+            503,
+            "Cloud ASR configuration is incomplete.",
+            "asr_provider_not_configured",
+            retryable=False,
+        )
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise ExtractionFailure(
+            503,
+            "Cloud ASR audio preparation requires ffmpeg and ffprobe.",
+            "ffmpeg_missing",
+            retryable=False,
+        )
+
+
+def cloud_provider_for_mode(mode: str) -> AsrProvider:
+    ensure_cloud_asr_ready()
+    model = cloud_model_for_mode(mode)
+    with CLOUD_PROVIDER_LOCK:
+        existing = CLOUD_PROVIDER_INSTANCES.get(model)
+        if existing is not None:
+            return existing
+        options = {
+            "api_key": os.getenv("DASHSCOPE_API_KEY", "").strip(),
+            "base_url": os.getenv("DASHSCOPE_BASE_URL", "").strip(),
+            "model": model,
+            "timeout_seconds": CLOUD_ASR_HTTP_TIMEOUT_SECONDS,
+            "max_retries": 2,
+        }
+        if mode == "economy":
+            provider: AsrProvider = AliyunParaformerProvider(**options)
+        else:
+            provider = AliyunQwenFileTransProvider(**options)
+        CLOUD_PROVIDER_INSTANCES[model] = provider
+        return provider
+
+
+def cloud_usage_stats() -> dict[str, Any]:
+    if CLOUD_USAGE_LEDGER is None:
+        return {
+            "daily_seconds": 0,
+            "monthly_seconds": 0,
+            "total_seconds": 0,
+            "reserved_seconds": 0,
+            "daily_limit_seconds": CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS,
+            "monthly_limit_seconds": CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS,
+            "user_daily_limit_seconds": CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS,
+            "total_limit_seconds": CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS,
+            "by_model_seconds": {},
+        }
+    try:
+        return CLOUD_USAGE_LEDGER.stats()
+    except Exception as exc:
+        LOGGER.error("cloud ASR usage status failed error_type=%s", type(exc).__name__)
+        return {
+            "daily_seconds": None,
+            "monthly_seconds": None,
+            "total_seconds": None,
+            "reserved_seconds": None,
+            "daily_limit_seconds": CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS,
+            "monthly_limit_seconds": CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS,
+            "user_daily_limit_seconds": CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS,
+            "total_limit_seconds": CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS,
+            "by_model_seconds": {},
+        }
+
+
 def sanitize_asr_context(value: str | None) -> str | None:
     if not value:
         return None
@@ -590,7 +843,7 @@ def asr_profile(quality: str) -> dict[str, Any]:
             ),
             "timeout_seconds": ACCURATE_ASR_TIMEOUT_SECONDS,
         }
-    return {
+    payload = {
         "quality": "fast",
         "model": DEFAULT_ASR_MODEL,
         "compute_type": ASR_COMPUTE_TYPE,
@@ -602,6 +855,7 @@ def asr_profile(quality: str) -> dict[str, Any]:
         "condition_on_previous_text": env_bool("ASR_CONDITION_ON_PREVIOUS_TEXT", False),
         "timeout_seconds": ASR_TIMEOUT_SECONDS,
     }
+    return payload
 
 
 def asr_task_timeout(audio_path: Path, quality: str) -> int:
@@ -881,6 +1135,21 @@ def extraction_progress(callback: Callable[[str, int, str], None] | None):
         PROGRESS_CONTEXT.callback = previous
 
 
+@contextmanager
+def extraction_owner(owner_id: int | None):
+    previous = getattr(JOB_OWNER_CONTEXT, "owner_id", None)
+    JOB_OWNER_CONTEXT.owner_id = owner_id
+    try:
+        yield
+    finally:
+        JOB_OWNER_CONTEXT.owner_id = previous
+
+
+def current_asr_owner_key() -> str:
+    owner_id = getattr(JOB_OWNER_CONTEXT, "owner_id", None)
+    return f"user:{owner_id}" if isinstance(owner_id, int) and owner_id > 0 else "system"
+
+
 def report_progress(stage: str, progress: int, message: str) -> None:
     callback = getattr(PROGRESS_CONTEXT, "callback", None)
     if callback:
@@ -948,6 +1217,11 @@ def stable_error_code(reason: str) -> str:
         "queue_full": "job_queue_full",
         "job_not_found": "job_expired",
         "job_cancelled": "task_cancelled",
+        "asr_provider_not_configured": "asr_provider_not_configured",
+        "asr_daily_limit_reached": "asr_daily_limit_reached",
+        "asr_monthly_limit_reached": "asr_monthly_limit_reached",
+        "asr_total_limit_reached": "asr_total_limit_reached",
+        "asr_user_daily_limit_reached": "asr_user_daily_limit_reached",
     }.get(normalized, normalized)
 
 
@@ -968,6 +1242,20 @@ USER_ERROR_MESSAGES = {
     "asr_model_download_failed": "语音识别模型不可用或下载失败，请检查模型缓存与网络。",
     "asr_failed": "本地语音识别失败，请稍后重试。",
     "asr_busy": "精确处理资源正忙，请稍后重试。",
+    "asr_provider_not_configured": "云端语音识别尚未完成配置。",
+    "asr_provider_auth_failed": "云端语音识别凭证无效或模型权限不足。",
+    "asr_provider_unavailable": "云端语音识别服务暂时不可用，请稍后重试。",
+    "asr_provider_rejected": "云端语音识别无法处理这个音频。",
+    "asr_provider_failed": "云端语音识别任务失败，请稍后重试。",
+    "asr_provider_response_invalid": "云端语音识别返回的数据异常，请稍后重试。",
+    "asr_result_download_failed": "云端识别已完成，但结果下载失败。",
+    "asr_audio_fetch_failed": "云端语音识别无法读取临时音频，请稍后重试。",
+    "asr_rate_limited": "云端语音识别请求过于频繁，请稍后重试。",
+    "asr_quota_exhausted": "免费额度已用尽，系统未继续产生付费调用。",
+    "asr_daily_limit_reached": "今日云端语音识别额度已用尽。",
+    "asr_monthly_limit_reached": "本月云端语音识别额度已用尽。",
+    "asr_total_limit_reached": "云端语音识别总免费额度保护线已达到。",
+    "asr_user_daily_limit_reached": "你今天可使用的云端识别时长已用尽。",
     "ocr_timeout": "画面字幕识别超时，请缩短视频或稍后重试。",
     "ocr_failed": "画面字幕识别失败；有音轨时会自动尝试语音识别。",
     "ocr_missing": "服务器未安装画面字幕识别组件。",
@@ -1040,8 +1328,12 @@ def result_cache_key(req: ExtractRequest, canonical_input: str) -> str:
         "lang": (req.lang or "").strip().lower(),
         "allow_platform_ai": req.allow_platform_ai,
         "quality": quality,
+        "asr_mode": req.asr_mode,
         "embedded_subtitles": req.embedded_subtitles,
         "cookie": cookie_fingerprint,
+        "cloud_asr_pipeline_version": CLOUD_ASR_PIPELINE_VERSION,
+        "cloud_asr_model": cloud_model_for_mode(req.asr_mode),
+        "cloud_asr_enabled": cloud_asr_enabled(),
         "asr_model": profile["model"],
         "asr_pipeline_version": ASR_PIPELINE_VERSION,
         "asr_compute_type": profile["compute_type"],
@@ -1079,7 +1371,11 @@ def upload_result_cache_key(req: UploadJobRequest) -> str:
         "sha256": req.sha256,
         "lang": (req.lang or "").strip().lower(),
         "quality": quality,
+        "asr_mode": req.asr_mode,
         "embedded_subtitles": req.embedded_subtitles,
+        "cloud_asr_pipeline_version": CLOUD_ASR_PIPELINE_VERSION,
+        "cloud_asr_model": cloud_model_for_mode(req.asr_mode),
+        "cloud_asr_enabled": cloud_asr_enabled(),
         "asr_model": profile["model"],
         "asr_pipeline_version": ASR_PIPELINE_VERSION,
         "asr_compute_type": profile["compute_type"],
@@ -1965,6 +2261,13 @@ def render_entries(entries: list[SubtitleEntry], output_format: str, meta: dict[
     raise ExtractionFailure(400, "Unsupported output format.", "unsupported_format", terminal=True)
 
 
+def rendered_raw_content(meta: dict[str, Any], output_format: str) -> str | None:
+    raw_entries = deserialize_entries(meta.get("raw_entries"))
+    if not raw_entries:
+        return None
+    return render_entries(raw_entries, output_format, meta)
+
+
 def official_subtitle(req: ExtractRequest, allow_cookie: bool, source_label: str) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     url = normalize_input(req.input)
     platform = detect_platform(url)
@@ -2065,7 +2368,7 @@ def official_subtitle(req: ExtractRequest, allow_cookie: bool, source_label: str
 
 
 def ensure_asr_ready() -> None:
-    if not env_bool("ASR_ENABLED", True):
+    if not local_asr_enabled():
         raise ExtractionFailure(503, "Local ASR is disabled by ASR_ENABLED=false.", "asr_disabled")
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise ExtractionFailure(503, "Local ASR requires ffmpeg and ffprobe.", "ffmpeg_missing")
@@ -2248,6 +2551,133 @@ def normalize_audio_for_asr(
         LOGGER.warning("ffmpeg audio normalization failed: %s", redact_sensitive(proc.stderr))
         raise ExtractionFailure(502, "ffmpeg 音轨转换失败。", "audio_extract_failed")
     return normalized_path
+
+
+def prepare_audio_for_cloud(input_path: Path, tmp_dir: Path) -> tuple[Path, dict[str, Any]]:
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        raise ExtractionFailure(503, "Cloud ASR requires ffmpeg and ffprobe.", "ffmpeg_missing")
+    output_path = tmp_dir / "provider-audio.mp3"
+    ensure_disk_space(tmp_dir, 128 * 1024 * 1024)
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        LOCAL_MEDIA_PROTOCOL_WHITELIST,
+        "-i",
+        str(input_path),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "96k",
+    ]
+    audio_filter = asr_audio_filter()
+    if audio_filter:
+        command.extend(["-af", audio_filter])
+    command.append(str(output_path))
+    try:
+        result = run_managed_process(
+            command,
+            timeout=ASR_DOWNLOAD_TIMEOUT_SECONDS,
+            output_limit=PROCESS_ERROR_OUTPUT_BYTES,
+        )
+    except ManagedProcessTimeout as exc:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(
+            504,
+            "Cloud ASR audio preparation timed out.",
+            "download_failed",
+            retryable=True,
+        ) from exc
+    except OSError as exc:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(
+            503,
+            "Unable to start ffmpeg for cloud ASR.",
+            "ffmpeg_failed",
+            retryable=True,
+        ) from exc
+    if result.returncode != 0 or not output_path.is_file():
+        output_path.unlink(missing_ok=True)
+        LOGGER.warning("cloud ASR audio conversion failed: %s", redact_sensitive(result.stderr))
+        raise ExtractionFailure(
+            422,
+            "The media does not contain a readable audio stream.",
+            "no_audio_stream",
+            terminal=True,
+        )
+    size = output_path.stat().st_size
+    if size <= 0 or size > CLOUD_ASR_MAX_FILE_BYTES:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(
+            413,
+            "Cloud ASR audio exceeds the configured file limit.",
+            "media_too_large",
+            terminal=True,
+        )
+    try:
+        probe = run_managed_process(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,format_name:stream=codec_type,codec_name,channels,sample_rate",
+                "-of",
+                "json",
+                str(output_path),
+            ],
+            timeout=min(60, ASR_DOWNLOAD_TIMEOUT_SECONDS),
+            output_limit=PROCESS_ERROR_OUTPUT_BYTES,
+        )
+    except ManagedProcessTimeout as exc:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(408, "Cloud ASR audio inspection timed out.", "ffmpeg_failed") from exc
+    if probe.returncode != 0:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(422, "Cloud ASR audio inspection failed.", "ffmpeg_failed")
+    try:
+        payload = json.loads(probe.stdout)
+        duration = float((payload.get("format") or {}).get("duration") or 0)
+        streams = payload.get("streams") or []
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(422, "Cloud ASR audio metadata is invalid.", "ffmpeg_failed") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(422, "Cloud ASR audio duration is invalid.", "no_audio_stream")
+    if duration > ASR_MAX_AUDIO_SECONDS:
+        output_path.unlink(missing_ok=True)
+        raise ExtractionFailure(
+            413,
+            "Cloud ASR audio duration exceeds the configured limit.",
+            "asr_duration_too_long",
+            terminal=True,
+        )
+    audio_stream = next(
+        (item for item in streams if isinstance(item, dict) and item.get("codec_type") == "audio"),
+        {},
+    )
+    return output_path, {
+        "duration": duration,
+        "size": size,
+        "format_name": str((payload.get("format") or {}).get("format_name") or ""),
+        "codec_name": str(audio_stream.get("codec_name") or ""),
+        "channels": int(audio_stream.get("channels") or 0) or None,
+        "sample_rate": int(audio_stream.get("sample_rate") or 0) or None,
+    }
 
 
 TEXT_SUBTITLE_CODECS = frozenset({"ass", "mov_text", "ssa", "srt", "subrip", "text", "ttml", "webvtt"})
@@ -2916,7 +3346,13 @@ def run_isolated_ytdlp_download(
                 pass
 
 
-def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple[Path, dict[str, Any]]:
+def download_audio_for_asr(
+    url: str,
+    allow_cookie: bool,
+    tmp_dir: Path,
+    *,
+    normalize: bool = True,
+) -> tuple[Path, dict[str, Any]]:
     def do_api_download() -> tuple[Path, dict[str, Any]]:
         deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
         attempt_dir = tmp_dir / "bilibili-api"
@@ -2991,18 +3427,20 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
                                     "download_too_large",
                                 )
                             handle.write(chunk)
-        normalized_path = normalize_audio_for_asr(
-            raw_path,
-            tmp_dir,
-            bvid,
-            remaining_before(deadline, "Bilibili audio normalization"),
-        )
-        raw_path.unlink(missing_ok=True)
+        output_path = raw_path
+        if normalize:
+            output_path = normalize_audio_for_asr(
+                raw_path,
+                tmp_dir,
+                bvid,
+                remaining_before(deadline, "Bilibili audio normalization"),
+            )
+            raw_path.unlink(missing_ok=True)
         page_number = bili_page_number(canonical_url)
         title = data.get("title")
         if page_number > 1 and selected_page and selected_page.get("part"):
             title = f"{title} - P{page_number} {selected_page['part']}"
-        return normalized_path, {
+        return output_path, {
             "id": bvid,
             "title": title,
             "duration": (selected_page or {}).get("duration") or data.get("duration"),
@@ -3011,7 +3449,7 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
             "audio_bytes": downloaded,
             "audio_bandwidth": int(selected_audio.get("bandwidth") or 0) or None,
             "audio_quality_strategy": audio_quality,
-            "audio_normalized_for_asr": True,
+            "audio_normalized_for_asr": normalize,
         }
 
     def do_download() -> tuple[Path, dict[str, Any]]:
@@ -3040,17 +3478,19 @@ def download_audio_for_asr(url: str, allow_cookie: bool, tmp_dir: Path) -> tuple
         source_path = candidates[0]
         if source_path.stat().st_size > BILI_MAX_DOWNLOAD_BYTES:
             raise ExtractionFailure(413, "Bilibili audio exceeds the download size limit.", "download_too_large")
-        normalized = normalize_audio_for_asr(
-            source_path,
-            tmp_dir,
-            f"{source_path.stem}.normalized",
-            remaining_before(deadline, "yt-dlp audio normalization"),
-        )
-        source_path.unlink(missing_ok=True)
+        output_path = source_path
+        if normalize:
+            output_path = normalize_audio_for_asr(
+                source_path,
+                tmp_dir,
+                f"{source_path.stem}.normalized",
+                remaining_before(deadline, "yt-dlp audio normalization"),
+            )
+            source_path.unlink(missing_ok=True)
         if isinstance(info, dict):
-            info["audio_normalized_for_asr"] = True
+            info["audio_normalized_for_asr"] = normalize
             info["audio_download"] = "yt-dlp_fallback"
-        return normalized, info if isinstance(info, dict) else {"audio_normalized_for_asr": True}
+        return output_path, info if isinstance(info, dict) else {"audio_normalized_for_asr": normalize}
 
     try:
         return do_api_download()
@@ -3622,7 +4062,7 @@ def finalize_media_artifact(
         "artifact_ttl_seconds": MEDIA_ARTIFACT_TTL_SECONDS,
     }
     report_progress("media_finalize", 97, "正在准备下载文件")
-    return {
+    payload = {
         "ok": True,
         "kind": "media",
         "media_type": req.media_type,
@@ -3632,6 +4072,7 @@ def finalize_media_artifact(
         "download_url": f"/api/artifacts/{req.artifact_token}",
         "metadata": result_metadata,
     }
+    return payload
 
 
 def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
@@ -4466,27 +4907,45 @@ def video_pixel_subtitle(
         fallback_asr_info: dict[str, Any] = {}
         if not entries and media_info.get("has_audio"):
             report_progress("ocr_fallback", 70, "画面字幕不足，正在使用精确语音识别补救")
-            ensure_asr_ready()
-            audio_path = normalize_audio_for_asr(media_path, tmp_path, "ocr-fallback")
+            if cloud_asr_enabled():
+                ensure_cloud_asr_ready()
+            elif local_asr_enabled():
+                ensure_asr_ready()
+            else:
+                raise ExtractionFailure(
+                    503,
+                    "No ASR provider is enabled.",
+                    "asr_disabled",
+                    retryable=False,
+                )
             acquired = ASR_SEMAPHORE.acquire(blocking=False)
             if not acquired:
                 report_progress("asr_wait", 72, "正在等待精确语音识别资源")
                 acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
             if not acquired:
-                raise ExtractionFailure(429, "Local ASR wait exceeded the queue timeout.", "asr_busy")
+                raise ExtractionFailure(429, "ASR wait exceeded the queue timeout.", "asr_busy")
             try:
-                initial_prompt, hotwords = asr_context(
-                    str(info.get("title") or ""),
-                    str(info.get("author") or ""),
-                    req.hotwords,
-                )
-                entries, fallback_asr_info = transcribe_audio(
-                    audio_path,
-                    req.lang,
-                    "accurate",
-                    initial_prompt,
-                    hotwords,
-                )
+                if cloud_asr_enabled():
+                    entries, fallback_asr_info = transcribe_media_with_cloud(
+                        media_path,
+                        tmp_path,
+                        language=req.lang,
+                        mode=req.asr_mode,
+                    )
+                else:
+                    audio_path = normalize_audio_for_asr(media_path, tmp_path, "ocr-fallback")
+                    initial_prompt, hotwords = asr_context(
+                        str(info.get("title") or ""),
+                        str(info.get("author") or ""),
+                        req.hotwords,
+                    )
+                    entries, fallback_asr_info = transcribe_audio(
+                        audio_path,
+                        req.lang,
+                        "accurate",
+                        initial_prompt,
+                        hotwords,
+                    )
             finally:
                 ASR_SEMAPHORE.release()
         if not entries:
@@ -4495,10 +4954,15 @@ def video_pixel_subtitle(
     subtitle_source = str(subtitle_info.get("subtitle_source") or "burned_in_ocr")
     used_asr_fallback = bool(fallback_asr_info)
     if used_asr_fallback:
-        source = "asr_local"
-        track_source_type = "asr_local"
+        cloud_result = fallback_asr_info.get("provider") == "aliyun"
+        source = "asr_aliyun" if cloud_result else "asr_local"
+        track_source_type = source
         subtitle_format = "asr"
-        note = "未识别到稳定的画面字幕，已自动改用精确语音识别。"
+        note = (
+            "未识别到稳定的画面字幕，已自动改用阿里云百炼语音识别。"
+            if cloud_result
+            else "未识别到稳定的画面字幕，已自动改用精确语音识别。"
+        )
     elif subtitle_source == "embedded_text_track":
         source = "embedded_text"
         track_source_type = "embedded_text"
@@ -4529,6 +4993,7 @@ def video_pixel_subtitle(
         "author": info.get("author"),
         "session_mode": "anonymous_browser" if platform == "douyin" else ("bilibili_cookie" if allow_cookie else "anonymous"),
         "quality": "accurate",
+        "asr_mode": fallback_asr_info.get("asr_mode") or req.asr_mode,
         "embedded_subtitles_requested": True,
         "ocr_fallback_to_asr": used_asr_fallback,
         "processing_seconds": round(time.monotonic() - started, 3),
@@ -4549,10 +5014,306 @@ def video_pixel_subtitle(
             }
         )
         meta.update(asr_public_diagnostics(fallback_asr_info))
+        meta.update(fallback_asr_info)
     return entries, meta
 
 
-def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None = None) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+def transcript_entries(transcript: Transcript) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    raw_entries = [
+        {
+            "start": round(segment.start_ms / 1000, 3),
+            "end": round(segment.end_ms / 1000, 3),
+            "text": segment.text,
+            "speaker": segment.speaker,
+            "emotion": segment.emotion,
+            "words": [
+                {
+                    "start": round(word.start_ms / 1000, 3) if word.start_ms is not None else None,
+                    "end": round(word.end_ms / 1000, 3) if word.end_ms is not None else None,
+                    "text": word.text,
+                }
+                for word in segment.words
+            ],
+        }
+        for segment in transcript.segments
+    ]
+    normalized = normalize_segments(transcript.segments)
+    entries = [
+        SubtitleEntry(
+            start=segment.start_ms / 1000,
+            end=segment.end_ms / 1000,
+            text=segment.text,
+        )
+        for segment in normalized
+    ]
+    return entries, {
+        "provider": transcript.provider,
+        "model": transcript.model,
+        "detected_language": transcript.language,
+        "provider_task_id": transcript.provider_task_id,
+        "provider_seconds": transcript.provider_seconds,
+        "provider_latency_seconds": transcript.latency_seconds,
+        "audio_duration_seconds": round(transcript.duration_ms / 1000, 3)
+        if transcript.duration_ms
+        else None,
+        "raw_entries": raw_entries,
+        "raw_metadata": transcript.raw_metadata,
+        "raw_entry_count": len(raw_entries),
+        "normalized_entry_count": len(entries),
+    }
+
+
+def cloud_provider_failure(exc: AsrProviderError) -> ExtractionFailure:
+    return ExtractionFailure(
+        exc.status_code,
+        exc.message,
+        exc.code,
+        retryable=exc.retryable,
+    )
+
+
+def transcribe_media_with_cloud(
+    media_path: Path,
+    tmp_dir: Path,
+    *,
+    language: str | None,
+    mode: str,
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    ensure_cloud_asr_ready()
+    assert CLOUD_SIGNED_AUDIO_STORE is not None
+    assert CLOUD_USAGE_LEDGER is not None
+    report_progress("preprocessing", 45, "正在准备云端识别音频")
+    audio_path, audio_info = prepare_audio_for_cloud(media_path, tmp_dir)
+    requested_mode = "economy" if mode == "economy" else "high_accuracy"
+    modes = [requested_mode]
+    if (
+        requested_mode == "high_accuracy"
+        and env_bool("ASR_ECONOMY_FALLBACK_ENABLED", False)
+    ):
+        modes.append("economy")
+    token, signed_url = CLOUD_SIGNED_AUDIO_STORE.register(
+        audio_path,
+        content_type="audio/mpeg",
+        ttl_seconds=CLOUD_AUDIO_TTL_SECONDS,
+    )
+    failures: list[str] = []
+    try:
+        for index, current_mode in enumerate(modes):
+            model = cloud_model_for_mode(current_mode)
+            provider = cloud_provider_for_mode(current_mode)
+            try:
+                reservation = CLOUD_USAGE_LEDGER.reserve(
+                    owner_key=current_asr_owner_key(),
+                    model=model,
+                    predicted_seconds=float(audio_info["duration"]),
+                )
+            except UsageLimitExceeded as exc:
+                raise ExtractionFailure(
+                    429,
+                    exc.message,
+                    exc.code,
+                    retryable=False,
+                ) from exc
+            submitted = False
+            try:
+                transcript = provider.transcribe(
+                    signed_url,
+                    language=language,
+                    enable_words=True,
+                    timeout_seconds=CLOUD_ASR_TIMEOUT_SECONDS,
+                    poll_initial_seconds=3,
+                    poll_max_seconds=5,
+                    progress=report_progress,
+                )
+                submitted = bool(transcript.provider_task_id)
+            except AsrProviderError as exc:
+                submitted = bool(exc.task_id)
+                estimated_seconds = float(audio_info["duration"])
+                if submitted:
+                    CLOUD_USAGE_LEDGER.commit(
+                        reservation.reservation_id,
+                        actual_seconds=estimated_seconds,
+                        estimated_cost_cny=estimated_seconds * cloud_model_price(model),
+                        outcome="provider_failed",
+                        metadata={"provider": "aliyun", "model": model, "fallback": index > 0},
+                    )
+                else:
+                    CLOUD_USAGE_LEDGER.release(reservation.reservation_id)
+                failures.append(exc.code)
+                can_fallback = (
+                    index + 1 < len(modes)
+                    and exc.retryable
+                    and exc.code not in {
+                        "asr_provider_auth_failed",
+                        "asr_quota_exhausted",
+                        "asr_rate_limited",
+                    }
+                )
+                if can_fallback:
+                    report_progress("waiting_for_provider", 62, "高精度服务暂不可用，正在切换经济模式")
+                    continue
+                raise cloud_provider_failure(exc) from exc
+            actual_seconds = float(
+                transcript.provider_seconds
+                if transcript.provider_seconds is not None
+                else audio_info["duration"]
+            )
+            estimated_cost = actual_seconds * cloud_model_price(model)
+            CLOUD_USAGE_LEDGER.commit(
+                reservation.reservation_id,
+                actual_seconds=actual_seconds,
+                estimated_cost_cny=estimated_cost,
+                outcome="completed",
+                metadata={"provider": transcript.provider, "model": model, "fallback": index > 0},
+            )
+            entries, transcript_info = transcript_entries(transcript)
+            if not entries:
+                raise ExtractionFailure(
+                    404,
+                    "Cloud ASR completed but returned no text.",
+                    "asr_empty",
+                )
+            transcript_info.update(
+                {
+                    "asr_mode": current_mode,
+                    "requested_asr_mode": mode,
+                    "fallback_used": index > 0,
+                    "fallback_failures": failures,
+                    "estimated_cost_cny": round(estimated_cost, 6),
+                    "audio_file_bytes": audio_info["size"],
+                    "audio_format": audio_info["format_name"],
+                    "audio_codec": audio_info["codec_name"],
+                    "audio_channels": audio_info["channels"],
+                    "audio_sample_rate": audio_info["sample_rate"],
+                }
+            )
+            return entries, transcript_info
+    finally:
+        CLOUD_SIGNED_AUDIO_STORE.revoke(token)
+
+    raise ExtractionFailure(
+        502,
+        "Cloud ASR did not produce a result.",
+        "asr_provider_failed",
+        retryable=True,
+    )
+
+
+def cloud_asr_subtitle(
+    req: ExtractRequest,
+    allow_cookie: bool,
+    prior_note: str | None = None,
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    ensure_cloud_asr_ready()
+    ensure_disk_space(ASR_TMP_DIR, min(BILI_MAX_DOWNLOAD_BYTES, 512 * 1024 * 1024))
+    url = normalize_input(req.input)
+    platform = detect_platform(url)
+    douyin_video: DouyinVideo | None = None
+    if platform == "douyin":
+        report_progress("checking_existing_subtitle", 18, "正在解析抖音视频信息")
+        try:
+            douyin_video = get_douyin_video(
+                url,
+                force_refresh=req.force_refresh and req.source == "asr",
+            )
+        except DouyinAdapterError as exc:
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+        view = ExtractionSource(
+            title=douyin_video.title,
+            video_id=douyin_video.video_id,
+            webpage_url=douyin_video.webpage_url,
+            tracks=[],
+            duration=douyin_video.duration,
+            platform="douyin",
+            author=douyin_video.author,
+        )
+    else:
+        report_progress("checking_existing_subtitle", 18, "正在解析 B站视频信息")
+        view = view_source(url, allow_cookie=allow_cookie)
+    duration = float(view.duration or 0)
+    if duration and duration > ASR_MAX_AUDIO_SECONDS:
+        raise ExtractionFailure(
+            413,
+            "Video duration exceeds the cloud ASR limit.",
+            "asr_duration_too_long",
+            terminal=True,
+        )
+    acquired = ASR_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        report_progress("asr_wait", 28, "正在等待语音识别资源")
+        acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+    if not acquired:
+        raise ExtractionFailure(
+            429,
+            "Cloud ASR queue wait timed out.",
+            "asr_busy",
+            retryable=True,
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="asr-cloud-", dir=str(ASR_TMP_DIR)) as tmp:
+            tmp_path = Path(tmp)
+            report_progress("downloading_audio", 35, "正在下载音轨")
+            if platform == "douyin" and douyin_video is not None:
+                try:
+                    media_path, info = download_douyin_media(douyin_video, tmp_path)
+                except DouyinAdapterError as exc:
+                    raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+            else:
+                media_path, info = download_audio_for_asr(
+                    url,
+                    allow_cookie=allow_cookie,
+                    tmp_dir=tmp_path,
+                    normalize=False,
+                )
+            entries, asr_info = transcribe_media_with_cloud(
+                media_path,
+                tmp_path,
+                language=req.lang,
+                mode=req.asr_mode,
+            )
+    finally:
+        ASR_SEMAPHORE.release()
+    note = "未找到可用的平台字幕，本次已使用阿里云百炼语音识别。"
+    if prior_note:
+        note = f"{redact_sensitive(prior_note)} 已改用阿里云百炼语音识别。"
+    meta = {
+        "title": view.title or info.get("title"),
+        "id": view.video_id or info.get("id"),
+        "webpage_url": view.webpage_url,
+        "source": "asr_aliyun",
+        "track_source_type": "asr_aliyun",
+        "cookie_used": allow_cookie and bool(cookie_header(True)),
+        "language": asr_info.get("detected_language") or req.lang,
+        "subtitle_format": "asr",
+        "warning": note,
+        "note": note,
+        "duration": duration or info.get("duration") or asr_info.get("audio_duration_seconds"),
+        "platform": platform,
+        "author": view.author or info.get("author"),
+        "session_mode": "anonymous_browser"
+        if platform == "douyin"
+        else ("bilibili_cookie" if allow_cookie else "anonymous"),
+        "quality": req.quality,
+        "asr_mode": asr_info.get("asr_mode"),
+        "requested_asr_mode": req.asr_mode,
+        "asr_provider": asr_info.get("provider"),
+        "asr_model": asr_info.get("model"),
+        "asr_task_id": asr_info.get("provider_task_id"),
+        "asr_provider_seconds": asr_info.get("provider_seconds"),
+        "asr_provider_latency_seconds": asr_info.get("provider_latency_seconds"),
+        "estimated_cost_cny": asr_info.get("estimated_cost_cny"),
+        "asr_fallback_used": asr_info.get("fallback_used", False),
+        "audio_download": info.get("audio_download"),
+        "audio_bandwidth": info.get("audio_bandwidth"),
+        "audio_quality_strategy": info.get("audio_quality_strategy"),
+        "audio_normalized_for_asr": True,
+        "available_tracks": [],
+        **asr_info,
+    }
+    return entries, meta
+
+
+def local_asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None = None) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     ensure_asr_ready()
     ensure_disk_space(ASR_TMP_DIR, min(BILI_MAX_DOWNLOAD_BYTES, 512 * 1024 * 1024))
     quality = effective_quality(req.quality, req.embedded_subtitles)
@@ -4670,6 +5431,23 @@ def asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str | None
     return entries, meta
 
 
+def asr_subtitle(
+    req: ExtractRequest,
+    allow_cookie: bool,
+    prior_note: str | None = None,
+) -> tuple[list[SubtitleEntry], dict[str, Any]]:
+    if cloud_asr_enabled():
+        return cloud_asr_subtitle(req, allow_cookie, prior_note)
+    if local_asr_enabled():
+        return local_asr_subtitle(req, allow_cookie, prior_note)
+    raise ExtractionFailure(
+        503,
+        "No ASR provider is enabled.",
+        "asr_disabled",
+        retryable=False,
+    )
+
+
 def upload_display_title(filename: str) -> str:
     title = Path(filename).stem.strip()
     return title[:120] or "uploaded_video"
@@ -4685,6 +5463,7 @@ def apply_upload_metadata(meta: dict[str, Any], req: UploadJobRequest) -> None:
     meta["requested_source"] = "embedded" if req.embedded_subtitles else "asr"
     meta["requested_use_cookie"] = False
     meta["requested_quality"] = req.quality
+    meta["requested_asr_mode"] = req.asr_mode
     meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
     meta["embedded_subtitles_requested"] = req.embedded_subtitles
     meta["cookie_enabled"] = cookie_enabled()
@@ -4725,7 +5504,17 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
             subtitle_info: dict[str, Any] = {}
 
             def transcribe_uploaded_video() -> tuple[list[SubtitleEntry], dict[str, Any]]:
-                ensure_asr_ready()
+                if cloud_asr_enabled():
+                    ensure_cloud_asr_ready()
+                elif local_asr_enabled():
+                    ensure_asr_ready()
+                else:
+                    raise ExtractionFailure(
+                        503,
+                        "No ASR provider is enabled.",
+                        "asr_disabled",
+                        retryable=False,
+                    )
                 acquired_asr = ASR_SEMAPHORE.acquire(blocking=False)
                 if not acquired_asr:
                     report_progress("asr_wait", 28, "正在等待语音识别资源")
@@ -4737,6 +5526,13 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                         "asr_busy",
                     )
                 try:
+                    if cloud_asr_enabled():
+                        return transcribe_media_with_cloud(
+                            media_path,
+                            media_path.parent,
+                            language=req.lang,
+                            mode=req.asr_mode,
+                        )
                     report_progress("download", 38, "正在提取并标准化音轨")
                     normalized_path = normalize_audio_for_asr(
                         media_path,
@@ -4781,13 +5577,18 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 raise ExtractionFailure(404, "The video did not produce readable subtitles.", reason)
 
             if asr_info:
-                source = "asr_local"
-                track_source_type = "asr_local"
+                cloud_result = asr_info.get("provider") == "aliyun"
+                source = "asr_aliyun" if cloud_result else "asr_local"
+                track_source_type = source
                 subtitle_format = "asr"
                 note = (
-                    "未识别到稳定的画面字幕，已自动改用精确语音识别。"
+                    "未识别到稳定的画面字幕，已自动改用云端语音识别。"
                     if req.embedded_subtitles
-                    else "本地上传视频已使用服务器语音识别生成字幕。"
+                    else (
+                        "上传视频已使用阿里云百炼语音识别生成字幕。"
+                        if cloud_result
+                        else "本地上传视频已使用服务器语音识别生成字幕。"
+                    )
                 )
             elif subtitle_info.get("subtitle_source") == "embedded_text_track":
                 source = "embedded_text"
@@ -4818,6 +5619,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 "author": None,
                 "session_mode": "local_upload",
                 "quality": quality,
+                "asr_mode": asr_info.get("asr_mode") or req.asr_mode,
                 "embedded_subtitles_requested": req.embedded_subtitles,
                 "ocr_fallback_to_asr": bool(req.embedded_subtitles and asr_info),
                 "asr_model": asr_info.get("model") or (profile["model"] if asr_info else None),
@@ -4843,6 +5645,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                 "cache_age_seconds": 0,
                 **subtitle_info,
                 **asr_public_diagnostics(asr_info),
+                **asr_info,
             }
             apply_upload_metadata(meta, req)
             meta["entry_count"] = len(entries)
@@ -4861,7 +5664,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
 def upload_extraction_payload(req: UploadJobRequest) -> dict[str, Any]:
     entries, meta = extract_uploaded_subtitle_data(req)
     content = render_entries(entries, req.format, meta)
-    return {
+    payload = {
         "ok": True,
         "format": req.format,
         "filename": safe_filename(meta.get("title"), req.format),
@@ -4869,6 +5672,10 @@ def upload_extraction_payload(req: UploadJobRequest) -> dict[str, Any]:
         "metadata": meta,
         "content": content,
     }
+    raw_content = rendered_raw_content(meta, req.format)
+    if raw_content is not None:
+        payload["raw_content"] = raw_content
+    return payload
 
 
 def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
@@ -4890,7 +5697,7 @@ def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
     apply_upload_metadata(meta, req)
     meta["entry_count"] = len(entries)
     meta["character_count"] = sum(len(entry.text) for entry in entries)
-    return {
+    payload = {
         "ok": True,
         "format": req.format,
         "filename": safe_filename(meta.get("title"), req.format),
@@ -4898,6 +5705,10 @@ def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
         "metadata": meta,
         "content": render_entries(entries, req.format, meta),
     }
+    raw_content = rendered_raw_content(meta, req.format)
+    if raw_content is not None:
+        payload["raw_content"] = raw_content
+    return payload
 
 
 def extraction_http_error(req: ExtractRequest, exc: ExtractionFailure, failures: list[dict[str, Any]]) -> HTTPException:
@@ -4959,6 +5770,7 @@ def extract_subtitle_uncached(req: ExtractRequest) -> tuple[list[SubtitleEntry],
     meta["requested_source"] = req.source
     meta["requested_use_cookie"] = req.use_cookie
     meta["requested_quality"] = req.quality
+    meta["requested_asr_mode"] = req.asr_mode
     meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
     meta["embedded_subtitles_requested"] = req.embedded_subtitles
     meta["cookie_enabled"] = cookie_enabled()
@@ -5008,6 +5820,7 @@ def extract_subtitle_data(req: ExtractRequest) -> tuple[list[SubtitleEntry], dic
     meta["requested_source"] = req.source
     meta["requested_use_cookie"] = req.use_cookie
     meta["requested_quality"] = req.quality
+    meta["requested_asr_mode"] = req.asr_mode
     meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
     meta["embedded_subtitles_requested"] = req.embedded_subtitles
     meta["cookie_enabled"] = cookie_enabled()
@@ -5043,7 +5856,7 @@ def safe_filename(title: str | None, fmt: str) -> str:
 
 def extraction_payload(req: ExtractRequest) -> dict[str, Any]:
     content, meta, fmt = extract_subtitle(req)
-    return {
+    payload = {
         "ok": True,
         "format": fmt,
         "filename": safe_filename(meta.get("title"), fmt),
@@ -5051,6 +5864,10 @@ def extraction_payload(req: ExtractRequest) -> dict[str, Any]:
         "metadata": meta,
         "content": content,
     }
+    raw_content = rendered_raw_content(meta, fmt)
+    if raw_content is not None:
+        payload["raw_content"] = raw_content
+    return payload
 
 
 def cached_extraction_payload(
@@ -5083,6 +5900,7 @@ def cached_extraction_payload(
     meta["requested_source"] = req.source
     meta["requested_use_cookie"] = req.use_cookie
     meta["requested_quality"] = req.quality
+    meta["requested_asr_mode"] = req.asr_mode
     meta["quality"] = effective_quality(req.quality, req.embedded_subtitles)
     meta["embedded_subtitles_requested"] = req.embedded_subtitles
     meta["cookie_enabled"] = cookie_enabled()
@@ -5090,7 +5908,7 @@ def cached_extraction_payload(
     meta["force_refresh"] = False
     meta.setdefault("platform", detect_platform(canonical))
     content = render_entries(entries, req.format, meta)
-    return {
+    payload = {
         "ok": True,
         "format": req.format,
         "filename": safe_filename(meta.get("title"), req.format),
@@ -5098,9 +5916,13 @@ def cached_extraction_payload(
         "metadata": meta,
         "content": content,
     }
+    raw_content = rendered_raw_content(meta, req.format)
+    if raw_content is not None:
+        payload["raw_content"] = raw_content
+    return payload
 
 
-def process_queued_job(
+def _process_queued_job(
     payload: dict[str, Any],
     update: Callable[[str, int, str], None],
 ) -> dict[str, Any]:
@@ -5137,6 +5959,18 @@ def process_queued_job(
         return extraction_payload(req)
 
 
+def process_queued_job(
+    payload: dict[str, Any],
+    update: Callable[[str, int, str], None],
+) -> dict[str, Any]:
+    try:
+        owner_id = int(payload.get("_owner_id") or 0) or None
+    except (TypeError, ValueError):
+        owner_id = None
+    with extraction_owner(owner_id):
+        return _process_queued_job(payload, update)
+
+
 JOB_MANAGER = JobManager(
     process_queued_job,
     max_pending=JOB_QUEUE_MAX_PENDING,
@@ -5144,6 +5978,7 @@ JOB_MANAGER = JobManager(
     max_records=JOB_MAX_RECORDS,
     worker_count=JOB_WORKER_COUNT,
     discarder=discard_job_payload,
+    state_path=JOB_STATE_DB_PATH,
 )
 
 
@@ -5182,17 +6017,19 @@ def submit_extraction_job(req: ExtractRequest, owner_id: int, idempotency_key: s
         }
     )
     cached_payload = cached_extraction_payload(canonical_req, canonical_input)
+    job_payload = canonical_req.model_dump(mode="json")
+    job_payload["_owner_id"] = owner_id
     try:
         if cached_payload is not None:
             job = JOB_MANAGER.submit_completed(
-                canonical_req.model_dump(mode="json"),
+                job_payload,
                 cached_payload,
                 owner_id=owner_id,
                 idempotency_key=idempotency_key,
             )
         else:
             job = JOB_MANAGER.submit(
-                canonical_req.model_dump(mode="json"),
+                job_payload,
                 owner_id=owner_id,
                 idempotency_key=idempotency_key,
             )
@@ -5273,6 +6110,7 @@ def upload_idempotency_fingerprint(
     lang: str | None,
     hotwords: str | None,
     quality: str,
+    asr_mode: str,
     embedded_subtitles: bool,
     force_refresh: bool,
     content_length: int | None,
@@ -5286,6 +6124,7 @@ def upload_idempotency_fingerprint(
             "lang": (lang or "").lower().replace("_", "-"),
             "hotwords_hash": asr_context_hash(hotwords),
             "quality": quality,
+            "asr_mode": asr_mode,
             "embedded_subtitles": embedded_subtitles,
             "force_refresh": force_refresh,
             "content_length": content_length,
@@ -5387,6 +6226,7 @@ async def stage_uploaded_video(
     embedded_subtitles: bool,
     force_refresh: bool,
     hotwords: str | None = None,
+    asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto",
 ) -> UploadJobRequest:
     safe_name, extension = safe_upload_filename(filename)
     content_length = request_content_length(request)
@@ -5441,6 +6281,7 @@ async def stage_uploaded_video(
             lang=lang,
             hotwords=sanitize_asr_context(hotwords),
             quality=quality,
+            asr_mode=asr_mode,
             embedded_subtitles=embedded_subtitles,
             force_refresh=force_refresh,
         )
@@ -5613,7 +6454,8 @@ async def account_session_middleware(request: Request, call_next: Callable[[Requ
 
     if path in {"/login", "/register"} and user is not None:
         return RedirectResponse(url="/", status_code=303)
-    if path not in PUBLIC_PATHS and not is_static and user is None:
+    is_provider_audio = path.startswith("/api/provider-audio/")
+    if path not in PUBLIC_PATHS and not is_static and not is_provider_audio and user is None:
         if path.startswith("/api/"):
             return JSONResponse(
                 status_code=401,
@@ -5638,11 +6480,12 @@ def startup() -> None:
     MEDIA_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(MEDIA_ARTIFACT_DIR, 0o700)
     cleanup_stale_asr_tmp()
-    cleanup_stale_media_artifacts(remove_all=True)
+    cleanup_stale_media_artifacts()
     cleanup_result_cache()
+    initialize_cloud_services()
     JOB_MANAGER.start()
     if (
-        env_bool("ASR_ENABLED", True)
+        local_asr_enabled()
         and env_bool("ASR_PERSISTENT_WORKER", True)
         and env_bool("ASR_PREWARM", True)
     ):
@@ -5653,6 +6496,9 @@ def startup() -> None:
 def shutdown() -> None:
     JOB_MANAGER.stop()
     stop_asr_worker()
+    close_cloud_providers()
+    if CLOUD_SIGNED_AUDIO_STORE is not None:
+        CLOUD_SIGNED_AUDIO_STORE.cleanup()
 
 
 @app.get("/api/health")
@@ -5685,7 +6531,8 @@ def health() -> dict[str, Any]:
         "cookie_enabled": cookie_enabled(),
         "cookie_configured": bool(configured_cookie_header()),
         "web_qr_login_enabled": web_qr_login_enabled(),
-        "asr_enabled": env_bool("ASR_ENABLED", True),
+        "asr_enabled": any_asr_enabled(),
+        "local_asr_enabled": local_asr_enabled(),
         "asr_model": DEFAULT_ASR_MODEL,
         "asr_accurate_model": ACCURATE_ASR_MODEL,
         "asr_persistent_worker": env_bool("ASR_PERSISTENT_WORKER", True),
@@ -5709,7 +6556,8 @@ def health() -> dict[str, Any]:
         "default_request": {
             "quality": "accurate",
             "language": "zh",
-            "allow_platform_ai": False,
+            "allow_platform_ai": True,
+            "asr_mode": "auto",
         },
         "extraction_modes": {
             "fast": {
@@ -5740,7 +6588,7 @@ def health() -> dict[str, Any]:
             "max_frames": OCR_MAX_FRAMES,
         },
         "uploads": {
-            "enabled": env_bool("ASR_ENABLED", True),
+            "enabled": any_asr_enabled(),
             "max_bytes": UPLOAD_MAX_BYTES,
             "client_max_bytes": PUBLIC_UPLOAD_MAX_BYTES,
             "edge_limited": PUBLIC_UPLOAD_MAX_BYTES < UPLOAD_MAX_BYTES,
@@ -5775,12 +6623,57 @@ def health() -> dict[str, Any]:
             },
         },
         "jobs": JOB_MANAGER.stats(),
+        "cloud_asr": {
+            "enabled": cloud_asr_enabled(),
+            "configured": bool(
+                cloud_asr_enabled()
+                and CLOUD_ASR_INIT_ERROR is None
+                and CLOUD_SIGNED_AUDIO_STORE is not None
+                and CLOUD_USAGE_LEDGER is not None
+            ),
+            "state": (
+                "ready"
+                if cloud_asr_enabled() and CLOUD_ASR_INIT_ERROR is None
+                else ("disabled" if not cloud_asr_enabled() else "configuration_error")
+            ),
+            "provider": "aliyun",
+            "default_model": CLOUD_ASR_DEFAULT_MODEL,
+            "economy_model": CLOUD_ASR_ECONOMY_MODEL,
+            "allow_paid": env_bool("ASR_ALLOW_PAID", False),
+            "monthly_free_seconds": CLOUD_ASR_MONTHLY_FREE_SECONDS,
+            "usage": cloud_usage_stats(),
+        },
         "auth": {
             "enabled": True,
             "registration_enabled": invite_configured(),
             "session_ttl_days": session_ttl_seconds() // 86400,
         },
     }
+
+
+@app.get("/api/provider-audio/{token}")
+def api_provider_audio(
+    token: str,
+    expires: int = Query(..., gt=0),
+    signature: str = Query(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
+) -> FileResponse:
+    if CLOUD_SIGNED_AUDIO_STORE is None:
+        raise HTTPException(status_code=404, detail={"reason": "signed_audio_not_found"})
+    try:
+        record = CLOUD_SIGNED_AUDIO_STORE.resolve(token, expires, signature)
+    except SignedAudioError as exc:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "signed_audio_expired", "message": "临时音频链接已失效。"},
+        ) from exc
+    return FileResponse(
+        record.path,
+        media_type=record.content_type,
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/api/auth/config")
@@ -5826,6 +6719,58 @@ def api_auth_login(req: LoginRequest) -> JSONResponse:
 def api_auth_me(request: Request) -> dict[str, Any]:
     user = require_auth_user(request)
     return {"ok": True, "user": {"id": user.user_id, "username": user.username}}
+
+
+@app.get("/api/bilibili/pages")
+def api_bilibili_pages(
+    input: str = Query(..., min_length=2, max_length=MAX_INPUT_LENGTH),
+    use_cookie: bool = Query(False),
+) -> dict[str, Any]:
+    try:
+        canonical = normalize_input(input)
+        if detect_platform(canonical) != "bilibili":
+            raise ExtractionFailure(
+                400,
+                "Only Bilibili videos have selectable pages.",
+                "unsupported_platform",
+                terminal=True,
+            )
+        bvid, canonical_url, data, selected_page, _ = bili_view_context(
+            canonical,
+            cookie_allowed(use_cookie),
+        )
+    except ExtractionFailure as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=extraction_error_detail("bilibili_pages", exc),
+        ) from exc
+    pages = [
+        {
+            "page": int(item.get("page") or index),
+            "cid": int(item.get("cid") or 0),
+            "title": str(item.get("part") or f"P{index}")[:160],
+            "duration": float(item.get("duration") or 0) or None,
+        }
+        for index, item in enumerate(data.get("pages") or [], 1)
+        if isinstance(item, dict) and item.get("cid")
+    ]
+    if not pages and selected_page:
+        pages = [
+            {
+                "page": 1,
+                "cid": int(selected_page.get("cid") or 0),
+                "title": str(selected_page.get("part") or data.get("title") or "P1")[:160],
+                "duration": float(selected_page.get("duration") or 0) or None,
+            }
+        ]
+    return {
+        "ok": True,
+        "bvid": bvid,
+        "title": str(data.get("title") or "")[:200],
+        "base_url": f"https://www.bilibili.com/video/{quote(bvid)}",
+        "current_page": bili_page_number(canonical_url),
+        "pages": pages,
+    }
 
 
 @app.post("/api/auth/logout")
@@ -5967,6 +6912,7 @@ async def api_create_upload_job(
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     ),
     quality: Literal["fast", "accurate"] = Query("accurate"),
+    asr_mode: Literal["auto", "high_accuracy", "economy"] = Query("auto"),
     embedded_subtitles: bool = Query(False),
     force_refresh: bool = Query(False),
 ) -> JSONResponse:
@@ -5981,6 +6927,7 @@ async def api_create_upload_job(
             lang,
             hotwords,
             quality,
+            asr_mode,
             embedded_subtitles,
             force_refresh,
             content_length,
@@ -6018,11 +6965,13 @@ async def api_create_upload_job(
         lang=lang,
         hotwords=hotwords,
         quality=quality,
+        asr_mode=asr_mode,
         embedded_subtitles=embedded_subtitles,
         force_refresh=force_refresh,
     )
     transferred = False
     payload = upload_req.model_dump(mode="json")
+    payload["_owner_id"] = user.user_id
     try:
         cached_payload = cached_upload_payload(upload_req)
         if cached_payload is not None:

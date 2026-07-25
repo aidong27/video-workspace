@@ -11,6 +11,10 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app import main
+from app.asr.base import Transcript, TranscriptSegment
+from app.asr.mock import MockAsrProvider
+from app.asr.signing import SignedAudioStore
+from app.asr.usage import UsageLedger
 
 
 class RequestDefaultsTests(unittest.TestCase):
@@ -23,13 +27,156 @@ class RequestDefaultsTests(unittest.TestCase):
         self.assertEqual(parsed["VmSwap"], 2048)
         self.assertNotIn("Broken", parsed)
 
-    def test_subtitle_requests_default_to_local_quality_first_settings(self) -> None:
+    def test_subtitle_requests_default_to_platform_first_cloud_settings(self) -> None:
         request = main.ExtractRequest(input="BV14jFvzbEvj")
 
         self.assertEqual(request.source, "auto")
         self.assertEqual(request.quality, "accurate")
         self.assertEqual(request.lang, "zh")
-        self.assertFalse(request.allow_platform_ai)
+        self.assertTrue(request.allow_platform_ai)
+        self.assertEqual(request.asr_mode, "auto")
+
+
+class CloudAsrPipelineTests(unittest.TestCase):
+    def test_cloud_configuration_refuses_unbounded_free_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "CLOUD_ASR_ENABLED": "true",
+                "ASR_ALLOW_PAID": "false",
+                "DASHSCOPE_API_KEY": "test-key",
+                "DASHSCOPE_BASE_URL": "https://ws-test.cn-beijing.maas.aliyuncs.com/api/v1",
+                "DASHSCOPE_WORKSPACE_ID": "ws-test",
+                "AUDIO_SIGNING_SECRET": "s" * 32,
+                "PUBLIC_BASE_URL": "https://caption.example.test",
+            },
+        ), patch.object(
+            main, "CLOUD_ASR_MONTHLY_FREE_SECONDS", 0
+        ), patch.object(
+            main, "CLOUD_ASR_MONTHLY_HARD_LIMIT_SECONDS", 100
+        ), patch.object(
+            main, "CLOUD_ASR_DAILY_HARD_LIMIT_SECONDS", 100
+        ), patch.object(
+            main, "CLOUD_ASR_USER_DAILY_HARD_LIMIT_SECONDS", 100
+        ), patch.object(
+            main, "CLOUD_ASR_USAGE_DB_PATH", Path(directory) / "usage.db"
+        ):
+            try:
+                with self.assertLogs("app.main", level="ERROR") as captured:
+                    main.initialize_cloud_services()
+                self.assertEqual(main.CLOUD_ASR_INIT_ERROR, "ValueError")
+                self.assertIsNone(main.CLOUD_SIGNED_AUDIO_STORE)
+                self.assertNotIn("test-key", "\n".join(captured.output))
+            finally:
+                main.CLOUD_ASR_INIT_ERROR = None
+                main.CLOUD_SIGNED_AUDIO_STORE = None
+                main.CLOUD_USAGE_LEDGER = None
+
+    def test_cloud_pipeline_records_usage_and_revokes_signed_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            store = SignedAudioStore(
+                root=root,
+                public_base_url="https://caption.example.test",
+                secret="s" * 32,
+            )
+            ledger = UsageLedger(
+                root / "usage.db",
+                daily_limit_seconds=100,
+                monthly_limit_seconds=1000,
+                user_daily_limit_seconds=60,
+            )
+            provider = MockAsrProvider(
+                Transcript(
+                    provider="aliyun",
+                    model="qwen3-asr-flash-filetrans",
+                    language="zh",
+                    duration_ms=5500,
+                    provider_seconds=5.5,
+                    segments=[
+                        TranscriptSegment(0, 1200, "测试字幕"),
+                        TranscriptSegment(1000, 1800, "测试字幕"),
+                    ],
+                )
+            )
+            with patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", store), patch.object(
+                main, "CLOUD_USAGE_LEDGER", ledger
+            ), patch.object(main, "ensure_cloud_asr_ready"), patch.object(
+                main,
+                "prepare_audio_for_cloud",
+                return_value=(
+                    audio,
+                    {
+                        "duration": 5.5,
+                        "size": 5,
+                        "format_name": "mp3",
+                        "codec_name": "mp3",
+                        "channels": 1,
+                        "sample_rate": 16000,
+                    },
+                ),
+            ), patch.object(
+                main, "cloud_provider_for_mode", return_value=provider
+            ), main.extraction_owner(7):
+                entries, metadata = main.transcribe_media_with_cloud(
+                    audio,
+                    root,
+                    language="zh",
+                    mode="auto",
+                )
+
+            self.assertEqual([entry.text for entry in entries], ["测试字幕"])
+            self.assertEqual(metadata["provider_seconds"], 5.5)
+            self.assertEqual(metadata["asr_mode"], "high_accuracy")
+            self.assertGreater(metadata["estimated_cost_cny"], 0)
+            self.assertEqual(store.records, {})
+            self.assertEqual(ledger.stats()["daily_seconds"], 5.5)
+
+    def test_cloud_pipeline_rejects_before_provider_when_quota_is_insufficient(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            store = SignedAudioStore(
+                root=root,
+                public_base_url="https://caption.example.test",
+                secret="s" * 32,
+            )
+            ledger = UsageLedger(
+                root / "usage.db",
+                daily_limit_seconds=2,
+                monthly_limit_seconds=2,
+                user_daily_limit_seconds=2,
+            )
+            provider = MockAsrProvider(
+                Transcript("aliyun", "qwen", "zh", 5000, [])
+            )
+            with patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", store), patch.object(
+                main, "CLOUD_USAGE_LEDGER", ledger
+            ), patch.object(main, "ensure_cloud_asr_ready"), patch.object(
+                main,
+                "prepare_audio_for_cloud",
+                return_value=(
+                    audio,
+                    {
+                        "duration": 5,
+                        "size": 5,
+                        "format_name": "mp3",
+                        "codec_name": "mp3",
+                        "channels": 1,
+                        "sample_rate": 16000,
+                    },
+                ),
+            ), patch.object(
+                main, "cloud_provider_for_mode", return_value=provider
+            ), self.assertRaises(main.ExtractionFailure) as raised:
+                main.transcribe_media_with_cloud(audio, root, language="zh", mode="auto")
+
+            self.assertEqual(raised.exception.reason, "asr_daily_limit_reached")
+            self.assertEqual(provider.submissions, [])
+            self.assertEqual(store.records, {})
 
     def test_upload_requests_use_the_same_quality_and_language_defaults(self) -> None:
         request = main.UploadJobRequest(
@@ -42,6 +189,7 @@ class RequestDefaultsTests(unittest.TestCase):
 
         self.assertEqual(request.quality, "accurate")
         self.assertEqual(request.lang, "zh")
+        self.assertEqual(request.asr_mode, "auto")
 
 
 class ResultCacheTests(unittest.TestCase):
@@ -84,6 +232,20 @@ class ResultCacheTests(unittest.TestCase):
         self.assertEqual(main.effective_quality("fast", embedded_subtitles=True), "accurate")
         self.assertEqual(main.asr_profile("fast")["model"], main.DEFAULT_ASR_MODEL)
         self.assertEqual(main.asr_profile("accurate")["model"], main.ACCURATE_ASR_MODEL)
+
+    def test_cache_key_separates_cloud_provider_modes(self) -> None:
+        canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
+        high_accuracy = main.ExtractRequest(
+            input=canonical,
+            source="asr",
+            asr_mode="high_accuracy",
+        )
+        economy = high_accuracy.model_copy(update={"asr_mode": "economy"})
+
+        self.assertNotEqual(
+            main.result_cache_key(high_accuracy, canonical),
+            main.result_cache_key(economy, canonical),
+        )
 
     def test_cache_key_includes_hashed_hotwords_and_audio_filter(self) -> None:
         canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
@@ -262,7 +424,9 @@ class UploadExtractionTests(unittest.TestCase):
         request = self.staged_request().model_copy(update={"hotwords": "MQTT, ESP32"})
         directory = main.ASR_TMP_DIR / f"asr-upload-{request.upload_token}"
         updates = []
-        with patch.object(main, "ensure_asr_ready"), patch.object(
+        with patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+            main, "ensure_asr_ready"
+        ), patch.object(
             main,
             "probe_uploaded_media",
             return_value={"duration": 12.5, "format_name": "mov,mp4"},
@@ -385,7 +549,9 @@ class UploadExtractionTests(unittest.TestCase):
                     "ocr_failure_reason": "ocr_failed",
                 },
             ),
-        ), patch.object(main, "ensure_asr_ready"), patch.object(
+        ), patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+            main, "ensure_asr_ready"
+        ), patch.object(
             main,
             "normalize_audio_for_asr",
             side_effect=lambda path, *_args, **_kwargs: path,
@@ -730,7 +896,9 @@ class ResourceSafetyTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             tmp_dir = Path(directory)
-            with patch.object(main, "ASR_TMP_DIR", tmp_dir), patch.object(
+            with patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+                main, "ASR_TMP_DIR", tmp_dir
+            ), patch.object(
                 main, "ASR_SEMAPHORE", semaphore
             ), patch.object(main, "ensure_asr_ready"), patch.object(
                 main, "ensure_disk_space"
@@ -881,6 +1049,28 @@ class MediaArtifactTests(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertFalse(directory.exists())
         self.assertNotIn(token, main.MEDIA_RESERVATIONS)
+
+    def test_cleanup_preserves_unexpired_finalized_artifact(self) -> None:
+        token = "e" * 32
+        directory = main.media_artifact_directory(token)
+        directory.mkdir(parents=True)
+        artifact = directory / "artifact.mp4"
+        artifact.write_bytes(b"active")
+        main.write_media_artifact_metadata(
+            directory,
+            {
+                "artifact_token": token,
+                "owner_id": 7,
+                "stored_name": artifact.name,
+                "size": artifact.stat().st_size,
+                "expires_at": time.time() + 300,
+            },
+        )
+
+        removed = main.cleanup_stale_media_artifacts()
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(artifact.is_file())
 
 
 class BilibiliRedirectAndCookieTests(unittest.TestCase):
@@ -1211,6 +1401,18 @@ class BilibiliCookieFallbackTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_raw_and_normalized_cloud_variants_render_independently(self) -> None:
+        metadata = {
+            "title": "测试",
+            "raw_entries": [
+                {"start": 0.0, "end": 1.0, "text": "原始  文本"},
+            ],
+        }
+        normalized = [main.SubtitleEntry(0.0, 1.0, "整理文本")]
+
+        self.assertEqual(main.render_entries(normalized, "txt", metadata), "整理文本\n")
+        self.assertEqual(main.rendered_raw_content(metadata, "txt"), "原始  文本\n")
+
     def test_sensitive_values_and_local_paths_are_redacted(self) -> None:
         value = (
             "failed at /opt/private/video.mp4 and C:\\Users\\name\\secret.txt "

@@ -11,6 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import main
+from app.asr.signing import SignedAudioStore
 
 
 class ApiIntegrationTests(unittest.TestCase):
@@ -36,6 +37,10 @@ class ApiIntegrationTests(unittest.TestCase):
             main.MEDIA_STAGING_MAX_BYTES,
             main.MEDIA_ARTIFACT_TTL_SECONDS,
         )
+        self.original_job_state = (
+            main.JOB_MANAGER.state_path,
+            main.JOB_MANAGER._restored,
+        )
         main.ASR_TMP_DIR = root / "tmp"
         main.ASR_MODEL_DIR = root / "models"
         main.ASR_CACHE_DIR = root / "cache"
@@ -45,6 +50,8 @@ class ApiIntegrationTests(unittest.TestCase):
         main.MEDIA_MAX_BYTES = 1024
         main.MEDIA_STAGING_MAX_BYTES = 2048
         main.MEDIA_ARTIFACT_TTL_SECONDS = 3600
+        main.JOB_MANAGER.state_path = root / "cache" / "jobs.db"
+        main.JOB_MANAGER._restored = False
         self.original_env = {
             key: os.environ.get(key)
             for key in (
@@ -103,6 +110,7 @@ class ApiIntegrationTests(unittest.TestCase):
             main.MEDIA_STAGING_MAX_BYTES,
             main.MEDIA_ARTIFACT_TTL_SECONDS,
         ) = self.original_media_limits
+        main.JOB_MANAGER.state_path, main.JOB_MANAGER._restored = self.original_job_state
         self.tmp.cleanup()
 
     def test_job_submission_is_idempotent_and_legacy_get_is_retired(self) -> None:
@@ -142,7 +150,14 @@ class ApiIntegrationTests(unittest.TestCase):
 
     def test_public_file_response_and_health_work_on_new_starlette(self) -> None:
         login = self.client.get("/login")
-        with patch.dict(os.environ, {"ASR_AUDIO_FILTER": "private-filter-value"}):
+        with patch.dict(
+            os.environ,
+            {
+                "ASR_AUDIO_FILTER": "private-filter-value",
+                "DASHSCOPE_API_KEY": "private-api-key-value",
+                "DASHSCOPE_WORKSPACE_ID": "private-workspace-value",
+            },
+        ):
             health = self.client.get("/api/health")
         self.assertEqual(login.status_code, 200)
         self.assertIn("text/html", login.headers["content-type"])
@@ -157,6 +172,8 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertIn("ffmpeg_available", health.json())
         self.assertTrue(health.json()["asr_single_model_instance"])
         self.assertEqual(health.json()["default_request"]["quality"], "accurate")
+        self.assertEqual(health.json()["default_request"]["asr_mode"], "auto")
+        self.assertTrue(health.json()["default_request"]["allow_platform_ai"])
         self.assertTrue(health.json()["asr_audio_filter_enabled"])
         self.assertEqual(health.json()["uploads"]["client_max_bytes"], main.PUBLIC_UPLOAD_MAX_BYTES)
         self.assertEqual(
@@ -168,6 +185,57 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertNotIn("AUTH_DB_PATH", encoded)
         self.assertNotIn("INVITE_CODE_HASH", encoded)
         self.assertNotIn("private-filter-value", encoded)
+        self.assertNotIn("private-api-key-value", encoded)
+        self.assertNotIn("private-workspace-value", encoded)
+
+    def test_signed_provider_audio_is_public_short_lived_and_revocable(self) -> None:
+        audio = main.ASR_TMP_DIR / "asr-cloud-test" / "provider-audio.mp3"
+        audio.parent.mkdir(parents=True)
+        audio.write_bytes(b"temporary-audio")
+        store = SignedAudioStore(
+            root=main.ASR_TMP_DIR,
+            public_base_url="https://testserver",
+            secret="s" * 32,
+        )
+        token, url = store.register(audio)
+        path = url.removeprefix("https://testserver")
+        with patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", store):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, b"temporary-audio")
+            self.assertEqual(response.headers["cache-control"], "private, no-store, max-age=0")
+            store.revoke(token)
+            expired = self.client.get(path)
+        self.assertEqual(expired.status_code, 410)
+
+    def test_bilibili_pages_endpoint_returns_sanitized_page_choices(self) -> None:
+        page_data = {
+            "title": "合集",
+            "pages": [
+                {"page": 1, "cid": 11, "part": "第一集", "duration": 60},
+                {"page": 2, "cid": 22, "part": "第二集", "duration": 70},
+            ],
+        }
+        with patch.object(
+            main,
+            "normalize_input",
+            return_value="https://www.bilibili.com/video/BV14jFvzbEvj?p=2",
+        ), patch.object(
+            main,
+            "bili_view_context",
+            return_value=(
+                "BV14jFvzbEvj",
+                "https://www.bilibili.com/video/BV14jFvzbEvj?p=2",
+                page_data,
+                page_data["pages"][1],
+                22,
+            ),
+        ):
+            response = self.client.get("/api/bilibili/pages?input=BV14jFvzbEvj%3Fp%3D2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["current_page"], 2)
+        self.assertEqual(response.json()["pages"][1]["cid"], 22)
+        self.assertNotIn("cookie", json.dumps(response.json()).lower())
 
     def test_unknown_job_reports_restart_or_expiry(self) -> None:
         response = self.client.get(f"/api/jobs/{'0' * 32}")
@@ -359,15 +427,17 @@ class ApiIntegrationTests(unittest.TestCase):
 
 
 class FrontendRecoveryTests(unittest.TestCase):
-    def test_frontend_defaults_to_accurate_chinese_without_platform_ai(self) -> None:
+    def test_frontend_defaults_to_auto_cloud_chinese_with_platform_subtitles(self) -> None:
         page = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-        self.assertIn('name="quality" value="accurate" checked', page)
-        self.assertNotIn('id="allow-platform-ai" type="checkbox" role="switch" checked', page)
+        self.assertIn('name="asr-mode" value="auto" checked', page)
+        self.assertIn('name="asr-mode" value="high_accuracy"', page)
+        self.assertIn('name="asr-mode" value="economy"', page)
+        self.assertIn('id="allow-platform-ai" type="checkbox" role="switch" checked', page)
         self.assertIn('<option value="zh" selected>中文</option>', page)
-        self.assertIn('payload.quality || "accurate"', script)
-        self.assertIn('payload.allow_platform_ai === true', script)
+        self.assertIn('asr_mode: selectedAsrMode()', script)
+        self.assertIn('payload.allow_platform_ai !== false', script)
         self.assertIn('X-ASR-Hotwords', script)
 
     def test_expired_backend_job_clears_saved_frontend_state(self) -> None:
