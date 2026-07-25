@@ -57,12 +57,16 @@ from app.asr.usage import UsageLedger, UsageLimitExceeded
 from app.auth import (
     AuthFailure,
     SESSION_COOKIE_NAME,
+    account_summary,
     auth_error,
+    change_password,
     clear_session_cookie,
     create_session,
     delete_session,
+    delete_user_sessions,
     initialize_auth_db,
     invite_configured,
+    max_sessions_per_user,
     register_user,
     require_auth_user,
     resolve_session,
@@ -112,7 +116,7 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.2")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.3")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -315,9 +319,10 @@ try:
     )
 except ValueError:
     CLOUD_ASR_PARAFORMER_PRICE_PER_SECOND = 0.00008
-RESULT_CACHE_VERSION = 10
+RESULT_CACHE_VERSION = 11
 ASR_PIPELINE_VERSION = 2
 CLOUD_ASR_PIPELINE_VERSION = 2
+ASR_SELECTION_VERSION = 1
 ASR_PROMPT_VERSION = 1
 ASR_VAD_PROFILE_VERSION = 1
 ASR_AUDIO_FILTER_VERSION = 1
@@ -494,6 +499,11 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 @dataclass
 class SubtitleTrack:
     source_type: str
@@ -634,6 +644,43 @@ def cloud_asr_enabled() -> bool:
 
 def any_asr_enabled() -> bool:
     return cloud_asr_enabled() or local_asr_enabled()
+
+
+def selected_asr_backend(mode: str) -> Literal["local", "cloud"] | None:
+    if mode in {"high_accuracy", "economy"}:
+        return "cloud" if cloud_asr_enabled() else None
+    if local_asr_enabled():
+        return "local"
+    if cloud_asr_enabled():
+        return "cloud"
+    return None
+
+
+def asr_unavailable_failure(mode: str) -> ExtractionFailure:
+    if mode in {"high_accuracy", "economy"}:
+        return ExtractionFailure(
+            503,
+            "The selected cloud ASR mode is not configured.",
+            "asr_provider_not_configured",
+            retryable=False,
+        )
+    return ExtractionFailure(
+        503,
+        "No ASR provider is enabled.",
+        "asr_disabled",
+        retryable=False,
+    )
+
+
+def ensure_selected_asr_ready(mode: str) -> Literal["local", "cloud"]:
+    backend = selected_asr_backend(mode)
+    if backend == "local":
+        ensure_asr_ready()
+        return backend
+    if backend == "cloud":
+        ensure_cloud_asr_ready()
+        return backend
+    raise asr_unavailable_failure(mode)
 
 
 def cloud_model_for_mode(mode: str) -> str:
@@ -1374,11 +1421,14 @@ def result_cache_key(req: ExtractRequest, canonical_input: str) -> str:
         "allow_platform_ai": req.allow_platform_ai,
         "quality": quality,
         "asr_mode": req.asr_mode,
+        "asr_backend": selected_asr_backend(req.asr_mode),
+        "asr_selection_version": ASR_SELECTION_VERSION,
         "embedded_subtitles": req.embedded_subtitles,
         "cookie": cookie_fingerprint,
         "cloud_asr_pipeline_version": CLOUD_ASR_PIPELINE_VERSION,
         "cloud_asr_model": cloud_model_for_mode(req.asr_mode),
         "cloud_asr_enabled": cloud_asr_enabled(),
+        "local_asr_enabled": local_asr_enabled(),
         "asr_model": profile["model"],
         "asr_pipeline_version": ASR_PIPELINE_VERSION,
         "asr_compute_type": profile["compute_type"],
@@ -1417,10 +1467,13 @@ def upload_result_cache_key(req: UploadJobRequest) -> str:
         "lang": (req.lang or "").strip().lower(),
         "quality": quality,
         "asr_mode": req.asr_mode,
+        "asr_backend": selected_asr_backend(req.asr_mode),
+        "asr_selection_version": ASR_SELECTION_VERSION,
         "embedded_subtitles": req.embedded_subtitles,
         "cloud_asr_pipeline_version": CLOUD_ASR_PIPELINE_VERSION,
         "cloud_asr_model": cloud_model_for_mode(req.asr_mode),
         "cloud_asr_enabled": cloud_asr_enabled(),
+        "local_asr_enabled": local_asr_enabled(),
         "asr_model": profile["model"],
         "asr_pipeline_version": ASR_PIPELINE_VERSION,
         "asr_compute_type": profile["compute_type"],
@@ -4952,17 +5005,7 @@ def video_pixel_subtitle(
         fallback_asr_info: dict[str, Any] = {}
         if not entries and media_info.get("has_audio"):
             report_progress("ocr_fallback", 70, "画面字幕不足，正在使用精确语音识别补救")
-            if cloud_asr_enabled():
-                ensure_cloud_asr_ready()
-            elif local_asr_enabled():
-                ensure_asr_ready()
-            else:
-                raise ExtractionFailure(
-                    503,
-                    "No ASR provider is enabled.",
-                    "asr_disabled",
-                    retryable=False,
-                )
+            backend = ensure_selected_asr_ready(req.asr_mode)
             acquired = ASR_SEMAPHORE.acquire(blocking=False)
             if not acquired:
                 report_progress("asr_wait", 72, "正在等待精确语音识别资源")
@@ -4970,7 +5013,7 @@ def video_pixel_subtitle(
             if not acquired:
                 raise ExtractionFailure(429, "ASR wait exceeded the queue timeout.", "asr_busy")
             try:
-                if cloud_asr_enabled():
+                if backend == "cloud":
                     entries, fallback_asr_info = transcribe_media_with_cloud(
                         media_path,
                         tmp_path,
@@ -5487,6 +5530,7 @@ def local_asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str 
         "author": view.author or info.get("author"),
         "session_mode": "anonymous_browser" if platform == "douyin" else ("bilibili_cookie" if allow_cookie else "anonymous"),
         "quality": quality,
+        "asr_mode": req.asr_mode,
         "embedded_subtitles_requested": req.embedded_subtitles,
         "asr_model": asr_info.get("model") or profile["model"],
         "asr_compute_type": asr_info.get("compute_type") or profile["compute_type"],
@@ -5514,16 +5558,12 @@ def asr_subtitle(
     allow_cookie: bool,
     prior_note: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
-    if cloud_asr_enabled():
+    backend = selected_asr_backend(req.asr_mode)
+    if backend == "cloud":
         return cloud_asr_subtitle(req, allow_cookie, prior_note)
-    if local_asr_enabled():
+    if backend == "local":
         return local_asr_subtitle(req, allow_cookie, prior_note)
-    raise ExtractionFailure(
-        503,
-        "No ASR provider is enabled.",
-        "asr_disabled",
-        retryable=False,
-    )
+    raise asr_unavailable_failure(req.asr_mode)
 
 
 def upload_display_title(filename: str) -> str:
@@ -5582,17 +5622,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
             subtitle_info: dict[str, Any] = {}
 
             def transcribe_uploaded_video() -> tuple[list[SubtitleEntry], dict[str, Any]]:
-                if cloud_asr_enabled():
-                    ensure_cloud_asr_ready()
-                elif local_asr_enabled():
-                    ensure_asr_ready()
-                else:
-                    raise ExtractionFailure(
-                        503,
-                        "No ASR provider is enabled.",
-                        "asr_disabled",
-                        retryable=False,
-                    )
+                backend = ensure_selected_asr_ready(req.asr_mode)
                 acquired_asr = ASR_SEMAPHORE.acquire(blocking=False)
                 if not acquired_asr:
                     report_progress("asr_wait", 28, "正在等待语音识别资源")
@@ -5604,7 +5634,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                         "asr_busy",
                     )
                 try:
-                    if cloud_asr_enabled():
+                    if backend == "cloud":
                         return transcribe_media_with_cloud(
                             media_path,
                             media_path.parent,
@@ -6636,6 +6666,21 @@ def health() -> dict[str, Any]:
             "language": "zh",
             "allow_platform_ai": True,
             "asr_mode": "auto",
+            "asr_backend": selected_asr_backend("auto"),
+        },
+        "asr_modes": {
+            "auto": {
+                "backend": selected_asr_backend("auto"),
+                "label": "local_base",
+            },
+            "high_accuracy": {
+                "backend": selected_asr_backend("high_accuracy"),
+                "label": "cloud_qwen",
+            },
+            "economy": {
+                "backend": selected_asr_backend("economy"),
+                "label": "cloud_paraformer",
+            },
         },
         "extraction_modes": {
             "fast": {
@@ -6736,6 +6781,7 @@ def health() -> dict[str, Any]:
             "enabled": True,
             "registration_enabled": invite_configured(),
             "session_ttl_days": session_ttl_seconds() // 86400,
+            "max_sessions_per_user": max_sessions_per_user(),
         },
     }
 
@@ -6814,7 +6860,54 @@ def api_auth_login(req: LoginRequest) -> JSONResponse:
 @app.get("/api/auth/me")
 def api_auth_me(request: Request) -> dict[str, Any]:
     user = require_auth_user(request)
-    return {"ok": True, "user": {"id": user.user_id, "username": user.username}}
+    try:
+        summary = account_summary(user.user_id)
+    except AuthFailure as exc:
+        raise auth_error(exc) from exc
+    return {
+        "ok": True,
+        "user": {
+            "id": user.user_id,
+            "username": user.username,
+            **summary,
+        },
+    }
+
+
+@app.post("/api/auth/change-password")
+def api_auth_change_password(req: ChangePasswordRequest, request: Request) -> JSONResponse:
+    user = require_auth_user(request)
+    try:
+        updated_user = change_password(
+            user.user_id,
+            req.current_password,
+            req.new_password,
+        )
+        token, expires_at = create_session(updated_user)
+    except AuthFailure as exc:
+        raise auth_error(exc) from exc
+    response = JSONResponse(
+        {
+            "ok": True,
+            "message": "密码已更新，其他设备上的登录已退出。",
+            "user": {"id": updated_user.user_id, "username": updated_user.username},
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+    set_session_cookie(response, token, expires_at)
+    return response
+
+
+@app.post("/api/auth/logout-all")
+def api_auth_logout_all(request: Request) -> JSONResponse:
+    user = require_auth_user(request)
+    delete_user_sessions(user.user_id)
+    response = JSONResponse(
+        {"ok": True, "message": "所有设备均已退出登录。"},
+        headers={"Cache-Control": "no-store"},
+    )
+    clear_session_cookie(response)
+    return response
 
 
 @app.get("/api/bilibili/pages")

@@ -24,6 +24,9 @@
     sourceFieldGroup: $("source-field-group"),
     qualityFieldGroup: $("quality-field-group"),
     qualityCaption: $("quality-caption"),
+    privacyNote: $("privacy-note"),
+    asrAutoTitle: $("asr-auto-title"),
+    asrAutoDetail: $("asr-auto-detail"),
     embeddedSubtitleRow: $("embedded-subtitle-row"),
     embeddedSubtitles: $("embedded-subtitles"),
     subtitleFormatGrid: $("subtitle-format-grid"),
@@ -53,8 +56,29 @@
     uploadChip: $("upload-chip"),
     accountArea: $("account-area"),
     accountAvatar: $("account-avatar"),
+    accountAvatarLarge: $("account-avatar-large"),
     accountName: $("account-name"),
+    accountTrigger: $("account-trigger"),
+    accountPopover: $("account-popover"),
+    accountPopoverName: $("account-popover-name"),
+    accountCreatedAt: $("account-created-at"),
+    accountSessionSummary: $("account-session-summary"),
+    openPasswordDialog: $("open-password-dialog"),
+    logoutAllDevices: $("logout-all-devices"),
     logoutAccount: $("logout-account"),
+    passwordDialog: $("password-dialog"),
+    passwordForm: $("password-form"),
+    currentPassword: $("current-password"),
+    newPassword: $("new-password"),
+    confirmNewPassword: $("confirm-new-password"),
+    passwordError: $("password-error"),
+    closePasswordDialog: $("close-password-dialog"),
+    cancelPasswordDialog: $("cancel-password-dialog"),
+    submitPassword: $("submit-password"),
+    railNewTask: $("rail-new-task"),
+    railSubtitle: $("rail-subtitle"),
+    railVideo: $("rail-video"),
+    railAudio: $("rail-audio"),
     resultKicker: $("result-kicker"),
     resultTitle: $("result-title"),
     resultActions: $("result-actions"),
@@ -73,6 +97,7 @@
     stageTrack: $("stage-track"),
     metadataStrip: $("metadata-strip"),
     notice: $("result-notice"),
+    idleOutput: $("idle-output"),
     outputShell: $("output-shell"),
     output: $("output"),
     outputFormat: $("output-format-label"),
@@ -195,7 +220,11 @@
     artifact_not_found: "下载文件不存在或已过期。",
     job_not_found: "服务可能已重启或任务已过期，请重新提交。",
     idempotency_conflict: "这次提交与上一次请求不一致，请重新提交。",
-    authentication_required: "登录已失效，正在返回登录页。"
+    authentication_required: "登录已失效，正在返回登录页。",
+    current_password_invalid: "当前密码不正确。",
+    password_unchanged: "新密码不能与当前密码相同。",
+    password_too_short: "新密码至少需要 8 个字符。",
+    password_too_long: "新密码不能超过 128 个字符。"
   };
 
   const stageDetails = {
@@ -391,6 +420,34 @@
     return response;
   }
 
+  function formatAccountDate(timestamp) {
+    const value = Number(timestamp || 0);
+    if (!value) return "首次登录";
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "short",
+      day: "numeric"
+    }).format(new Date(value * 1000));
+  }
+
+  function setAccountMenu(open) {
+    const visible = Boolean(open) && !elements.accountTrigger.disabled;
+    elements.accountPopover.hidden = !visible;
+    elements.accountTrigger.setAttribute("aria-expanded", String(visible));
+  }
+
+  function setPasswordDialog(open) {
+    const visible = Boolean(open);
+    elements.passwordDialog.hidden = !visible;
+    document.body.classList.toggle("dialog-open", visible);
+    if (visible) {
+      setAccountMenu(false);
+      elements.passwordError.textContent = "";
+      elements.passwordForm.reset();
+      requestAnimationFrame(() => elements.currentPassword.focus());
+    }
+  }
+
   async function loadAccount() {
     try {
       const response = await apiFetch("/api/auth/me", { cache: "no-store" });
@@ -398,8 +455,14 @@
       if (!response.ok || !data.user) return;
       state.user = data.user;
       elements.accountName.textContent = data.user.username;
-      elements.accountAvatar.textContent = String(data.user.username || "?").charAt(0).toUpperCase();
-      elements.logoutAccount.disabled = false;
+      const initial = String(data.user.username || "?").charAt(0).toUpperCase();
+      elements.accountAvatar.textContent = initial;
+      elements.accountAvatarLarge.textContent = initial;
+      elements.accountPopoverName.textContent = data.user.username;
+      elements.accountCreatedAt.textContent = `${formatAccountDate(data.user.created_at)} 加入`;
+      const sessions = Math.max(1, Number(data.user.active_sessions || 1));
+      elements.accountSessionSummary.textContent = `当前有 ${sessions} 个有效登录会话`;
+      elements.accountTrigger.disabled = false;
       elements.accountArea.setAttribute("aria-busy", "false");
       loadPreferences(data.user.id);
       state.history = loadHistory(data.user.id);
@@ -412,15 +475,77 @@
   }
 
   async function logoutAccount() {
-    elements.logoutAccount.disabled = true;
+    elements.accountTrigger.disabled = true;
     try {
       const response = await apiFetch("/api/auth/logout", { method: "POST" });
       if (!response.ok) throw new Error(String(response.status));
       clearActiveJob();
       window.location.replace("/login");
     } catch (_) {
-      elements.logoutAccount.disabled = false;
+      elements.accountTrigger.disabled = false;
       showToast("退出失败，请检查网络后重试。", true);
+    }
+  }
+
+  async function logoutAllDevices() {
+    if (!window.confirm("确定退出全部设备吗？完成后需要重新登录。")) return;
+    elements.logoutAllDevices.disabled = true;
+    try {
+      const response = await apiFetch("/api/auth/logout-all", { method: "POST" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(friendlyError(data, response.status));
+      clearActiveJob();
+      window.location.replace("/login");
+    } catch (error) {
+      elements.logoutAllDevices.disabled = false;
+      showToast(error.message || "无法退出全部设备，请稍后重试。", true);
+    }
+  }
+
+  async function changeAccountPassword(event) {
+    event.preventDefault();
+    const currentPassword = elements.currentPassword.value;
+    const newPassword = elements.newPassword.value;
+    if (!currentPassword) {
+      elements.passwordError.textContent = "请输入当前密码。";
+      elements.currentPassword.focus();
+      return;
+    }
+    if (newPassword.length < 8) {
+      elements.passwordError.textContent = "新密码至少需要 8 个字符。";
+      elements.newPassword.focus();
+      return;
+    }
+    if (newPassword !== elements.confirmNewPassword.value) {
+      elements.passwordError.textContent = "两次输入的新密码不一致。";
+      elements.confirmNewPassword.focus();
+      return;
+    }
+    elements.submitPassword.disabled = true;
+    elements.submitPassword.textContent = "正在更新";
+    elements.passwordError.textContent = "";
+    try {
+      const response = await apiFetch("/api/auth/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        elements.passwordError.textContent = friendlyError(data, response.status);
+        return;
+      }
+      setPasswordDialog(false);
+      showToast("密码已更新，其他设备已退出。", false);
+      await loadAccount();
+    } catch (_) {
+      elements.passwordError.textContent = "无法连接账号服务，请稍后重试。";
+    } finally {
+      elements.submitPassword.disabled = false;
+      elements.submitPassword.textContent = "更新密码";
     }
   }
 
@@ -588,6 +713,17 @@
         : selectedInputMode() === "upload" ? "开始识别" : "开始提取";
   }
 
+  function syncRailNavigation() {
+    const operation = selectedOperation();
+    [elements.railSubtitle, elements.railVideo, elements.railAudio].forEach((button) => {
+      const selected = button.dataset.operation === operation;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-current", selected ? "page" : "false");
+      button.disabled = state.busy
+        || (button.dataset.operation !== "subtitle" && !state.mediaEnabled);
+    });
+  }
+
   function syncInputMode() {
     const operation = selectedOperation();
     const mediaMode = operation !== "subtitle";
@@ -612,6 +748,7 @@
     elements.form.querySelectorAll('input[name="operation"]').forEach((radio) => {
       radio.disabled = state.busy || (radio.value !== "subtitle" && !state.mediaEnabled);
     });
+    syncRailNavigation();
     elements.forceRefreshLabel.textContent = mediaMode ? "重新获取平台信息" : "忽略已有结果";
     elements.forceRefreshHint.textContent = mediaMode ? "不复用已有的视频解析信息" : "重新下载并处理视频";
     syncPrecisionOptions();
@@ -634,6 +771,13 @@
     if (radio) radio.checked = true;
   }
 
+  function isLocalAsrReady() {
+    if (!state.health) return true;
+    return state.health.local_asr_enabled === true
+      && state.health.ffmpeg_available === true
+      && state.health.ffprobe_available === true;
+  }
+
   function syncPrecisionOptions() {
     const subtitleMode = selectedOperation() === "subtitle";
     const videoSubtitleReady = !state.health
@@ -646,22 +790,59 @@
     }
     elements.qualityFieldGroup.hidden = !subtitleMode;
     elements.embeddedSubtitleRow.hidden = !subtitleMode;
+    const localReady = isLocalAsrReady();
+    const cloudReady = Boolean(
+      state.health
+      && state.health.cloud_asr
+      && state.health.cloud_asr.enabled
+      && state.health.cloud_asr.configured
+    );
+    const autoBackend = state.health
+      && state.health.asr_modes
+      && state.health.asr_modes.auto
+      ? state.health.asr_modes.auto.backend
+      : null;
+    const autoReady = !state.health
+      || (autoBackend === "local" && localReady)
+      || (autoBackend === "cloud" && cloudReady);
+    const autoUsesLocal = !state.health || autoBackend === "local";
+    const autoRadio = elements.form.querySelector('input[name="asr-mode"][value="auto"]');
+    elements.asrAutoTitle.textContent = autoUsesLocal ? "本地基础" : "自动识别";
+    elements.asrAutoDetail.textContent = autoUsesLocal ? "服务器处理" : "按可用服务处理";
     elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
-      radio.disabled = state.busy || !subtitleMode;
+      const unavailable = radio.value === "auto"
+        ? !autoReady
+        : !cloudReady;
+      radio.disabled = state.busy || !subtitleMode || unavailable;
     });
+    if (
+      state.health
+      && selectedAsrMode() !== "auto"
+      && !cloudReady
+      && autoRadio
+      && !autoRadio.disabled
+    ) {
+      autoRadio.checked = true;
+    }
     elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
       radio.disabled = state.busy || embedded;
     });
     elements.allowPlatformAi.disabled = state.busy || embedded;
     elements.hotwords.disabled = state.busy || !subtitleMode;
     elements.hotwordsRow.hidden = !subtitleMode;
+    const currentMode = selectedAsrMode();
     elements.qualityCaption.textContent = embedded
       ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
-      : selectedAsrMode() === "economy"
-        ? "没有平台字幕时使用经济型 Paraformer 识别"
-        : selectedAsrMode() === "high_accuracy"
-          ? "没有平台字幕时使用千问高精度语音识别"
-          : "先提取平台字幕，没有字幕时再使用高精度识别";
+      : currentMode === "economy"
+        ? "平台字幕优先；没有字幕时发送临时音频至 Paraformer"
+        : currentMode === "high_accuracy"
+          ? "平台字幕优先；没有字幕时发送临时音频至千问 ASR"
+          : autoUsesLocal
+            ? "先提取平台字幕，没有字幕时由服务器本地识别"
+            : "先提取平台字幕，没有字幕时使用当前可用识别服务";
+    elements.privacyNote.textContent = currentMode === "auto" && localReady
+      ? "基础模式在本机完成语音识别，不会把音频发送给云端。临时媒体会在任务结束后自动删除，识别结果可能存在误差。"
+      : "云端高级模式会把临时音频发送至阿里云百炼处理；本地副本在任务结束后删除，服务端临时副本按供应商规则自动过期。";
     elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
   }
 
@@ -873,6 +1054,11 @@
     }
     elements.outputShell.hidden = true;
     elements.mediaResult.hidden = true;
+    elements.idleOutput.hidden = kind === "error";
+    elements.idleOutput.classList.toggle(
+      "processing",
+      ["queued", "processing"].includes(kind)
+    );
     elements.metadataStrip.hidden = true;
     elements.notice.hidden = true;
   }
@@ -1029,6 +1215,7 @@
     elements.toggleRaw.textContent = "原始版";
     elements.outputShell.hidden = false;
     elements.mediaResult.hidden = true;
+    elements.idleOutput.hidden = true;
     elements.copyResult.hidden = false;
     elements.retryAccurate.hidden = !shouldOfferAccurateRetry(meta, payload);
     elements.resultActions.hidden = false;
@@ -1057,6 +1244,7 @@
     renderMetadata(meta);
     elements.notice.hidden = true;
     elements.outputShell.hidden = true;
+    elements.idleOutput.hidden = true;
     elements.retryAccurate.hidden = true;
     elements.mediaFileMark.textContent = state.current.mediaType === "audio"
       ? "MP3"
@@ -1516,18 +1704,28 @@
         queueTotal ? `${queueTotal} 个处理中` : "空闲",
         Number(jobs.queued || 0) >= Number(jobs.max_pending || 8) ? "warn" : ""
       );
+      const localAsrReady = isLocalAsrReady();
+      const cloudAsrReady = Boolean(
+        state.health.cloud_asr
+        && state.health.cloud_asr.enabled
+        && state.health.cloud_asr.configured
+      );
       if (state.health.asr_enabled === false) {
         setHealthValue(elements.healthAsr, "未启用", "error");
+      } else if (localAsrReady && cloudAsrReady) {
+        setHealthValue(elements.healthAsr, "本地 + 云端可用", "");
+      } else if (localAsrReady) {
+        setHealthValue(
+          elements.healthAsr,
+          state.health.asr_worker_warm ? "本地模型已就绪" : "本地识别可用",
+          ""
+        );
       } else if (state.health.cloud_asr && state.health.cloud_asr.enabled) {
         setHealthValue(
           elements.healthAsr,
-          state.health.cloud_asr.configured ? "百炼云端可用" : "云端配置异常",
-          state.health.cloud_asr.configured ? "" : "error"
+          cloudAsrReady ? "云端高级可用" : "云端配置异常",
+          cloudAsrReady ? "" : "error"
         );
-      } else if (state.health.asr_worker_warm) {
-        setHealthValue(elements.healthAsr, "模型已预热", "");
-      } else if (state.health.asr_persistent_worker && !state.health.asr_worker_alive) {
-        setHealthValue(elements.healthAsr, "正在启动", "warn");
       } else {
         setHealthValue(elements.healthAsr, "可用", "");
       }
@@ -1638,6 +1836,33 @@
       savePreferences();
     });
   });
+  [elements.railSubtitle, elements.railVideo, elements.railAudio].forEach((button) => {
+    button.addEventListener("click", () => {
+      if (state.busy || button.disabled) return;
+      setSelectedOperation(button.dataset.operation || "subtitle");
+      setMobileView("compose");
+      elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
+      savePreferences();
+    });
+  });
+  elements.railNewTask.addEventListener("click", () => {
+    if (state.busy) {
+      showToast("当前任务完成后即可新建任务。", true);
+      return;
+    }
+    setSelectedOperation("subtitle");
+    setInputMode("link");
+    elements.input.value = "";
+    elements.inputError.textContent = "";
+    elements.input.classList.remove("invalid");
+    elements.forceRefresh.checked = false;
+    setUploadFile(null);
+    hidePageSelector();
+    updatePlatformDetect();
+    setMobileView("compose");
+    elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
+    elements.input.focus();
+  });
   elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
     radio.addEventListener("change", () => {
       syncPrecisionOptions();
@@ -1732,12 +1957,30 @@
   elements.healthTrigger.addEventListener("click", () => {
     setHealthPopover(elements.healthPopover.hidden);
   });
+  elements.accountTrigger.addEventListener("click", () => {
+    setAccountMenu(elements.accountPopover.hidden);
+  });
+  elements.openPasswordDialog.addEventListener("click", () => setPasswordDialog(true));
+  elements.closePasswordDialog.addEventListener("click", () => setPasswordDialog(false));
+  elements.cancelPasswordDialog.addEventListener("click", () => setPasswordDialog(false));
+  elements.passwordForm.addEventListener("submit", changeAccountPassword);
+  elements.logoutAllDevices.addEventListener("click", logoutAllDevices);
+  elements.passwordDialog.addEventListener("click", (event) => {
+    if (event.target === elements.passwordDialog) setPasswordDialog(false);
+  });
   document.addEventListener("click", (event) => {
-    if (elements.healthPopover.hidden) return;
-    if (!event.target.closest(".health-menu")) setHealthPopover(false);
+    if (!elements.healthPopover.hidden && !event.target.closest(".health-menu")) {
+      setHealthPopover(false);
+    }
+    if (!elements.accountPopover.hidden && !event.target.closest(".account-area")) {
+      setAccountMenu(false);
+    }
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") setHealthPopover(false);
+    if (event.key !== "Escape") return;
+    setHealthPopover(false);
+    setAccountMenu(false);
+    if (!elements.passwordDialog.hidden) setPasswordDialog(false);
   });
   elements.clearHistory.addEventListener("click", () => {
     state.history = [];
@@ -1755,4 +1998,5 @@
   loadAccount();
   loadHealth();
   setInterval(loadHealth, 30000);
+  requestAnimationFrame(() => document.body.classList.add("app-ready"));
 })();

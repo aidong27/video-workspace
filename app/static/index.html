@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f7f8fa">
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260725-1">
-  <script src="/static/app.js?v=20260725-1" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260725-2">
+  <script src="/static/app.js?v=20260725-2" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -72,14 +72,53 @@
         </div>
 
         <div class="account-area" id="account-area" aria-busy="true">
-          <span class="account-avatar" id="account-avatar" aria-hidden="true">?</span>
-          <span class="account-name" id="account-name">账号</span>
-          <button class="icon-button logout-button" id="logout-account" type="button" title="退出登录" aria-label="退出登录" disabled>
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
-              <path d="m16 17 5-5-5-5M21 12H9"></path>
+          <button
+            class="account-trigger"
+            id="account-trigger"
+            type="button"
+            aria-expanded="false"
+            aria-controls="account-popover"
+            disabled
+          >
+            <span class="account-avatar" id="account-avatar" aria-hidden="true">?</span>
+            <span class="account-name" id="account-name">账号</span>
+            <svg class="icon chevron-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m9 18 6-6-6-6"></path>
             </svg>
           </button>
+          <section class="account-popover" id="account-popover" aria-label="账号菜单" hidden>
+            <header>
+              <span class="account-avatar account-avatar-large" id="account-avatar-large" aria-hidden="true">?</span>
+              <span>
+                <strong id="account-popover-name">当前账号</strong>
+                <small id="account-created-at">正在读取账号信息</small>
+              </span>
+            </header>
+            <p class="session-summary" id="account-session-summary">正在读取登录设备</p>
+            <div class="account-menu-actions">
+              <button id="open-password-dialog" type="button">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect width="18" height="11" x="3" y="10" rx="2"></rect>
+                  <path d="M7 10V7a5 5 0 0 1 10 0v3M12 14v2"></path>
+                </svg>
+                修改密码
+              </button>
+              <button id="logout-all-devices" type="button">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect width="18" height="12" x="3" y="4" rx="2"></rect>
+                  <path d="M8 20h8M12 16v4"></path>
+                </svg>
+                退出全部设备
+              </button>
+              <button class="danger" id="logout-account" type="button">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                  <path d="m16 17 5-5-5-5M21 12H9"></path>
+                </svg>
+                退出当前账号
+              </button>
+            </div>
+          </section>
         </div>
       </div>
     </div>
@@ -104,6 +143,55 @@
   </nav>
 
   <main class="app-shell">
+    <aside class="workspace-rail" aria-label="工作区导航">
+      <div class="rail-heading">
+        <span>工作区</span>
+        <button class="rail-new-button" id="rail-new-task" type="button" title="新建任务" aria-label="新建任务">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"></path>
+          </svg>
+        </button>
+      </div>
+      <nav class="workspace-nav" aria-label="任务类型">
+        <button class="active" id="rail-subtitle" type="button" data-operation="subtitle">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect width="18" height="14" x="3" y="5" rx="2"></rect>
+            <path d="M7 11h2M13 11h4M7 15h4M15 15h2"></path>
+          </svg>
+          <span><strong>字幕提取</strong><small>链接或本地视频</small></span>
+        </button>
+        <button id="rail-video" type="button" data-operation="video">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m16 13 5 3V8l-5 3"></path>
+            <rect width="13" height="12" x="3" y="6" rx="2"></rect>
+          </svg>
+          <span><strong>视频提取</strong><small>下载平台视频</small></span>
+        </button>
+        <button id="rail-audio" type="button" data-operation="audio">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 18V5l12-2v13"></path>
+            <circle cx="6" cy="18" r="3"></circle>
+            <circle cx="18" cy="16" r="3"></circle>
+          </svg>
+          <span><strong>音频提取</strong><small>转换为 MP3</small></span>
+        </button>
+      </nav>
+
+      <section class="recent-section" id="recent-section" hidden aria-labelledby="recent-title">
+        <div class="recent-heading">
+          <h2 id="recent-title">最近任务</h2>
+          <button class="text-button" id="clear-history" type="button">清空</button>
+        </div>
+        <div class="recent-list" id="recent-list"></div>
+      </section>
+
+      <footer class="rail-footer">
+        <span class="rail-status-dot" aria-hidden="true"></span>
+        <span>单机任务队列</span>
+        <strong>4C / 4G</strong>
+      </footer>
+    </aside>
+
     <aside class="control-pane" id="composer-pane" aria-label="任务设置">
       <form id="extract-form" novalidate>
         <div class="section-heading">
@@ -231,31 +319,31 @@
         </fieldset>
 
         <fieldset class="field-group precision-group" id="quality-field-group">
-          <legend>识别模式</legend>
+          <legend>识别服务</legend>
           <div class="quality-options">
             <label>
               <input type="radio" name="asr-mode" value="auto" checked>
               <span>
-                <strong>自动</strong>
-                <small>字幕优先</small>
+                <strong id="asr-auto-title">本地基础</strong>
+                <small id="asr-auto-detail">服务器处理</small>
               </span>
             </label>
             <label>
               <input type="radio" name="asr-mode" value="high_accuracy">
               <span>
-                <strong>高精度</strong>
-                <small>千问 ASR</small>
+                <strong>云端高精度</strong>
+                <small>千问 · 高级</small>
               </span>
             </label>
             <label>
               <input type="radio" name="asr-mode" value="economy">
               <span>
-                <strong>经济</strong>
-                <small>Paraformer</small>
+                <strong>云端经济</strong>
+                <small>Paraformer · 高级</small>
               </span>
             </label>
           </div>
-          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时再使用高精度识别</p>
+          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时由服务器本地识别</p>
         </fieldset>
 
         <label class="toggle-row embedded-subtitle-row" id="embedded-subtitle-row">
@@ -332,8 +420,8 @@
           </div>
         </details>
 
-        <p class="privacy-note">
-          无平台字幕时，临时音频会发送至阿里云百炼识别；本地副本在任务结束后删除，百炼临时副本最长 48 小时自动过期。结果可能存在误差，请勿滥用或批量消耗额度。
+        <p class="privacy-note" id="privacy-note">
+          基础模式在本机完成语音识别，不会把音频发送给云端。临时媒体会在任务结束后自动删除，识别结果可能存在误差。
         </p>
 
         <div class="form-actions">
@@ -345,14 +433,6 @@
           </button>
         </div>
       </form>
-
-      <section class="recent-section" id="recent-section" hidden aria-labelledby="recent-title">
-        <div class="recent-heading">
-          <h2 id="recent-title">最近任务</h2>
-          <button class="text-button" id="clear-history" type="button">清空</button>
-        </div>
-        <div class="recent-list" id="recent-list"></div>
-      </section>
 
       <section class="login-section" id="login-section" hidden aria-labelledby="login-title">
         <h2 id="login-title">B站登录态</h2>
@@ -422,6 +502,21 @@
         <div class="metadata-strip" id="metadata-strip" hidden></div>
         <div class="notice" id="result-notice" hidden></div>
 
+        <div class="idle-output" id="idle-output" aria-hidden="true">
+          <header>
+            <span>字幕预览</span>
+            <span>TXT</span>
+          </header>
+          <div class="idle-lines">
+            <i></i>
+            <i></i>
+            <i></i>
+            <i></i>
+            <i></i>
+            <i></i>
+          </div>
+        </div>
+
         <div class="output-shell" id="output-shell" hidden>
           <div class="output-toolbar">
             <div class="output-stats">
@@ -462,6 +557,35 @@
       </div>
     </section>
   </main>
+
+  <div class="dialog-backdrop" id="password-dialog" hidden>
+    <section class="account-dialog" role="dialog" aria-modal="true" aria-labelledby="password-dialog-title">
+      <header>
+        <div>
+          <p class="eyebrow">账号安全</p>
+          <h2 id="password-dialog-title">修改密码</h2>
+        </div>
+        <button class="icon-button" id="close-password-dialog" type="button" title="关闭" aria-label="关闭">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </header>
+      <form id="password-form" novalidate>
+        <label for="current-password">当前密码</label>
+        <input id="current-password" type="password" maxlength="128" autocomplete="current-password" required>
+        <label for="new-password">新密码</label>
+        <input id="new-password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+        <label for="confirm-new-password">确认新密码</label>
+        <input id="confirm-new-password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+        <p class="dialog-error" id="password-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="secondary-dialog-button" id="cancel-password-dialog" type="button">取消</button>
+          <button class="primary-dialog-button" id="submit-password" type="submit">更新密码</button>
+        </div>
+      </form>
+    </section>
+  </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </body>

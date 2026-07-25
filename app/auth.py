@@ -61,6 +61,10 @@ def session_ttl_seconds() -> int:
     return days * 24 * 60 * 60
 
 
+def max_sessions_per_user() -> int:
+    return _env_int("AUTH_MAX_SESSIONS_PER_USER", 8, 1)
+
+
 def invite_configured() -> bool:
     value = os.getenv("INVITE_CODE_HASH", "").strip().lower()
     return bool(re.fullmatch(r"[0-9a-f]{64}", value))
@@ -204,6 +208,15 @@ def create_session(user: AuthUser) -> tuple[str, int]:
     now = int(time.time())
     expires_at = now + session_ttl_seconds()
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+        max_sessions = max_sessions_per_user()
+        rows = connection.execute(
+            "SELECT id FROM sessions WHERE user_id = ? ORDER BY last_seen_at DESC, id DESC",
+            (user.user_id,),
+        ).fetchall()
+        for row in rows[max_sessions - 1 :]:
+            connection.execute("DELETE FROM sessions WHERE id = ?", (row["id"],))
         connection.execute(
             "INSERT INTO sessions(user_id, token_hash, created_at, expires_at, last_seen_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -241,6 +254,70 @@ def delete_session(token: str | None) -> None:
     token_hash = hashlib.sha256(token.encode("utf-8")).digest()
     with _connect() as connection:
         connection.execute("DELETE FROM sessions WHERE token_hash = ?", (sqlite3.Binary(token_hash),))
+
+
+def delete_user_sessions(user_id: int) -> None:
+    with _connect() as connection:
+        connection.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+
+def change_password(user_id: int, current_password: str, new_password: str) -> AuthUser:
+    validated_password = _validate_password(new_password)
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT id, username, password_salt, password_hash, created_at, is_active "
+            "FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None or not row["is_active"]:
+            raise AuthFailure(401, "当前账号不可用，请重新登录。", "authentication_required")
+        try:
+            current_digest = _password_digest(current_password or "", bytes(row["password_salt"]))
+        except (ValueError, TypeError):
+            raise AuthFailure(400, "当前密码不正确。", "current_password_invalid") from None
+        if not secrets.compare_digest(current_digest, bytes(row["password_hash"])):
+            raise AuthFailure(400, "当前密码不正确。", "current_password_invalid")
+        if secrets.compare_digest(
+            _password_digest(validated_password, bytes(row["password_salt"])),
+            bytes(row["password_hash"]),
+        ):
+            raise AuthFailure(400, "新密码不能与当前密码相同。", "password_unchanged")
+        salt = secrets.token_bytes(16)
+        digest = _password_digest(validated_password, salt)
+        connection.execute(
+            "UPDATE users SET password_salt = ?, password_hash = ? WHERE id = ?",
+            (sqlite3.Binary(salt), sqlite3.Binary(digest), user_id),
+        )
+        connection.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    return AuthUser(
+        user_id=int(row["id"]),
+        username=str(row["username"]),
+        created_at=int(row["created_at"]),
+    )
+
+
+def account_summary(user_id: int) -> dict[str, int | None]:
+    now = int(time.time())
+    with _connect() as connection:
+        connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+        row = connection.execute(
+            "SELECT created_at, last_login_at FROM users WHERE id = ? AND is_active = 1",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthFailure(401, "当前账号不可用，请重新登录。", "authentication_required")
+        active_sessions = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+        )
+    return {
+        "created_at": int(row["created_at"]),
+        "last_login_at": int(row["last_login_at"]) if row["last_login_at"] is not None else None,
+        "active_sessions": active_sessions,
+    }
 
 
 def user_count() -> int:

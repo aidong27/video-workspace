@@ -27,7 +27,7 @@ class RequestDefaultsTests(unittest.TestCase):
         self.assertEqual(parsed["VmSwap"], 2048)
         self.assertNotIn("Broken", parsed)
 
-    def test_subtitle_requests_default_to_platform_first_cloud_settings(self) -> None:
+    def test_subtitle_requests_default_to_platform_first_local_settings(self) -> None:
         request = main.ExtractRequest(input="BV14jFvzbEvj")
 
         self.assertEqual(request.source, "auto")
@@ -35,6 +35,55 @@ class RequestDefaultsTests(unittest.TestCase):
         self.assertEqual(request.lang, "zh")
         self.assertTrue(request.allow_platform_ai)
         self.assertEqual(request.asr_mode, "auto")
+
+    def test_auto_prefers_local_while_explicit_advanced_modes_use_cloud(self) -> None:
+        with patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+            main,
+            "cloud_asr_enabled",
+            return_value=True,
+        ):
+            self.assertEqual(main.selected_asr_backend("auto"), "local")
+            self.assertEqual(main.selected_asr_backend("high_accuracy"), "cloud")
+            self.assertEqual(main.selected_asr_backend("economy"), "cloud")
+        with patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+            main,
+            "cloud_asr_enabled",
+            return_value=False,
+        ):
+            self.assertEqual(main.selected_asr_backend("auto"), "local")
+            self.assertIsNone(main.selected_asr_backend("high_accuracy"))
+            self.assertIsNone(main.selected_asr_backend("economy"))
+            with self.assertRaises(main.ExtractionFailure) as unavailable:
+                main.ensure_selected_asr_ready("high_accuracy")
+            self.assertEqual(
+                unavailable.exception.reason,
+                "asr_provider_not_configured",
+            )
+
+    def test_asr_dispatch_uses_selected_backend(self) -> None:
+        request = main.ExtractRequest(input="BV14jFvzbEvj")
+        local_result = ([main.SubtitleEntry(0, 1, "local")], {"source": "asr_local"})
+        cloud_result = ([main.SubtitleEntry(0, 1, "cloud")], {"source": "asr_aliyun"})
+        with patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+            main,
+            "cloud_asr_enabled",
+            return_value=True,
+        ), patch.object(
+            main,
+            "local_asr_subtitle",
+            return_value=local_result,
+        ) as local, patch.object(
+            main,
+            "cloud_asr_subtitle",
+            return_value=cloud_result,
+        ) as cloud:
+            self.assertEqual(main.asr_subtitle(request, False), local_result)
+            local.assert_called_once()
+            cloud.assert_not_called()
+
+            advanced = request.model_copy(update={"asr_mode": "high_accuracy"})
+            self.assertEqual(main.asr_subtitle(advanced, False), cloud_result)
+            cloud.assert_called_once()
 
 
 class CloudAsrPipelineTests(unittest.TestCase):

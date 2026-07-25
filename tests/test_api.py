@@ -59,6 +59,8 @@ class ApiIntegrationTests(unittest.TestCase):
                 "INVITE_CODE_HASH",
                 "ASR_PREWARM",
                 "ASR_ENABLED",
+                "LOCAL_ASR_ENABLED",
+                "CLOUD_ASR_ENABLED",
                 "AUTH_COOKIE_SECURE",
             )
         }
@@ -69,6 +71,8 @@ class ApiIntegrationTests(unittest.TestCase):
                 "INVITE_CODE_HASH": hashlib.sha256(invite.encode()).hexdigest(),
                 "ASR_PREWARM": "false",
                 "ASR_ENABLED": "false",
+                "LOCAL_ASR_ENABLED": "false",
+                "CLOUD_ASR_ENABLED": "false",
                 "AUTH_COOKIE_SECURE": "true",
             }
         )
@@ -173,6 +177,8 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertTrue(health.json()["asr_single_model_instance"])
         self.assertEqual(health.json()["default_request"]["quality"], "accurate")
         self.assertEqual(health.json()["default_request"]["asr_mode"], "auto")
+        self.assertIn("asr_backend", health.json()["default_request"])
+        self.assertIn("auto", health.json()["asr_modes"])
         self.assertTrue(health.json()["default_request"]["allow_platform_ai"])
         self.assertTrue(health.json()["asr_audio_filter_enabled"])
         self.assertIn(
@@ -195,6 +201,40 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertNotIn("private-filter-value", encoded)
         self.assertNotIn("private-api-key-value", encoded)
         self.assertNotIn("private-workspace-value", encoded)
+
+    def test_account_can_change_password_and_logout_all_sessions(self) -> None:
+        wrong = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "wrong-password", "new_password": "new-strong-pass"},
+        )
+        self.assertEqual(wrong.status_code, 400)
+        self.assertEqual(wrong.json()["detail"]["reason"], "current_password_invalid")
+
+        changed = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "strong-pass", "new_password": "new-strong-pass"},
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertNotIn("password", json.dumps(changed.json()).lower())
+        me = self.client.get("/api/auth/me")
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.json()["user"]["active_sessions"], 1)
+        self.assertIn("created_at", me.json()["user"])
+
+        self.client.post("/api/auth/logout")
+        old_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "integration", "password": "strong-pass"},
+        )
+        self.assertEqual(old_login.status_code, 401)
+        new_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "integration", "password": "new-strong-pass"},
+        )
+        self.assertEqual(new_login.status_code, 200)
+        logged_out = self.client.post("/api/auth/logout-all")
+        self.assertEqual(logged_out.status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
 
     def test_signed_provider_audio_is_public_short_lived_and_revocable(self) -> None:
         audio = main.ASR_TMP_DIR / "asr-cloud-test" / "provider-audio.mp3"
@@ -440,7 +480,7 @@ class ApiIntegrationTests(unittest.TestCase):
 
 
 class FrontendRecoveryTests(unittest.TestCase):
-    def test_frontend_defaults_to_auto_cloud_chinese_with_platform_subtitles(self) -> None:
+    def test_frontend_defaults_to_local_base_chinese_with_platform_subtitles(self) -> None:
         page = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
@@ -452,6 +492,8 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn('asr_mode: selectedAsrMode()', script)
         self.assertIn('payload.allow_platform_ai !== false', script)
         self.assertIn('X-ASR-Hotwords', script)
+        self.assertIn("本地基础", page)
+        self.assertIn('id="privacy-note"', page)
 
     def test_expired_backend_job_clears_saved_frontend_state(self) -> None:
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -476,6 +518,11 @@ class FrontendRecoveryTests(unittest.TestCase):
             "stage-track",
             "result-search",
             "toggle-wrap",
+            "rail-subtitle",
+            "rail-video",
+            "rail-audio",
+            "account-popover",
+            "password-dialog",
         ):
             self.assertIn(f'id="{element_id}"', page)
         ids = re.findall(r'\bid="([^"]+)"', page)
@@ -483,7 +530,17 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function renderOutputContent()", script)
         self.assertIn("function updateStageTrack(", script)
         self.assertIn("function retryAccurate()", script)
+        self.assertIn("function changeAccountPassword(", script)
+        self.assertIn("function syncRailNavigation(", script)
+        local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
+            "function syncPrecisionOptions", 1
+        )[0]
+        self.assertIn("state.health.ffmpeg_available === true", local_ready_block)
+        self.assertIn("state.health.ffprobe_available === true", local_ready_block)
+        self.assertIn('autoBackend === "local" && localReady', script)
+        self.assertIn('autoBackend === "cloud" && cloudReady', script)
         self.assertIn("uploads.client_max_bytes", script)
+        self.assertIn("body.dialog-open", css)
         self.assertNotIn("linear-gradient", css)
 
     def test_user_preferences_exclude_links_and_hotwords(self) -> None:

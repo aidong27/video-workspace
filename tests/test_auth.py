@@ -8,9 +8,12 @@ from unittest.mock import patch
 
 from app.auth import (
     AuthFailure,
+    account_summary,
     authenticate_user,
+    change_password,
     create_session,
     delete_session,
+    delete_user_sessions,
     initialize_auth_db,
     register_user,
     resolve_session,
@@ -29,6 +32,7 @@ class AuthTests(unittest.TestCase):
                 "AUTH_DB_PATH": str(self.db_path),
                 "AUTH_MAX_USERS": "50",
                 "AUTH_SESSION_TTL_DAYS": "30",
+                "AUTH_MAX_SESSIONS_PER_USER": "8",
                 "INVITE_CODE_HASH": hashlib.sha256(self.invite_code.encode()).hexdigest(),
             },
             clear=False,
@@ -91,6 +95,47 @@ class AuthTests(unittest.TestCase):
         with self.assertRaises(AuthFailure) as failure:
             register_user("second_user", "a-long-password", self.invite_code)
         self.assertEqual(failure.exception.reason, "user_limit_reached")
+
+    def test_password_change_revokes_existing_sessions(self) -> None:
+        user = register_user("secure_user", "old-password-123", self.invite_code)
+        first_token, _ = create_session(user)
+        second_token, _ = create_session(user)
+
+        updated = change_password(user.user_id, "old-password-123", "new-password-456")
+
+        self.assertEqual(updated.user_id, user.user_id)
+        self.assertIsNone(resolve_session(first_token))
+        self.assertIsNone(resolve_session(second_token))
+        with self.assertRaises(AuthFailure):
+            authenticate_user("secure_user", "old-password-123")
+        self.assertEqual(
+            authenticate_user("secure_user", "new-password-456").user_id,
+            user.user_id,
+        )
+
+    def test_password_change_rejects_wrong_and_reused_passwords(self) -> None:
+        user = register_user("password_user", "current-password", self.invite_code)
+        with self.assertRaises(AuthFailure) as wrong:
+            change_password(user.user_id, "wrong-password", "replacement-password")
+        self.assertEqual(wrong.exception.reason, "current_password_invalid")
+
+        with self.assertRaises(AuthFailure) as unchanged:
+            change_password(user.user_id, "current-password", "current-password")
+        self.assertEqual(unchanged.exception.reason, "password_unchanged")
+
+    def test_session_cap_prunes_oldest_sessions_and_logout_all_clears_them(self) -> None:
+        os.environ["AUTH_MAX_SESSIONS_PER_USER"] = "2"
+        user = register_user("session_user", "session-password", self.invite_code)
+        first_token, _ = create_session(user)
+        second_token, _ = create_session(user)
+        third_token, _ = create_session(user)
+
+        self.assertIsNone(resolve_session(first_token))
+        self.assertIsNotNone(resolve_session(second_token))
+        self.assertIsNotNone(resolve_session(third_token))
+        self.assertEqual(account_summary(user.user_id)["active_sessions"], 2)
+        delete_user_sessions(user.user_id)
+        self.assertEqual(account_summary(user.user_id)["active_sessions"], 0)
 
 
 if __name__ == "__main__":
