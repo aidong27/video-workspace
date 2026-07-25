@@ -289,7 +289,7 @@ class AliyunProviderTests(unittest.TestCase):
             ProviderStatus(
                 "FAILED",
                 "task-fetch",
-                error_code="InvalidFile.DownloadFailed",
+                error_code="FILE_DOWNLOAD_FAILED",
                 error_message="signed URL was unavailable",
             )
         )

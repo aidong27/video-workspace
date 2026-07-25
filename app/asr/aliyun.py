@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import time
 from typing import Any, Callable
@@ -21,6 +22,7 @@ from app.network import ensure_public_http_url, validate_public_request
 
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"}
 ACTIVE_STATUSES = {"PENDING", "RUNNING", "QUEUED"}
+LOGGER = logging.getLogger(__name__)
 
 
 def validate_dashscope_base_url(value: str) -> str:
@@ -265,7 +267,13 @@ class _AliyunAsyncProvider(AsrProvider):
             )
         if any(
             word in marker
-            for word in ("invalidfile.downloadfailed", "downloadfailed", "download failed")
+            for word in (
+                "invalidfile.downloadfailed",
+                "downloadfailed",
+                "download failed",
+                "file_download_failed",
+                "filedownloadfailed",
+            )
         ):
             return AsrProviderError(
                 "asr_audio_fetch_failed",
@@ -299,6 +307,16 @@ class _AliyunAsyncProvider(AsrProvider):
         )
 
     def failure_from_status(self, status: ProviderStatus) -> AsrProviderError:
+        safe_code = "".join(
+            character
+            for character in str(status.error_code or "unknown")
+            if character.isalnum() or character in "._-"
+        )[:80]
+        LOGGER.warning(
+            "Aliyun ASR task failed model=%s code=%s",
+            self.model,
+            safe_code or "unknown",
+        )
         return self._normalized_error(
             status.error_code or "TaskFailed",
             status.error_message or "",

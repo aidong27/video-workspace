@@ -6651,8 +6651,9 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/api/provider-audio/{token}")
+@app.api_route("/api/provider-audio/{token}", methods=["GET", "HEAD"])
 def api_provider_audio(
+    request: Request,
     token: str,
     expires: int = Query(..., gt=0),
     signature: str = Query(..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
@@ -6666,10 +6667,16 @@ def api_provider_audio(
             status_code=410,
             detail={"reason": "signed_audio_expired", "message": "临时音频链接已失效。"},
         ) from exc
+    LOGGER.info(
+        "provider audio fetch method=%s range=%s",
+        request.method,
+        bool(request.headers.get("range")),
+    )
     return FileResponse(
         record.path,
         media_type=record.content_type,
         headers={
+            "Accept-Ranges": "bytes",
             "Cache-Control": "private, no-store, max-age=0",
             "X-Content-Type-Options": "nosniff",
         },

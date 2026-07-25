@@ -200,6 +200,11 @@ class ApiIntegrationTests(unittest.TestCase):
         token, url = store.register(audio)
         path = url.removeprefix("https://testserver")
         with patch.object(main, "CLOUD_SIGNED_AUDIO_STORE", store):
+            head = self.client.head(path)
+            self.assertEqual(head.status_code, 200)
+            self.assertEqual(head.content, b"")
+            self.assertEqual(head.headers["content-length"], str(len(b"temporary-audio")))
+            self.assertEqual(head.headers["accept-ranges"], "bytes")
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.content, b"temporary-audio")
