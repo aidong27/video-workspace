@@ -828,13 +828,29 @@ textarea.invalid {
   white-space: nowrap;
 }
 
+.page-selector-row {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.page-selector-row .field-label {
+  margin: 0;
+}
+
+.page-selector-row select {
+  width: 100%;
+}
+
 .precision-group {
   margin-bottom: 8px;
 }
 
 .quality-options {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -878,6 +894,31 @@ textarea.invalid {
   color: var(--faint);
   font-size: 10px;
   line-height: 17px;
+}
+
+.privacy-note {
+  margin: -3px 1px 14px;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.version-toggle {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--canvas);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 720;
+}
+
+.version-toggle[aria-pressed="true"] {
+  border-color: #92b3e7;
+  color: var(--blue);
+  background: var(--blue-soft);
 }
 
 .field-grid {

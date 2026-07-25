@@ -10,6 +10,8 @@
     clearInput: $("clear-input"),
     taskHeading: $("task-heading"),
     platformDetect: $("platform-detect"),
+    pageSelectorRow: $("page-selector-row"),
+    pageSelect: $("page-select"),
     inputModeGroup: $("input-mode-group"),
     linkInputPanel: $("link-input-panel"),
     uploadInputPanel: $("upload-input-panel"),
@@ -77,6 +79,7 @@
     outputStats: $("output-stats-label"),
     resultSearch: $("result-search"),
     searchCount: $("search-count"),
+    toggleRaw: $("toggle-raw"),
     toggleWrap: $("toggle-wrap"),
     mediaResult: $("media-result"),
     mediaFileMark: $("media-file-mark"),
@@ -121,13 +124,16 @@
     mediaMaxBytes: 1000 * 1000 * 1000,
     wrapOutput: true,
     mobileView: "compose",
-    preferencesLoaded: false
+    preferencesLoaded: false,
+    pageLookupTimer: null,
+    biliBaseUrl: ""
   };
 
   const sourceLabels = {
     official_no_cookie: "平台字幕",
     official_with_cookie: "平台字幕",
     asr_local: "本地语音识别",
+    asr_aliyun: "百炼语音识别",
     embedded_text: "内嵌字幕轨",
     ocr_video: "画面字幕 OCR"
   };
@@ -144,6 +150,20 @@
     asr_model_download_failed: "语音识别模型不可用，请检查模型缓存与服务器网络。",
     download_failed: "视频、音频或字幕下载失败，请稍后重试。",
     asr_failed: "本地语音识别失败，请稍后重试。",
+    asr_provider_not_configured: "云端语音识别尚未完成配置。",
+    asr_provider_auth_failed: "云端语音识别凭证无效或模型权限不足。",
+    asr_provider_unavailable: "云端语音识别暂时不可用，请稍后重试。",
+    asr_provider_rejected: "云端语音识别无法处理这个音频。",
+    asr_provider_failed: "云端语音识别任务失败，请稍后重试。",
+    asr_provider_response_invalid: "云端语音识别返回的数据异常。",
+    asr_result_download_failed: "识别已完成，但结果下载失败，请重试。",
+    asr_audio_fetch_failed: "云端服务暂时无法读取音频，请稍后重试。",
+    asr_rate_limited: "云端请求过于频繁，请稍后重试。",
+    asr_quota_exhausted: "免费额度已用尽，系统没有继续产生付费调用。",
+    asr_daily_limit_reached: "今天的云端识别额度已用尽。",
+    asr_monthly_limit_reached: "本月的云端识别额度已用尽。",
+    asr_total_limit_reached: "云端识别总免费额度保护线已达到。",
+    asr_user_daily_limit_reached: "你今天可使用的识别时长已用尽。",
     ocr_missing: "画面字幕识别组件尚未准备完成。",
     ocr_failed: "画面字幕识别失败，可取消画面字幕选项后改用语音识别。",
     ocr_empty: "没有在视频画面中识别到稳定字幕。",
@@ -184,6 +204,12 @@
     cache: "正在查找可复用的处理结果",
     discover: "正在查找平台字幕与语言轨道",
     platform: "正在读取视频信息与音轨",
+    checking_existing_subtitle: "正在检查平台已有字幕",
+    downloading_audio: "正在下载并校验音轨",
+    preprocessing: "正在生成临时识别音频",
+    waiting_for_provider: "正在向云端提交识别任务",
+    transcribing: "云端正在识别音频",
+    postprocessing: "正在整理识别时间轴",
     embedded_subtitle: "正在检查视频中的字幕轨",
     ocr_wait: "前一个画面识别任务结束后会自动继续",
     ocr: "正在逐帧识别画面中的字幕",
@@ -216,11 +242,15 @@
     setSelectedOperation(["subtitle", "video", "audio"].includes(value.operation) ? value.operation : "subtitle");
     setInputMode(value.inputMode === "upload" ? "upload" : "link");
     setSelectedSource(["auto", "official", "asr"].includes(value.source) ? value.source : "auto");
-    setSelectedQuality(value.quality === "fast" ? "fast" : "accurate");
+    setSelectedAsrMode(
+      ["auto", "high_accuracy", "economy"].includes(value.asrMode)
+        ? value.asrMode
+        : "auto"
+    );
     if (["txt", "srt", "vtt", "markdown", "json"].includes(value.format)) elements.format.value = value.format;
     elements.lang.value = ["", "zh", "en", "ja", "ko"].includes(value.lang) ? value.lang : "zh";
     elements.embeddedSubtitles.checked = value.embeddedSubtitles === true;
-    elements.allowPlatformAi.checked = value.allowPlatformAi === true;
+    elements.allowPlatformAi.checked = value.allowPlatformAi !== false;
     elements.useCookie.checked = value.useCookie === true;
     state.wrapOutput = value.wrapOutput !== false;
     applyWrapPreference();
@@ -234,7 +264,8 @@
       operation: selectedOperation(),
       inputMode: selectedInputMode(),
       source: selectedSource(),
-      quality: selectedQuality(),
+      quality: "accurate",
+      asrMode: selectedAsrMode(),
       format: elements.format.value,
       lang: elements.lang.value,
       embeddedSubtitles: selectedEmbeddedSubtitles(),
@@ -304,7 +335,7 @@
       elements.format.value = payload.format || "txt";
       elements.lang.value = payload.lang || "zh";
       elements.hotwords.value = payload.hotwords || "";
-      setSelectedQuality(payload.quality || "accurate");
+      setSelectedAsrMode(payload.asr_mode || "auto");
       elements.embeddedSubtitles.checked = Boolean(payload.embedded_subtitles);
     }
     elements.forceRefresh.checked = Boolean(payload.force_refresh);
@@ -318,10 +349,11 @@
     }
     if (!payload.input) return;
     elements.input.value = payload.input;
-    if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai === true;
+    if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai !== false;
     elements.useCookie.checked = Boolean(payload.use_cookie);
     if (payload.kind !== "media") setSelectedSource(payload.source || "auto");
     updatePlatformDetect();
+    schedulePageLookup();
     syncInputMode();
   }
 
@@ -398,8 +430,12 @@
   }
 
   function selectedQuality() {
-    const selected = elements.form.querySelector('input[name="quality"]:checked');
-    return selected ? selected.value : "accurate";
+    return "accurate";
+  }
+
+  function selectedAsrMode() {
+    const selected = elements.form.querySelector('input[name="asr-mode"]:checked');
+    return selected ? selected.value : "auto";
   }
 
   function selectedEmbeddedSubtitles() {
@@ -433,8 +469,18 @@
     elements.toggleWrap.title = state.wrapOutput ? "关闭自动换行" : "开启自动换行";
   }
 
+  function toggleRawVersion() {
+    if (!state.current || state.current.kind !== "subtitle" || !state.current.rawContent) return;
+    state.current.showingRaw = !state.current.showingRaw;
+    elements.toggleRaw.setAttribute("aria-pressed", String(state.current.showingRaw));
+    elements.toggleRaw.textContent = state.current.showingRaw ? "整理版" : "原始版";
+    elements.resultSearch.value = "";
+    renderOutputContent();
+    updateOutputStats();
+  }
+
   function renderOutputContent() {
-    const content = state.current && state.current.kind === "subtitle" ? state.current.content : "";
+    const content = currentDisplayedContent();
     const query = elements.resultSearch.value.trim();
     elements.output.textContent = "";
     elements.searchCount.textContent = "";
@@ -472,6 +518,19 @@
     if (firstMatch) firstMatch.scrollIntoView({ block: "center" });
   }
 
+  function currentDisplayedContent() {
+    if (!state.current || state.current.kind !== "subtitle") return "";
+    return state.current.showingRaw && state.current.rawContent
+      ? state.current.rawContent
+      : state.current.content;
+  }
+
+  function updateOutputStats() {
+    const content = currentDisplayedContent();
+    const lineCount = content ? content.split("\n").filter(Boolean).length : 0;
+    elements.outputStats.textContent = `${lineCount} 行 · ${content.length.toLocaleString("zh-CN")} 字符`;
+  }
+
   function updateStageTrack(stage, progress, status) {
     const stageGroups = {
       starting: "prepare",
@@ -479,7 +538,9 @@
       cache: "prepare",
       discover: "fetch",
       platform: "fetch",
+      checking_existing_subtitle: "fetch",
       download: "fetch",
+      downloading_audio: "fetch",
       media_download: "fetch",
       embedded_subtitle: "fetch",
       ocr_wait: "recognize",
@@ -487,6 +548,10 @@
       ocr_fallback: "recognize",
       asr_wait: "recognize",
       transcribe: "recognize",
+      preprocessing: "recognize",
+      waiting_for_provider: "recognize",
+      transcribing: "recognize",
+      postprocessing: "render",
       media_convert: "recognize",
       render: "render",
       media_finalize: "render"
@@ -564,8 +629,8 @@
     if (radio) radio.checked = true;
   }
 
-  function setSelectedQuality(value) {
-    const radio = elements.form.querySelector(`input[name="quality"][value="${value}"]`);
+  function setSelectedAsrMode(value) {
+    const radio = elements.form.querySelector(`input[name="asr-mode"][value="${value}"]`);
     if (radio) radio.checked = true;
   }
 
@@ -577,13 +642,12 @@
     elements.embeddedSubtitles.disabled = state.busy || !subtitleMode || !videoSubtitleReady;
     const embedded = subtitleMode && selectedEmbeddedSubtitles();
     if (embedded) {
-      setSelectedQuality("accurate");
       setSelectedSource("auto");
     }
     elements.qualityFieldGroup.hidden = !subtitleMode;
     elements.embeddedSubtitleRow.hidden = !subtitleMode;
-    elements.form.querySelectorAll('input[name="quality"]').forEach((radio) => {
-      radio.disabled = state.busy || !subtitleMode || (embedded && radio.value === "fast");
+    elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
+      radio.disabled = state.busy || !subtitleMode;
     });
     elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
       radio.disabled = state.busy || embedded;
@@ -593,9 +657,11 @@
     elements.hotwordsRow.hidden = !subtitleMode;
     elements.qualityCaption.textContent = embedded
       ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
-      : selectedQuality() === "accurate"
-        ? "保留跨段上下文并使用更细致的解码"
-        : "使用同一常驻模型，以较窄搜索缩短等待时间";
+      : selectedAsrMode() === "economy"
+        ? "没有平台字幕时使用经济型 Paraformer 识别"
+        : selectedAsrMode() === "high_accuracy"
+          ? "没有平台字幕时使用千问高精度语音识别"
+          : "先提取平台字幕，没有字幕时再使用高精度识别";
     elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
   }
 
@@ -665,6 +731,60 @@
     return platform;
   }
 
+  function hidePageSelector() {
+    elements.pageSelectorRow.hidden = true;
+    elements.pageSelect.textContent = "";
+    state.biliBaseUrl = "";
+  }
+
+  function schedulePageLookup() {
+    if (state.pageLookupTimer) clearTimeout(state.pageLookupTimer);
+    if (detectPlatform(elements.input.value.trim()) !== "bilibili") {
+      hidePageSelector();
+      return;
+    }
+    state.pageLookupTimer = setTimeout(loadBilibiliPages, 450);
+  }
+
+  async function loadBilibiliPages() {
+    state.pageLookupTimer = null;
+    const input = elements.input.value.trim();
+    if (detectPlatform(input) !== "bilibili") {
+      hidePageSelector();
+      return;
+    }
+    const params = new URLSearchParams({
+      input,
+      use_cookie: String(elements.useCookie.checked)
+    });
+    try {
+      const response = await apiFetch(`/api/bilibili/pages?${params.toString()}`, {
+        cache: "no-store"
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || elements.input.value.trim() !== input || !Array.isArray(data.pages)) {
+        hidePageSelector();
+        return;
+      }
+      if (data.pages.length <= 1) {
+        hidePageSelector();
+        return;
+      }
+      elements.pageSelect.textContent = "";
+      data.pages.forEach((page, index) => {
+        const option = document.createElement("option");
+        option.value = String(page.page || index + 1);
+        option.textContent = `P${page.page || index + 1} · ${page.title || "未命名分段"}`;
+        elements.pageSelect.appendChild(option);
+      });
+      elements.pageSelect.value = String(data.current_page || 1);
+      state.biliBaseUrl = data.base_url || "";
+      elements.pageSelectorRow.hidden = false;
+    } catch (_) {
+      hidePageSelector();
+    }
+  }
+
   function buildPayload(overrides) {
     const operation = selectedOperation();
     const payload = operation === "subtitle"
@@ -675,6 +795,7 @@
           lang: elements.lang.value || null,
           hotwords: elements.hotwords.value.trim() || null,
           quality: selectedQuality(),
+          asr_mode: selectedAsrMode(),
           embedded_subtitles: selectedEmbeddedSubtitles(),
           use_cookie: elements.useCookie.checked,
           allow_platform_ai: elements.allowPlatformAi.checked,
@@ -809,11 +930,17 @@
     if (meta.media_type) {
       addChip(meta.media_type === "audio" ? "MP3 音频" : "视频文件", meta.media_type === "audio" ? "asr" : "");
     } else {
-      addChip(sourceLabels[meta.source] || meta.source || "未知来源", ["asr_local", "ocr_video"].includes(meta.source) ? "asr" : "");
+      addChip(
+        sourceLabels[meta.source] || meta.source || "未知来源",
+        ["asr_local", "asr_aliyun", "ocr_video"].includes(meta.source) ? "asr" : ""
+      );
     }
-    const quality = meta.effective_quality || meta.quality || meta.requested_quality;
-    if (quality && ["asr_local", "ocr_video"].includes(meta.source)) {
-      addChip(quality === "accurate" ? "精确模式" : "快速模式", quality === "accurate" ? "asr" : "");
+    const asrMode = meta.asr_mode || meta.requested_asr_mode;
+    if (asrMode && ["asr_local", "asr_aliyun"].includes(meta.source)) {
+      addChip(
+        asrMode === "economy" ? "经济模式" : asrMode === "high_accuracy" ? "高精度" : "自动模式",
+        asrMode === "economy" ? "" : "asr"
+      );
     }
     if (meta.track_source_type === "embedded_text") addChip("内嵌字幕", "cache");
     if (meta.track_source_type === "burned_in_ocr") addChip("画面字幕", "asr");
@@ -822,6 +949,11 @@
     if (meta.entry_count) addChip(`${meta.entry_count} 条`);
     if (meta.language) addChip(`语言 ${String(meta.language).toUpperCase()}`);
     if (meta.elapsed_seconds !== undefined) addChip(`用时 ${formatElapsed(meta.elapsed_seconds)}`);
+    if (meta.asr_model) addChip(meta.asr_model, "asr");
+    if (meta.asr_provider_seconds != null) addChip(`计费 ${formatDuration(meta.asr_provider_seconds)}`);
+    if (meta.estimated_cost_cny != null) {
+      addChip(`估算 ¥${Number(meta.estimated_cost_cny).toFixed(4)}`);
+    }
     if (meta.asr_worker_reused) addChip("模型已热启动", "cache");
     elements.metadataStrip.hidden = false;
   }
@@ -841,6 +973,9 @@
     }
     if (meta.source === "asr_local" && meta.requested_source === "auto") {
       return `未找到可用的${platformLabel(meta.platform)}字幕，本次已使用本地语音识别。`;
+    }
+    if (meta.source === "asr_aliyun" && meta.requested_source === "auto") {
+      return `未找到可用的${platformLabel(meta.platform)}字幕，本次已使用阿里云百炼语音识别。`;
     }
     if (meta.track_source_type === "platform_ai") {
       return `本次使用了${platformLabel(meta.platform)}平台自动字幕。`;
@@ -865,6 +1000,8 @@
     state.current = {
       kind: "subtitle",
       content: data.content || "",
+      rawContent: data.raw_content || "",
+      showingRaw: false,
       filename: data.filename || `video_subtitle.${data.format || "txt"}`,
       contentType: data.content_type || "text/plain;charset=utf-8",
       format: data.format || payload.format,
@@ -886,8 +1023,10 @@
     renderOutputContent();
     applyWrapPreference();
     elements.outputFormat.textContent = state.current.format.toUpperCase();
-    const lineCount = state.current.content ? state.current.content.split("\n").filter(Boolean).length : 0;
-    elements.outputStats.textContent = `${lineCount} 行 · ${state.current.content.length.toLocaleString("zh-CN")} 字符`;
+    updateOutputStats();
+    elements.toggleRaw.hidden = !state.current.rawContent;
+    elements.toggleRaw.setAttribute("aria-pressed", "false");
+    elements.toggleRaw.textContent = "原始版";
     elements.outputShell.hidden = false;
     elements.mediaResult.hidden = true;
     elements.copyResult.hidden = false;
@@ -944,6 +1083,7 @@
       operation,
       source: payload.source,
       quality: payload.quality || "accurate",
+      asrMode: payload.asr_mode || "auto",
       embeddedSubtitles: Boolean(payload.embedded_subtitles),
       format: payload.format || (operation === "audio" ? "mp3" : "mp4"),
       lang: payload.lang || "",
@@ -982,12 +1122,13 @@
           elements.lang.value = item.lang || "zh";
           elements.hotwords.value = "";
           setSelectedSource(item.source || "auto");
-          setSelectedQuality(item.quality || "accurate");
+          setSelectedAsrMode(item.asrMode || "auto");
           elements.embeddedSubtitles.checked = Boolean(item.embeddedSubtitles);
           syncInputMode();
         }
         elements.forceRefresh.checked = false;
         updatePlatformDetect();
+        schedulePageLookup();
         runExtraction();
       });
       elements.recentList.appendChild(button);
@@ -1140,6 +1281,7 @@
       lang: elements.lang.value || null,
       hotwords: elements.hotwords.value.trim() || null,
       quality: selectedQuality(),
+      asr_mode: selectedAsrMode(),
       embedded_subtitles: selectedEmbeddedSubtitles(),
       force_refresh: elements.forceRefresh.checked
     };
@@ -1148,6 +1290,7 @@
       filename: file.name,
       format: payload.format,
       quality: payload.quality,
+      asr_mode: payload.asr_mode,
       embedded_subtitles: String(payload.embedded_subtitles),
       force_refresh: String(payload.force_refresh)
     });
@@ -1264,11 +1407,12 @@
 
   async function copyResult() {
     if (!state.current || state.current.kind === "media") return;
+    const content = currentDisplayedContent();
     try {
-      await navigator.clipboard.writeText(state.current.content);
+      await navigator.clipboard.writeText(content);
     } catch (_) {
       const helper = document.createElement("textarea");
-      helper.value = state.current.content;
+      helper.value = content;
       helper.style.position = "fixed";
       helper.style.opacity = "0";
       document.body.appendChild(helper);
@@ -1295,11 +1439,13 @@
       showToast("已开始下载", false);
       return;
     }
-    const blob = new Blob([state.current.content], { type: state.current.contentType });
+    const blob = new Blob([currentDisplayedContent()], { type: state.current.contentType });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = state.current.filename;
+    link.download = state.current.showingRaw
+      ? state.current.filename.replace(/(\.[^.]+)$/, "_raw$1")
+      : state.current.filename;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1311,7 +1457,7 @@
     if (state.busy || !state.current || state.current.kind !== "subtitle") return;
     setSelectedOperation("subtitle");
     setInputMode("link");
-    setSelectedQuality("accurate");
+    setSelectedAsrMode("high_accuracy");
     setSelectedSource("asr");
     elements.embeddedSubtitles.checked = false;
     elements.allowPlatformAi.checked = false;
@@ -1321,6 +1467,7 @@
     runExtraction({
       source: "asr",
       quality: "accurate",
+      asr_mode: "high_accuracy",
       embedded_subtitles: false,
       allow_platform_ai: false,
       force_refresh: true
@@ -1333,6 +1480,7 @@
       if (!text) throw new Error("empty");
       elements.input.value = text.trim();
       validateInput();
+      schedulePageLookup();
       elements.input.focus();
     } catch (_) {
       showToast("无法读取剪贴板，请手动粘贴。", true);
@@ -1370,6 +1518,12 @@
       );
       if (state.health.asr_enabled === false) {
         setHealthValue(elements.healthAsr, "未启用", "error");
+      } else if (state.health.cloud_asr && state.health.cloud_asr.enabled) {
+        setHealthValue(
+          elements.healthAsr,
+          state.health.cloud_asr.configured ? "百炼云端可用" : "云端配置异常",
+          state.health.cloud_asr.configured ? "" : "error"
+        );
       } else if (state.health.asr_worker_warm) {
         setHealthValue(elements.healthAsr, "模型已预热", "");
       } else if (state.health.asr_persistent_worker && !state.health.asr_worker_alive) {
@@ -1484,7 +1638,7 @@
       savePreferences();
     });
   });
-  elements.form.querySelectorAll('input[name="quality"]').forEach((radio) => {
+  elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
     radio.addEventListener("change", () => {
       syncPrecisionOptions();
       savePreferences();
@@ -1495,7 +1649,6 @@
   });
   elements.embeddedSubtitles.addEventListener("change", () => {
     if (elements.embeddedSubtitles.checked) {
-      setSelectedQuality("accurate");
       setSelectedSource("auto");
     }
     syncInputMode();
@@ -1503,6 +1656,7 @@
   });
   elements.input.addEventListener("input", () => {
     updatePlatformDetect();
+    schedulePageLookup();
     if (elements.input.classList.contains("invalid")) validateInput();
   });
   elements.input.addEventListener("keydown", (event) => {
@@ -1542,6 +1696,7 @@
     elements.inputError.textContent = "";
     elements.input.classList.remove("invalid");
     updatePlatformDetect();
+    hidePageSelector();
     elements.input.focus();
   });
   elements.copyResult.addEventListener("click", copyResult);
@@ -1556,8 +1711,17 @@
   });
   elements.lang.addEventListener("change", savePreferences);
   elements.allowPlatformAi.addEventListener("change", savePreferences);
-  elements.useCookie.addEventListener("change", savePreferences);
+  elements.useCookie.addEventListener("change", () => {
+    savePreferences();
+    schedulePageLookup();
+  });
+  elements.pageSelect.addEventListener("change", () => {
+    if (!state.biliBaseUrl) return;
+    elements.input.value = `${state.biliBaseUrl}?p=${encodeURIComponent(elements.pageSelect.value)}`;
+    updatePlatformDetect();
+  });
   elements.resultSearch.addEventListener("input", renderOutputContent);
+  elements.toggleRaw.addEventListener("click", toggleRawVersion);
   elements.toggleWrap.addEventListener("click", () => {
     state.wrapOutput = !state.wrapOutput;
     applyWrapPreference();

@@ -4,21 +4,22 @@ A private, shareable FastAPI workspace for extracting subtitles, video, and audi
 
 ## Processing flow
 
-- Bilibili: official/manual subtitle, optional platform AI subtitle, then selectable fast or accurate local ASR fallback.
-- Douyin: short-link normalization, anonymous browser session, signed metadata request, platform caption when available, then selectable fast or accurate local ASR fallback.
-- Upload: streamed file intake, real media validation, then selectable ASR or embedded/burned-in subtitle extraction. Uploaded video files are deleted after completion, failure, or queued cancellation.
-- Local ASR: fast and accurate modes share one resident `small` int8 model. Fast mode uses beam 3 without cross-window context; accurate mode uses beam 5, keeps context, and retries once without context only when repetition or low confidence is detected.
-- Precise extraction: VAD, title/author context, and optional user hotwords improve difficult Chinese speech. The embedded-subtitle option first reads text subtitle tracks, then uses RapidOCR on burned-in text, and falls back to precise ASR when an audio track is available.
+- Bilibili: official/manual and platform AI subtitles first. Only videos without a usable platform track enter cloud ASR.
+- Douyin: short-link normalization, anonymous browser session, signed metadata request, platform caption when available, then cloud ASR fallback.
+- Upload: streamed file intake, real media validation, then cloud ASR or embedded/burned-in subtitle extraction. Uploaded video files are deleted after completion, failure, or queued cancellation.
+- Cloud ASR: `qwen3-asr-flash-filetrans` is the high-accuracy default and `paraformer-v2` is the explicit economy mode. Requests are made only by the server through separate provider adapters.
+- Embedded subtitles: text tracks are extracted first, RapidOCR handles burned-in text, and audio falls back to the selected cloud model only when OCR finds no stable captions.
 - Direct media: Bilibili video up to 1080p, Douyin video, or MP3 audio. Binary results use owner-scoped temporary artifacts instead of JSON payloads and are deleted when the job expires.
 - Successful results are cached as normalized entries, so TXT, SRT, VTT, Markdown, and JSON conversions do not repeat transcription.
-- Work runs through a bounded two-worker queue so platform subtitles can finish while another job uses ASR. Local ASR remains strictly single-concurrency for 4C/4G memory safety; a second ASR job waits and continues automatically.
+- Work runs through a bounded queue so platform subtitles can finish while another job uses ASR. ASR and OCR share one heavy-work slot; cloud submissions, Chromium, downloads, and temporary media remain bounded for 4C/4G operation.
+- Job state is stored in a small local SQLite database. Queued link jobs can resume after an unclean restart; any job that was already running returns an explicit interruption error so a cloud task is never submitted twice after a crash.
 - Cache hits bypass the worker queue and are rendered in the requested format immediately. The web UI remembers an active job per account and reconnects after a refresh or short network interruption.
 
 The Douyin adapter is pinned to an audited upstream commit. See `THIRD_PARTY_NOTICES.md`.
 
 ## Quick start
 
-Requirements: Python 3.12, FFmpeg, and enough disk space for Whisper and OCR models.
+Requirements: Python 3.12, FFmpeg, an HTTPS public origin, and an Aliyun Bailian project key when cloud ASR is enabled.
 
 ```bash
 python3.12 -m venv .venv
@@ -49,7 +50,7 @@ Create a job:
 curl -b session.cookie -X POST https://HOST/api/jobs \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: UNIQUE-REQUEST-ID' \
-  -d '{"input":"https://www.douyin.com/video/...","source":"auto","quality":"accurate","lang":"zh","hotwords":"MQTT, ESP32, Node-RED","format":"srt"}'
+  -d '{"input":"https://www.douyin.com/video/...","source":"auto","asr_mode":"auto","lang":"zh","format":"srt"}'
 ```
 
 Poll or cancel it:
@@ -78,7 +79,7 @@ Upload a local video as the raw request body:
 
 ```bash
 curl -b session.cookie -X POST \
-  'https://HOST/api/upload-jobs?filename=meeting.mp4&format=srt&lang=zh&quality=accurate' \
+  'https://HOST/api/upload-jobs?filename=meeting.mp4&format=srt&lang=zh&asr_mode=high_accuracy' \
   -H 'Content-Type: video/mp4' \
   -H 'Idempotency-Key: UNIQUE-UPLOAD-ID' \
   --data-binary '@meeting.mp4'
@@ -91,10 +92,11 @@ Request parameters:
 - `source`: `auto`, `official`, or `asr`
 - `format`: `txt`, `srt`, `vtt`, `markdown`, or `json`
 - `lang`: ASR language hint; defaults to `zh`, while an explicit null/empty value enables automatic detection
-- `hotwords`: optional names, terms, or abbreviations, limited to 300 characters and represented by a hash in cache metadata
-- `quality`: `fast` (shared small model, beam 3) or `accurate` (shared small model, beam 5 and cross-window context); defaults to `accurate`
+- `hotwords`: optional names, terms, or abbreviations for the optional local-ASR compatibility path; limited to 300 characters and represented by a hash in cache metadata
+- `asr_mode`: `auto`, `high_accuracy`, or `economy`; defaults to `auto`
+- `quality`: retained for backward compatibility with local ASR clients; defaults to `accurate`
 - `embedded_subtitles`: inspect an embedded text track or OCR burned-in video text; implies accurate processing
-- `allow_platform_ai`: use platform-generated captions when available; defaults to `false`
+- `allow_platform_ai`: use platform-generated captions before cloud ASR; defaults to `true`
 - `force_refresh`: bypass the result cache
 - `use_cookie`: allow the optional server-side Bilibili login state
 
@@ -104,36 +106,33 @@ Request parameters:
 JOB_QUEUE_MAX_PENDING=4
 JOB_WORKER_COUNT=2
 JOB_RESULT_TTL_SECONDS=3600
-ASR_CONCURRENCY_LIMIT=1
+JOB_STATE_DB_PATH=./var/cache/jobs.db
+CLOUD_ASR_ENABLED=true
+LOCAL_ASR_ENABLED=false
+ASR_ENABLED=false
+ASR_JOB_CONCURRENCY=1
 ASR_QUEUE_WAIT_SECONDS=1800
-ASR_MODEL=small
-ASR_COMPUTE_TYPE=int8
-ASR_DEVICE=cpu
-ASR_CPU_THREADS=3
-ASR_TIMEOUT_SECONDS=1800
-ASR_TIMEOUT_PER_AUDIO_SECOND=0.5
-ASR_FAST_BEAM_SIZE=3
-ASR_VAD_FILTER=true
-ASR_CONDITION_ON_PREVIOUS_TEXT=false
-ASR_ACCURATE_MODEL=small
-ASR_ACCURATE_COMPUTE_TYPE=int8
-ASR_ACCURATE_CPU_THREADS=3
-ASR_ACCURATE_BEAM_SIZE=5
-ASR_ACCURATE_VAD_FILTER=true
-ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT=true
-ASR_ACCURATE_TIMEOUT_SECONDS=3600
-ASR_ACCURATE_TIMEOUT_PER_AUDIO_SECOND=1.5
-ASR_MAX_TIMEOUT_SECONDS=7200
+DASHSCOPE_API_KEY=
+DASHSCOPE_WORKSPACE_ID=
+DASHSCOPE_BASE_URL=https://WORKSPACE.cn-beijing.maas.aliyuncs.com/api/v1
+ASR_DEFAULT_MODEL=qwen3-asr-flash-filetrans
+ASR_ECONOMY_MODEL=paraformer-v2
+ASR_ALLOW_PAID=false
+ASR_MONTHLY_FREE_SECONDS=36000
+ASR_MONTHLY_HARD_LIMIT_SECONDS=32400
+ASR_TOTAL_HARD_LIMIT_SECONDS=32400
+ASR_DAILY_HARD_LIMIT_SECONDS=3600
+ASR_USER_DAILY_HARD_LIMIT_SECONDS=1800
+ASR_ECONOMY_FALLBACK_ENABLED=false
+CLOUD_ASR_TIMEOUT_SECONDS=1800
+CLOUD_ASR_HTTP_TIMEOUT_SECONDS=30
+CLOUD_ASR_MAX_FILE_BYTES=268435456
+ASR_USAGE_DB_PATH=./var/cache/cloud-usage.db
+AUDIO_SIGNING_SECRET=RANDOM_SECRET_AT_LEAST_32_BYTES
+PUBLIC_BASE_URL=https://caption.example.com
+TEMP_AUDIO_TTL_SECONDS=1800
 ASR_DOWNLOAD_TIMEOUT_SECONDS=300
 ASR_MAX_AUDIO_SECONDS=3600
-ASR_PROMPT_MAX_CHARS=300
-ASR_VAD_THRESHOLD=0.45
-ASR_VAD_MIN_SILENCE_MS=700
-ASR_VAD_SPEECH_PAD_MS=300
-ASR_LOW_LOGPROB_THRESHOLD=-1.0
-ASR_CONTEXT_RETRY_ENABLED=true
-ASR_RETRY_REPETITION_RATIO=0.25
-ASR_RETRY_LOW_CONFIDENCE_RATIO=0.65
 ASR_AUDIO_QUALITY=best
 ASR_AUDIO_FILTER=
 BILI_MAX_DOWNLOAD_BYTES=1000000000
@@ -144,9 +143,6 @@ MEDIA_MAX_BYTES=1000000000
 MEDIA_STAGING_MAX_BYTES=8000000000
 MEDIA_ARTIFACT_TTL_SECONDS=3600
 MEDIA_FRAGMENT_CONCURRENCY=2
-ASR_PERSISTENT_WORKER=true
-ASR_PREWARM=true
-ASR_PREWARM_QUALITY=accurate
 OCR_TIMEOUT_SECONDS=1800
 OCR_SAMPLE_FPS=1.5
 OCR_CROP_TOP_RATIO=0.45
@@ -165,17 +161,21 @@ MKL_NUM_THREADS=1
 NUMEXPR_NUM_THREADS=1
 ```
 
-Both ASR modes intentionally use the same model, compute type, device, and thread count. The ASR child retains exactly one model instance and unloads it before a differently keyed profile is loaded. The configured timeouts are minimums; long WAV inputs receive a duration-based budget capped by `ASR_MAX_TIMEOUT_SECONDS`. Prewarming, OCR, and ASR share the single heavy-work semaphore to stay within a 4 GB memory budget.
+`ASR_ALLOW_PAID=false` is the required default. The server refuses to enable cloud ASR unless the free allowance and a lifetime hard limit are explicitly configured. It reserves predicted audio seconds in SQLite before submitting a provider task, enforces lifetime, global daily/monthly, and per-user daily limits atomically, and records provider-reported seconds after completion. Provider submission `POST` requests are never retried automatically, avoiding duplicate billable jobs when a response is lost. Prices are configurable estimates only; the Aliyun bill remains authoritative.
+
+Cloud input is converted to a bounded mono MP3 only after media validation. A random HMAC-signed HTTPS URL exposes that file to the provider for at most `TEMP_AUDIO_TTL_SECONDS`; the token is revoked immediately when the task ends and the task directory is removed.
 
 `ASR_AUDIO_FILTER` is opt-in because filtering can damage quiet consonants. A conservative A/B candidate is `highpass=f=70,lowpass=f=7800,loudnorm=I=-20:TP=-2:LRA=11`; compare it against an empty filter on real source audio before enabling it in production.
 
-ASR metadata includes duration, transcription time, realtime factor, confidence/repetition ratios, peak worker RSS, retry status, and hashes for prompt/filter inputs. It never includes prompt or hotword plaintext.
+Cloud ASR metadata includes the actual provider/model, provider task ID, reported seconds, latency, estimated standard-price cost, raw segments, and normalized segments. The web result view can switch between raw and organized output.
 
 Uploads, media downloads, ASR normalization, and OCR preparation check both the absolute and proportional free-disk thresholds before starting. FFmpeg and ffprobe output is continuously drained but capped at `PROCESS_ERROR_OUTPUT_BYTES`, and timed-out processes are terminated, killed if necessary, and reaped.
 
-Run exactly one Uvicorn application worker. Job state and the warm ASR process are intentionally local to this single 4C/4G instance; additional Uvicorn workers would create inconsistent job views and duplicate model memory.
+Run exactly one Uvicorn application worker. The heavy-work semaphore and signed-audio registry are process-local; multiple Uvicorn workers would bypass the global concurrency limit and invalidate task-local signed audio state.
 
-`GET /api/health` reports worker, queue, FFmpeg/ffprobe, ASR model key/restart count, process memory/swap, warm-state, and disk-threshold status without returning paths, Cookie values, users, or environment variables. Reading health never downloads or initializes a model.
+`GET /api/health` reports queue, FFmpeg/ffprobe, cloud-provider readiness, local quota totals, process memory/swap, and disk-threshold status without returning paths, API keys, workspace IDs, Cookie values, users, or environment variables. Reading health never invokes a provider or initializes a local model.
+
+The local faster-whisper and OCR implementation remains available for controlled fallback and offline deployments. Enable it explicitly with `LOCAL_ASR_ENABLED=true`; do not keep a Whisper model resident on the default 4C/4G cloud deployment.
 
 ## Douyin runtime
 

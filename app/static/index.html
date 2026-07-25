@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f7f8fa">
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260724-1">
-  <script src="/static/app.js?v=20260724-1" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260725-1">
+  <script src="/static/app.js?v=20260725-1" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -186,6 +186,10 @@
               <p class="field-error" id="input-error" role="alert"></p>
               <span class="platform-detect" id="platform-detect"><i></i><span>等待识别平台</span></span>
             </div>
+            <div class="page-selector-row" id="page-selector-row" hidden>
+              <label class="field-label" for="page-select">分 P</label>
+              <select id="page-select"></select>
+            </div>
           </div>
 
           <div class="upload-panel" id="upload-input-panel" hidden>
@@ -227,24 +231,31 @@
         </fieldset>
 
         <fieldset class="field-group precision-group" id="quality-field-group">
-          <legend>处理模式</legend>
+          <legend>识别模式</legend>
           <div class="quality-options">
             <label>
-              <input type="radio" name="quality" value="fast">
+              <input type="radio" name="asr-mode" value="auto" checked>
               <span>
-                <strong>快速</strong>
-                <small>清晰口播</small>
+                <strong>自动</strong>
+                <small>字幕优先</small>
               </span>
             </label>
             <label>
-              <input type="radio" name="quality" value="accurate" checked>
+              <input type="radio" name="asr-mode" value="high_accuracy">
               <span>
-                <strong>精确</strong>
-                <small>复杂语音</small>
+                <strong>高精度</strong>
+                <small>千问 ASR</small>
+              </span>
+            </label>
+            <label>
+              <input type="radio" name="asr-mode" value="economy">
+              <span>
+                <strong>经济</strong>
+                <small>Paraformer</small>
               </span>
             </label>
           </div>
-          <p class="mode-caption" id="quality-caption">保留跨段上下文并使用更细致的解码</p>
+          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时再使用高精度识别</p>
         </fieldset>
 
         <label class="toggle-row embedded-subtitle-row" id="embedded-subtitle-row">
@@ -300,9 +311,9 @@
             <label class="toggle-row" id="platform-ai-row">
               <span>
                 <strong>平台自动字幕</strong>
-                <small>优先于本地语音识别</small>
+                <small>优先使用，不消耗云端识别额度</small>
               </span>
-              <input id="allow-platform-ai" type="checkbox" role="switch">
+              <input id="allow-platform-ai" type="checkbox" role="switch" checked>
             </label>
             <label class="toggle-row" id="cookie-row" hidden>
               <span>
@@ -320,6 +331,10 @@
             </label>
           </div>
         </details>
+
+        <p class="privacy-note">
+          无平台字幕时，临时音频会发送至阿里云百炼识别，并在任务结束后删除。结果可能存在误差，请勿滥用或批量消耗额度。
+        </p>
 
         <div class="form-actions">
           <button class="primary-button" id="extract-button" type="submit">
@@ -414,6 +429,7 @@
               <span id="output-stats-label"></span>
             </div>
             <div class="output-tools">
+              <button class="version-toggle" id="toggle-raw" type="button" aria-pressed="false" hidden>原始版</button>
               <label class="result-search" for="result-search">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
                   <circle cx="11" cy="11" r="8"></circle>
