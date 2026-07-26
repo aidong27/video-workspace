@@ -581,9 +581,15 @@ def download_douyin_media(
     video: DouyinVideo,
     target_dir: Path,
     require_video: bool = False,
+    max_bytes: int | None = None,
+    max_duration_seconds: float | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     target_dir.mkdir(parents=True, exist_ok=True)
-    max_bytes = _env_int("DOUYIN_MAX_DOWNLOAD_BYTES", 1_000_000_000, 10_000_000)
+    configured_max_bytes = _env_int("DOUYIN_MAX_DOWNLOAD_BYTES", 1_000_000_000, 10_000_000)
+    max_bytes = min(
+        configured_max_bytes,
+        max(10_000_000, int(max_bytes or configured_max_bytes)),
+    )
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -596,6 +602,16 @@ def download_douyin_media(
     refreshed_urls = False
     current_video = video
     while True:
+        if (
+            max_duration_seconds
+            and current_video.duration
+            and current_video.duration > max_duration_seconds
+        ):
+            raise DouyinAdapterError(
+                422,
+                "视频时长超过当前媒体提取限制。",
+                "media_duration_too_long",
+            )
         for index, url in enumerate(current_video.media_urls[:10]):
             partial = target_dir / f"{video.video_id}.{index}.partial"
             final = target_dir / f"{video.video_id}.mp4"
@@ -668,6 +684,16 @@ def download_douyin_media(
                     has_audio = False
                     has_video = False
                     media_duration = None
+                if (
+                    max_duration_seconds
+                    and media_duration
+                    and media_duration > max_duration_seconds
+                ):
+                    raise DouyinAdapterError(
+                        422,
+                        "视频时长超过当前媒体提取限制。",
+                        "media_duration_too_long",
+                    )
                 if (require_video and not has_video) or (not require_video and not has_audio):
                     missing_requested_stream = True
                     raise RuntimeError("downloaded media does not contain the requested stream")

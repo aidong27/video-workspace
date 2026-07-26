@@ -11,6 +11,7 @@ A self-hosted FastAPI workspace for extracting subtitles, video, and audio from 
 - Cloud ASR: explicit advanced modes use `qwen3-asr-flash-filetrans` for high accuracy or `paraformer-v2` for economy. Requests are made only by the server through separate provider adapters.
 - Embedded subtitles: text tracks are extracted first, RapidOCR handles burned-in text, and audio falls back to the selected ASR backend only when OCR finds no stable captions.
 - Direct media: Bilibili video up to 1080p, Douyin video, or MP3 audio. Binary results use owner-scoped temporary artifacts instead of JSON payloads and are deleted when the job expires.
+- Guest media: optional signed guest sessions can expose only direct video/audio extraction without opening subtitle, upload, Cookie, or cloud-ASR access. Guest outputs use lower limits and a shorter retention window.
 - Successful results are cached as normalized entries, so TXT, SRT, VTT, Markdown, and JSON conversions do not repeat transcription.
 - Work runs through a bounded queue so platform subtitles can finish while another job uses ASR. ASR and OCR share one heavy-work slot; cloud submissions, Chromium, downloads, and temporary media remain bounded for 4C/4G operation.
 - Job state is stored in a small local SQLite database. Queued link jobs can resume after an unclean restart; any job that was already running returns an explicit interruption error so a cloud task is never submitted twice after a crash.
@@ -34,6 +35,11 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 Open `http://127.0.0.1:8000`. Before sharing the service, set a non-empty
 `INVITE_CODE_HASH`, keep `.env` private, and place the application behind an
 HTTPS reverse proxy.
+
+Guest video/audio extraction is disabled by default. To enable it, set
+`GUEST_MEDIA_ENABLED=true` and generate a unique `GUEST_MEDIA_SECRET` with at
+least 32 bytes. The browser receives only a signed, HttpOnly owner cookie; it
+does not receive the secret.
 
 ## Job API
 
@@ -74,13 +80,27 @@ curl -b session.cookie -X POST https://HOST/api/media-jobs \
 
 When the job completes, download the returned `download_url` with the same session cookie. Artifact URLs are opaque, account-scoped, size-limited, and expire automatically. `media_type` accepts `video` or `audio`; audio output is MP3.
 
+When guest media is enabled, the same endpoint can be called without an account.
+The successful response sets a short-lived guest cookie that must be sent while
+polling and downloading:
+
+```bash
+curl -c guest.cookie -X POST https://HOST/api/media-jobs \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: UNIQUE-GUEST-MEDIA-ID' \
+  -d '{"input":"https://www.bilibili.com/video/...","media_type":"video"}'
+```
+
+Guest requests never use the server-side Bilibili Cookie, even if a client sends
+`use_cookie=true`.
+
 `POST /api/extract` and `POST /api/download` remain available for synchronous clients, but they now use the same bounded queue. The old side-effecting `GET /api/download` endpoint returns `410 Gone`. Reusing an `Idempotency-Key` for the same request returns the original job instead of starting duplicate work after a network retry; using it for a different request returns `409 Conflict`.
 
 Upload a local video as the raw request body:
 
 ```bash
 curl -b session.cookie -X POST \
-  'https://HOST/api/upload-jobs?filename=meeting.mp4&format=srt&lang=zh&asr_mode=high_accuracy' \
+  'https://HOST/api/upload-jobs?filename=meeting.mp4&format=srt&lang=zh&asr_mode=high_accuracy&cloud_consent=true' \
   -H 'Content-Type: video/mp4' \
   -H 'Idempotency-Key: UNIQUE-UPLOAD-ID' \
   --data-binary '@meeting.mp4'
@@ -95,6 +115,7 @@ Request parameters:
 - `lang`: ASR language hint; defaults to `zh`, while an explicit null/empty value enables automatic detection
 - `hotwords`: optional names, terms, or abbreviations for the optional local-ASR compatibility path; limited to 300 characters and represented by a hash in cache metadata
 - `asr_mode`: `auto` uses the local baseline when available; `high_accuracy` and `economy` explicitly select the cloud Qwen and Paraformer modes
+- `cloud_consent`: must be `true` for either explicit cloud mode; the API enforces this independently of the browser confirmation dialog
 - `quality`: retained for backward compatibility with local ASR clients; defaults to `accurate`
 - `embedded_subtitles`: inspect an embedded text track or OCR burned-in video text; implies accurate processing
 - `allow_platform_ai`: use platform-generated captions before the selected ASR backend; defaults to `true`
@@ -143,9 +164,21 @@ UPLOAD_MAX_BYTES=536870912
 PUBLIC_UPLOAD_MAX_BYTES=536870912
 UPLOAD_STAGING_MAX_BYTES=2147483648
 MEDIA_MAX_BYTES=1000000000
+MEDIA_MAX_DURATION_SECONDS=21600
 MEDIA_STAGING_MAX_BYTES=8000000000
 MEDIA_ARTIFACT_TTL_SECONDS=3600
 MEDIA_FRAGMENT_CONCURRENCY=2
+GUEST_MEDIA_ENABLED=false
+GUEST_MEDIA_SECRET=
+GUEST_SESSION_TTL_SECONDS=86400
+GUEST_MEDIA_MAX_BYTES=262144000
+GUEST_MEDIA_MAX_DURATION_SECONDS=1800
+GUEST_MEDIA_MAX_VIDEO_HEIGHT=720
+GUEST_MEDIA_AUDIO_BITRATE_KBPS=160
+GUEST_MEDIA_ARTIFACT_TTL_SECONDS=1800
+GUEST_MEDIA_MAX_ACTIVE=1
+GUEST_MEDIA_SESSION_HOURLY_LIMIT=6
+GUEST_MEDIA_GLOBAL_HOURLY_LIMIT=24
 OCR_TIMEOUT_SECONDS=1800
 OCR_SAMPLE_FPS=1.5
 OCR_CROP_TOP_RATIO=0.45
@@ -180,6 +213,12 @@ Run exactly one Uvicorn application worker. The heavy-work semaphore and signed-
 
 Public `GET /api/health` returns only `{"status":"ok"}`. Signed-in clients use `GET /api/client-config` for a deliberately small capability document containing user-facing availability and upload constraints; neither endpoint returns queue totals, process or disk metrics, model names, provider usage, paths, API keys, workspace IDs, Cookie values, users, or environment variables. Reading either endpoint never invokes a provider or initializes a local model.
 
+Unauthenticated clients use `GET /api/public-config`, which exposes only guest
+media availability and public limits. Temporary media responses remain
+`private, no-store`. A CDN may cache the versioned CSS and JavaScript files, but
+must not cache or publicly proxy artifact downloads; this keeps owner isolation
+intact and avoids treating a general CDN as a video-delivery service.
+
 The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for both quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model.
 
 ## Douyin runtime
@@ -199,7 +238,14 @@ The service creates a fresh anonymous Douyin browser session when its cached coo
 
 ## Sharing and HTTPS
 
-Friends register once with a shared permanent invite code, choose their own username and password, and then use the normal login page. Passwords are hashed with `scrypt`; session tokens and the invite code are stored only as hashes. Jobs are scoped to the account that submitted them. Signed-in users can change their password, which revokes all older sessions, or explicitly log out every device from the account menu.
+Friends can extract video or audio without an account when guest media is enabled.
+Subtitle extraction, uploads, cloud enhancement, and optional Bilibili Cookie use
+still require an account. Friends register once with a shared permanent invite
+code, choose their own username and password, and then use the normal login page.
+Passwords are hashed with `scrypt`; session tokens and the invite code are stored
+only as hashes. Jobs are scoped to the account or signed guest session that
+submitted them. Signed-in users can change their password, which revokes all older
+sessions, or explicitly log out every device from the account menu.
 
 Generate the invite hash without placing the plaintext code in `.env`:
 

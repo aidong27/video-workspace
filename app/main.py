@@ -58,6 +58,7 @@ from app.auth import (
     AuthFailure,
     SESSION_COOKIE_NAME,
     account_summary,
+    auth_user_from_request,
     auth_error,
     change_password,
     clear_session_cookie,
@@ -73,6 +74,13 @@ from app.auth import (
     authenticate_user,
     session_ttl_seconds,
     set_session_cookie,
+)
+from app.guest import (
+    GUEST_COOKIE_NAME,
+    GuestIdentity,
+    GuestMediaRateLimiter,
+    GuestSessionCodec,
+    set_guest_cookie,
 )
 
 from app.douyin import (
@@ -116,7 +124,7 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.4")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.5")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -233,6 +241,10 @@ MEDIA_ARTIFACT_DIR = Path(
     os.getenv("MEDIA_ARTIFACT_DIR", str(ASR_TMP_DIR / "media-artifacts"))
 )
 MEDIA_MAX_BYTES = max(10_000_000, int(os.getenv("MEDIA_MAX_BYTES", "1000000000")))
+MEDIA_MAX_DURATION_SECONDS = max(
+    60,
+    int(os.getenv("MEDIA_MAX_DURATION_SECONDS", "21600")),
+)
 MEDIA_STAGING_MAX_BYTES = max(
     MEDIA_MAX_BYTES,
     int(os.getenv("MEDIA_STAGING_MAX_BYTES", "8000000000")),
@@ -396,6 +408,8 @@ UPLOAD_RESERVATION_LOCK = Lock()
 UPLOAD_RESERVATIONS: dict[str, int] = {}
 MEDIA_RESERVATION_LOCK = Lock()
 MEDIA_RESERVATIONS: dict[str, int] = {}
+MEDIA_CLEANUP_GATE_LOCK = Lock()
+MEDIA_CLEANUP_LAST_RUN = 0.0
 os.environ.setdefault("HF_HOME", str(ASR_CACHE_DIR / "hf"))
 os.environ.setdefault("XDG_CACHE_HOME", str(ASR_CACHE_DIR))
 os.environ.setdefault("OMP_NUM_THREADS", "3")
@@ -491,6 +505,7 @@ class ExtractRequest(BaseModel):
     allow_platform_ai: bool = True
     quality: Literal["fast", "accurate"] = "accurate"
     asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto"
+    cloud_consent: bool = False
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -511,6 +526,7 @@ class UploadJobRequest(BaseModel):
     hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
     quality: Literal["fast", "accurate"] = "accurate"
     asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto"
+    cloud_consent: bool = False
     embedded_subtitles: bool = False
     force_refresh: bool = False
 
@@ -525,7 +541,12 @@ class MediaRequest(BaseModel):
 class MediaJobRequest(MediaRequest):
     kind: Literal["media"] = "media"
     artifact_token: str = Field(..., pattern=r"^[0-9a-f]{32}$")
-    owner_id: int = Field(..., gt=0)
+    owner_id: int
+    guest: bool = False
+    max_bytes: int = Field(MEDIA_MAX_BYTES, gt=0)
+    max_duration_seconds: int = Field(MEDIA_MAX_DURATION_SECONDS, gt=0)
+    max_video_height: int = Field(1080, ge=240, le=2160)
+    audio_bitrate_kbps: int = Field(192, ge=64, le=320)
 
 
 class RegisterRequest(BaseModel):
@@ -672,6 +693,99 @@ def env_bool(name: str, default: bool = False) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+GUEST_MEDIA_SESSION_TTL_SECONDS = max(
+    300,
+    int(
+        os.getenv(
+            "GUEST_SESSION_TTL_SECONDS",
+            os.getenv("GUEST_MEDIA_SESSION_TTL_SECONDS", "86400"),
+        )
+    ),
+)
+GUEST_MEDIA_MAX_BYTES = min(
+    MEDIA_MAX_BYTES,
+    max(10_000_000, int(os.getenv("GUEST_MEDIA_MAX_BYTES", "262144000"))),
+)
+GUEST_MEDIA_MAX_DURATION_SECONDS = max(
+    60,
+    int(os.getenv("GUEST_MEDIA_MAX_DURATION_SECONDS", "1800")),
+)
+GUEST_MEDIA_MAX_VIDEO_HEIGHT = min(
+    1080,
+    max(240, int(os.getenv("GUEST_MEDIA_MAX_VIDEO_HEIGHT", "720"))),
+)
+GUEST_MEDIA_ARTIFACT_TTL_SECONDS = min(
+    MEDIA_ARTIFACT_TTL_SECONDS,
+    max(300, int(os.getenv("GUEST_MEDIA_ARTIFACT_TTL_SECONDS", "1800"))),
+)
+GUEST_MEDIA_AUDIO_BITRATE_KBPS = min(
+    320,
+    max(64, int(os.getenv("GUEST_MEDIA_AUDIO_BITRATE_KBPS", "160"))),
+)
+GUEST_MEDIA_MAX_ACTIVE_PER_SESSION = max(
+    1,
+    int(
+        os.getenv(
+            "GUEST_MEDIA_MAX_ACTIVE",
+            os.getenv("GUEST_MEDIA_MAX_ACTIVE_PER_SESSION", "1"),
+        )
+    ),
+)
+GUEST_SESSION_CODEC = GuestSessionCodec(
+    os.getenv("GUEST_MEDIA_SECRET", ""),
+    GUEST_MEDIA_SESSION_TTL_SECONDS,
+)
+GUEST_MEDIA_RATE_LIMITER = GuestMediaRateLimiter(
+    session_limit=max(1, int(os.getenv("GUEST_MEDIA_SESSION_HOURLY_LIMIT", "6"))),
+    global_limit=max(1, int(os.getenv("GUEST_MEDIA_GLOBAL_HOURLY_LIMIT", "24"))),
+)
+
+
+def guest_media_enabled() -> bool:
+    return bool(env_bool("GUEST_MEDIA_ENABLED", False) and GUEST_SESSION_CODEC.enabled)
+
+
+def media_request_owner(
+    request: Request,
+    *,
+    create_guest: bool,
+) -> tuple[int, bool, tuple[str, GuestIdentity] | None]:
+    user = auth_user_from_request(request)
+    if user is not None:
+        return user.user_id, False, None
+    token = request.cookies.get(GUEST_COOKIE_NAME)
+    identity = GUEST_SESSION_CODEC.resolve(token)
+    if identity is not None:
+        return identity.owner_id, True, None
+    if not create_guest or not guest_media_enabled():
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "reason": "guest_session_expired" if token else "authentication_required",
+                "message": (
+                    "游客任务凭据已失效，请重新提交。"
+                    if token
+                    else "请先登录，或稍后再使用免登录媒体提取。"
+                ),
+            },
+        )
+    token, identity = GUEST_SESSION_CODEC.issue()
+    return identity.owner_id, True, (token, identity)
+
+
+def enforce_cloud_consent(asr_mode: str, consent: bool) -> None:
+    if asr_mode not in {"high_accuracy", "economy"} or consent:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "reason": "cloud_consent_required",
+            "message": "云端识别会消耗站点额度，请确认后再提交。",
+            "retryable": False,
+        },
+    )
 
 
 def local_asr_enabled() -> bool:
@@ -1124,8 +1238,8 @@ def media_artifact_directory(artifact_token: str) -> Path:
     return MEDIA_ARTIFACT_DIR / f"media-artifact-{artifact_token}"
 
 
-def reserve_media_artifact(artifact_token: str) -> int:
-    reservation = MEDIA_MAX_BYTES
+def reserve_media_artifact(artifact_token: str, max_bytes: int = MEDIA_MAX_BYTES) -> int:
+    reservation = min(MEDIA_MAX_BYTES, max(1, int(max_bytes)))
     with MEDIA_RESERVATION_LOCK:
         if artifact_token in MEDIA_RESERVATIONS:
             raise HTTPException(
@@ -1146,13 +1260,18 @@ def reserve_media_artifact(artifact_token: str) -> int:
     return reservation
 
 
-def resize_media_reservation(artifact_token: str, required_bytes: int) -> None:
-    if required_bytes <= 0 or required_bytes > MEDIA_MAX_BYTES:
+def resize_media_reservation(
+    artifact_token: str,
+    required_bytes: int,
+    max_bytes: int = MEDIA_MAX_BYTES,
+) -> None:
+    effective_limit = min(MEDIA_MAX_BYTES, max(1, int(max_bytes)))
+    if required_bytes <= 0 or required_bytes > effective_limit:
         raise HTTPException(
             status_code=413,
             detail={
                 "reason": "media_too_large",
-                "message": f"媒体文件不能超过 {MEDIA_MAX_BYTES // (1024 * 1024)} MB。",
+                "message": f"媒体文件不能超过 {effective_limit // (1024 * 1024)} MB。",
             },
         )
     with MEDIA_RESERVATION_LOCK:
@@ -1254,6 +1373,16 @@ def cleanup_stale_media_artifacts(now: float | None = None, remove_all: bool = F
         release_media_reservation(artifact_token)
         removed += 1
     return removed
+
+
+def maybe_cleanup_stale_media_artifacts(min_interval_seconds: float = 60) -> int:
+    global MEDIA_CLEANUP_LAST_RUN
+    current = time.monotonic()
+    with MEDIA_CLEANUP_GATE_LOCK:
+        if current - MEDIA_CLEANUP_LAST_RUN < max(1, min_interval_seconds):
+            return 0
+        MEDIA_CLEANUP_LAST_RUN = current
+    return cleanup_stale_media_artifacts()
 
 
 @contextmanager
@@ -3381,7 +3510,19 @@ def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
     result_queue.put({"kind": "started", "group_owned": group_owned})
     deadline = time.monotonic() + max(30, int(payload.get("timeout_seconds") or 300))
     max_bytes = max(1, int(payload.get("max_bytes") or 1))
+    max_duration = max(1, int(payload.get("max_duration_seconds") or ASR_MAX_AUDIO_SECONDS))
+    max_video_height = min(2160, max(240, int(payload.get("max_video_height") or 1080)))
+    duration_limit_reason = str(
+        payload.get("duration_limit_reason") or "asr_duration_too_long"
+    )
+    if duration_limit_reason not in {
+        "asr_duration_too_long",
+        "media_duration_too_long",
+        "guest_media_duration_too_long",
+    }:
+        duration_limit_reason = "asr_duration_too_long"
     too_large = False
+    too_long = False
     timed_out = False
     last_progress = -1
 
@@ -3406,6 +3547,18 @@ def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
         except Full:
             pass
 
+    def match_filter(info: dict[str, Any], *, incomplete: bool = False) -> str | None:
+        del incomplete
+        nonlocal too_long
+        try:
+            duration = float(info.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration > max_duration:
+            too_long = True
+            return "media duration limit exceeded"
+        return None
+
     target_dir = Path(str(payload["target_dir"]))
     mode = str(payload.get("mode") or "audio")
     media_type = str(payload.get("media_type") or "audio")
@@ -3425,6 +3578,7 @@ def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
         "continuedl": False,
         "overwrites": True,
         "max_filesize": max_bytes,
+        "match_filter": match_filter,
         "progress_hooks": [progress_hook],
     }
     if mode == "audio":
@@ -3432,7 +3586,10 @@ def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
     elif media_type == "video":
         options.update(
             {
-                "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                "format": (
+                    f"bestvideo[height<={max_video_height}]+bestaudio/"
+                    f"best[height<={max_video_height}]"
+                ),
                 "merge_output_format": "mp4",
                 "concurrent_fragment_downloads": max(
                     1,
@@ -3454,7 +3611,15 @@ def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
         }
         result_queue.put({"kind": "result", "ok": True, "info": summary}, timeout=5)
     except Exception as exc:
-        reason = "media_too_large" if too_large else ("download_timeout" if timed_out else "download_failed")
+        reason = (
+            "media_too_large"
+            if too_large
+            else duration_limit_reason
+            if too_long
+            else "download_timeout"
+            if timed_out
+            else "download_failed"
+        )
         try:
             result_queue.put(
                 {
@@ -3478,6 +3643,9 @@ def run_isolated_ytdlp_download(
     allow_cookie: bool,
     max_bytes: int,
     timeout_seconds: float,
+    max_duration_seconds: int = ASR_MAX_AUDIO_SECONDS,
+    max_video_height: int = 1080,
+    duration_limit_reason: str = "asr_duration_too_long",
 ) -> dict[str, Any]:
     result_queue: Any = None
     process: Any = None
@@ -3496,6 +3664,9 @@ def run_isolated_ytdlp_download(
                         "media_type": media_type,
                         "http_headers": headers_for(allow_cookie=allow_cookie),
                         "max_bytes": max_bytes,
+                        "max_duration_seconds": max_duration_seconds,
+                        "max_video_height": max_video_height,
+                        "duration_limit_reason": duration_limit_reason,
                         "timeout_seconds": max(1, int(timeout_seconds)),
                         "fragment_concurrency": max(
                             1,
@@ -3548,6 +3719,24 @@ def run_isolated_ytdlp_download(
                 LOGGER.warning("isolated yt-dlp failed: %s", redact_sensitive(str(message.get("error") or reason)))
                 if reason == "media_too_large":
                     raise ExtractionFailure(413, "下载媒体超过大小限制。", "media_too_large")
+                if reason == "guest_media_duration_too_long":
+                    raise ExtractionFailure(
+                        413,
+                        "视频时长超过当前免登录提取限制。",
+                        "guest_media_duration_too_long",
+                    )
+                if reason == "media_duration_too_long":
+                    raise ExtractionFailure(
+                        413,
+                        "视频时长超过当前媒体提取限制。",
+                        "media_duration_too_long",
+                    )
+                if reason == "asr_duration_too_long":
+                    raise ExtractionFailure(
+                        413,
+                        "视频时长超过当前语音识别限制。",
+                        "asr_duration_too_long",
+                    )
                 if reason == "download_timeout":
                     raise ExtractionFailure(504, "yt-dlp 下载超时。", "download_failed", retryable=True)
                 raise ExtractionFailure(502, "yt-dlp 下载失败。", "download_failed", retryable=True)
@@ -3830,6 +4019,23 @@ def select_downloaded_media(directory: Path, media_type: Literal["video", "audio
     return path, probe
 
 
+def ensure_media_duration(req: MediaJobRequest, duration: Any) -> None:
+    try:
+        seconds = float(duration or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds > req.max_duration_seconds:
+        raise ExtractionFailure(
+            413,
+            (
+                "视频时长超过当前免登录提取限制。"
+                if req.guest
+                else "视频时长超过当前媒体提取限制。"
+            ),
+            "guest_media_duration_too_long" if req.guest else "media_duration_too_long",
+        )
+
+
 def download_bilibili_media_ytdlp(
     req: MediaJobRequest,
     target_dir: Path,
@@ -3842,10 +4048,21 @@ def download_bilibili_media_ytdlp(
         mode="media",
         media_type=req.media_type,
         allow_cookie=cookie_allowed(req.use_cookie),
-        max_bytes=MEDIA_MAX_BYTES,
+        max_bytes=req.max_bytes,
         timeout_seconds=remaining_before(deadline, "Bilibili yt-dlp media download"),
+        max_duration_seconds=req.max_duration_seconds,
+        max_video_height=req.max_video_height,
+        duration_limit_reason=(
+            "guest_media_duration_too_long"
+            if req.guest
+            else "media_duration_too_long"
+        ),
     )
+    ensure_media_duration(req, info.get("duration"))
     source_path, probe = select_downloaded_media(target_dir, req.media_type)
+    ensure_media_duration(req, probe.get("duration"))
+    if source_path.stat().st_size > req.max_bytes:
+        raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
     return source_path, {
         "id": info.get("id"),
         "title": info.get("title"),
@@ -4002,6 +4219,8 @@ def download_bilibili_media_api(
     deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
     allow_cookie = cookie_allowed(req.use_cookie)
     bvid, canonical_url, data, selected_page, cid = bili_view_context(req.input, allow_cookie)
+    media_duration = (selected_page or {}).get("duration") or data.get("duration")
+    ensure_media_duration(req, media_duration)
     play = api_get_json(
         "https://api.bilibili.com/x/player/playurl?"
         + urllib.parse.urlencode(
@@ -4034,7 +4253,7 @@ def download_bilibili_media_api(
             source_path,
             canonical_url,
             deadline,
-            MEDIA_MAX_BYTES,
+            req.max_bytes,
             20,
             58,
             "正在下载 B站音频",
@@ -4045,9 +4264,12 @@ def download_bilibili_media_api(
             for item in (dash.get("video") or [])
             if isinstance(item, dict) and bili_stream_urls(item)
         ]
-        within_limit = [item for item in video_items if int(item.get("height") or 0) <= 1080]
-        if within_limit:
-            video_items = within_limit
+        within_limit = [
+            item
+            for item in video_items
+            if int(item.get("height") or 0) <= req.max_video_height
+        ]
+        video_items = within_limit
         video_items.sort(
             key=lambda item: (
                 int(item.get("height") or 0),
@@ -4067,7 +4289,7 @@ def download_bilibili_media_api(
                 raw_audio,
                 canonical_url,
                 deadline,
-                MEDIA_MAX_BYTES,
+                req.max_bytes,
                 20,
                 8,
                 "正在下载 B站音频",
@@ -4084,13 +4306,13 @@ def download_bilibili_media_api(
                     raw_video,
                     canonical_url,
                     deadline,
-                    MEDIA_MAX_BYTES - audio_bytes,
+                    req.max_bytes - audio_bytes,
                     28,
                     50,
                     "正在下载 B站视频",
                 )
                 merge_bilibili_dash(raw_video, raw_audio, source_path, deadline)
-                if source_path.stat().st_size > MEDIA_MAX_BYTES:
+                if source_path.stat().st_size > req.max_bytes:
                     raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
                 last_size_error = None
                 break
@@ -4151,11 +4373,12 @@ def download_bilibili_media(
 
 def prepare_media_output(
     source_path: Path,
-    media_type: Literal["video", "audio"],
+    req: MediaJobRequest,
     artifact_dir: Path,
 ) -> tuple[Path, str]:
     probe = probe_downloaded_media(source_path)
-    if media_type == "audio":
+    ensure_media_duration(req, probe.get("duration"))
+    if req.media_type == "audio":
         if not probe["has_audio"]:
             raise ExtractionFailure(422, "Downloaded media has no audio stream.", "audio_stream_missing")
         ffmpeg = shutil.which("ffmpeg")
@@ -4166,7 +4389,10 @@ def prepare_media_output(
             source_bytes = source_path.stat().st_size
         except OSError:
             source_bytes = 0
-        ensure_disk_space(artifact_dir, min(MEDIA_MAX_BYTES, max(32 * 1024 * 1024, source_bytes // 2)))
+        ensure_disk_space(
+            artifact_dir,
+            min(req.max_bytes, max(32 * 1024 * 1024, source_bytes // 2)),
+        )
         report_progress("media_convert", 86, "正在生成 MP3 音频")
         try:
             completed = run_managed_process(
@@ -4185,7 +4411,7 @@ def prepare_media_output(
                     "-c:a",
                     "libmp3lame",
                     "-b:a",
-                    "192k",
+                    f"{req.audio_bitrate_kbps}k",
                     "-id3v2_version",
                     "3",
                     str(final_path),
@@ -4202,6 +4428,9 @@ def prepare_media_output(
         if completed.returncode != 0 or not final_path.is_file():
             final_path.unlink(missing_ok=True)
             raise ExtractionFailure(502, "Audio conversion failed.", "media_convert_failed")
+        if final_path.stat().st_size > req.max_bytes:
+            final_path.unlink(missing_ok=True)
+            raise ExtractionFailure(413, "Converted audio exceeds the size limit.", "media_too_large")
         source_path.unlink(missing_ok=True)
         return final_path, "audio/mpeg"
 
@@ -4218,6 +4447,9 @@ def prepare_media_output(
         suffix = ".mp4"
     final_path = artifact_dir / f"artifact{suffix}"
     os.replace(source_path, final_path)
+    if final_path.stat().st_size > req.max_bytes:
+        final_path.unlink(missing_ok=True)
+        raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
     return final_path, content_types.get(suffix, "video/mp4")
 
 
@@ -4234,12 +4466,15 @@ def finalize_media_artifact(
         raise ExtractionFailure(502, "Media artifact was not created.", "artifact_missing") from exc
     if final_path.is_symlink() or not final_path.is_file() or stat.st_size <= 0:
         raise ExtractionFailure(502, "Media artifact is invalid.", "invalid_artifact")
-    resize_media_reservation(req.artifact_token, stat.st_size)
+    resize_media_reservation(req.artifact_token, stat.st_size, req.max_bytes)
     extension = final_path.suffix.lower().lstrip(".") or ("mp3" if req.media_type == "audio" else "mp4")
     title = str(info.get("title") or info.get("id") or "video").strip()[:160]
     filename = safe_filename(title, extension)
     now = time.time()
-    expires_at = now + MEDIA_ARTIFACT_TTL_SECONDS
+    artifact_ttl = (
+        GUEST_MEDIA_ARTIFACT_TTL_SECONDS if req.guest else MEDIA_ARTIFACT_TTL_SECONDS
+    )
+    expires_at = now + artifact_ttl
     metadata = {
         "version": 1,
         "artifact_token": req.artifact_token,
@@ -4276,7 +4511,7 @@ def finalize_media_artifact(
         "source_container": info.get("source_container"),
         "cookie_used": platform == "bilibili" and cookie_allowed(req.use_cookie),
         "elapsed_seconds": round(time.monotonic() - started, 3),
-        "artifact_ttl_seconds": MEDIA_ARTIFACT_TTL_SECONDS,
+        "artifact_ttl_seconds": artifact_ttl,
     }
     report_progress("media_finalize", 97, "正在准备下载文件")
     payload = {
@@ -4296,7 +4531,7 @@ def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
     started = time.monotonic()
     artifact_dir = media_artifact_directory(req.artifact_token)
     source_dir = artifact_dir / "source"
-    ensure_disk_space(MEDIA_ARTIFACT_DIR, MEDIA_MAX_BYTES)
+    ensure_disk_space(MEDIA_ARTIFACT_DIR, req.max_bytes)
     MEDIA_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(MEDIA_ARTIFACT_DIR, 0o700)
     artifact_dir.mkdir(mode=0o700)
@@ -4306,21 +4541,29 @@ def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
     if platform == "douyin":
         try:
             video = get_douyin_video(req.input, force_refresh=req.force_refresh)
+            ensure_media_duration(req, video.duration)
             report_progress("media_download", 20, "正在下载抖音媒体文件")
             source_path, info = download_douyin_media(
                 video,
                 source_dir,
                 require_video=req.media_type == "video",
+                max_bytes=req.max_bytes,
+                max_duration_seconds=req.max_duration_seconds,
             )
         except DouyinAdapterError as exc:
-            raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
+            reason = (
+                "guest_media_duration_too_long"
+                if req.guest and exc.reason == "media_duration_too_long"
+                else exc.reason
+            )
+            raise ExtractionFailure(exc.status_code, exc.message, reason) from exc
         info["source_container"] = source_path.suffix.lower().lstrip(".")
     else:
         report_progress("media_download", 20, "正在下载 B站媒体文件")
         source_path, info = download_bilibili_media(req, source_dir)
-    if source_path.stat().st_size > MEDIA_MAX_BYTES:
+    if source_path.stat().st_size > req.max_bytes:
         raise ExtractionFailure(413, "Downloaded media exceeds the size limit.", "media_too_large")
-    final_path, content_type = prepare_media_output(source_path, req.media_type, artifact_dir)
+    final_path, content_type = prepare_media_output(source_path, req, artifact_dir)
     shutil.rmtree(source_dir)
     return finalize_media_artifact(req, final_path, content_type, info, started)
 
@@ -6233,6 +6476,7 @@ def idempotency_conflict_error() -> HTTPException:
 
 
 def submit_extraction_job(req: ExtractRequest, owner_id: int, idempotency_key: str | None) -> dict[str, Any]:
+    enforce_cloud_consent(req.asr_mode, req.cloud_consent)
     try:
         canonical_input = normalize_input(req.input)
     except ExtractionFailure as exc:
@@ -6338,6 +6582,7 @@ def upload_idempotency_fingerprint(
     hotwords: str | None,
     quality: str,
     asr_mode: str,
+    cloud_consent: bool,
     embedded_subtitles: bool,
     force_refresh: bool,
     content_length: int | None,
@@ -6352,6 +6597,7 @@ def upload_idempotency_fingerprint(
             "hotwords_hash": asr_context_hash(hotwords),
             "quality": quality,
             "asr_mode": asr_mode,
+            "cloud_consent": cloud_consent,
             "embedded_subtitles": embedded_subtitles,
             "force_refresh": force_refresh,
             "content_length": content_length,
@@ -6371,7 +6617,13 @@ def media_idempotency_fingerprint(req: MediaRequest, canonical_input: str) -> st
     )
 
 
-def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | None) -> dict[str, Any]:
+def submit_media_job(
+    req: MediaRequest,
+    owner_id: int,
+    idempotency_key: str | None,
+    *,
+    guest: bool = False,
+) -> dict[str, Any]:
     try:
         canonical_input = normalize_input(req.input)
     except ExtractionFailure as exc:
@@ -6379,7 +6631,12 @@ def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | No
             status_code=exc.status_code,
             detail=extraction_error_detail("media", exc),
         ) from exc
-    canonical_req = req.model_copy(update={"input": canonical_input})
+    canonical_req = req.model_copy(
+        update={
+            "input": canonical_input,
+            "use_cookie": False if guest else req.use_cookie,
+        }
+    )
     fingerprint = media_idempotency_fingerprint(canonical_req, canonical_input) if idempotency_key else None
     try:
         existing = JOB_MANAGER.get_by_idempotency(
@@ -6404,17 +6661,52 @@ def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | No
                 "retryable": True,
             },
         )
+    if guest:
+        owner_stats = JOB_MANAGER.owner_stats(owner_id)
+        if owner_stats["queued"] + owner_stats["running"] >= GUEST_MEDIA_MAX_ACTIVE_PER_SESSION:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": "guest_media_busy",
+                    "message": "当前游客会话已有媒体任务，请等待完成后再提交。",
+                    "retryable": True,
+                },
+            )
+        rate_limit = GUEST_MEDIA_RATE_LIMITER.consume(owner_id)
+        if rate_limit is not None:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": rate_limit.reason,
+                    "message": "免登录提取请求较多，请稍后再试。",
+                    "retryable": True,
+                    "retry_after_seconds": rate_limit.retry_after_seconds,
+                },
+                headers={"Retry-After": str(rate_limit.retry_after_seconds)},
+            )
 
     artifact_token = secrets.token_hex(16)
-    reserve_media_artifact(artifact_token)
-    media_req = MediaJobRequest(
-        **canonical_req.model_dump(mode="json"),
-        artifact_token=artifact_token,
-        owner_id=owner_id,
-    )
-    payload = media_req.model_dump(mode="json")
+    media_limit = GUEST_MEDIA_MAX_BYTES if guest else MEDIA_MAX_BYTES
+    payload: dict[str, Any] | None = None
+    artifact_reserved = False
+    guest_rate_reserved = guest
     transferred = False
     try:
+        reserve_media_artifact(artifact_token, media_limit)
+        artifact_reserved = True
+        media_req = MediaJobRequest(
+            **canonical_req.model_dump(mode="json"),
+            artifact_token=artifact_token,
+            owner_id=owner_id,
+            guest=guest,
+            max_bytes=media_limit,
+            max_duration_seconds=(
+                GUEST_MEDIA_MAX_DURATION_SECONDS if guest else MEDIA_MAX_DURATION_SECONDS
+            ),
+            max_video_height=GUEST_MEDIA_MAX_VIDEO_HEIGHT if guest else 1080,
+            audio_bitrate_kbps=GUEST_MEDIA_AUDIO_BITRATE_KBPS if guest else 192,
+        )
+        payload = media_req.model_dump(mode="json")
         try:
             job = JOB_MANAGER.submit(
                 payload,
@@ -6441,7 +6733,12 @@ def submit_media_job(req: MediaRequest, owner_id: int, idempotency_key: str | No
         raise idempotency_conflict_error() from exc
     finally:
         if not transferred:
-            discard_media_payload(payload)
+            if payload is not None:
+                discard_media_payload(payload)
+            elif artifact_reserved:
+                release_media_reservation(artifact_token)
+            if guest_rate_reserved:
+                GUEST_MEDIA_RATE_LIMITER.refund(owner_id)
 
 
 async def stage_uploaded_video(
@@ -6454,6 +6751,7 @@ async def stage_uploaded_video(
     force_refresh: bool,
     hotwords: str | None = None,
     asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto",
+    cloud_consent: bool = False,
 ) -> UploadJobRequest:
     safe_name, extension = safe_upload_filename(filename)
     content_length = request_content_length(request)
@@ -6509,6 +6807,7 @@ async def stage_uploaded_video(
             hotwords=sanitize_asr_context(hotwords),
             quality=quality,
             asr_mode=asr_mode,
+            cloud_consent=cloud_consent,
             embedded_subtitles=embedded_subtitles,
             force_refresh=force_refresh,
         )
@@ -6646,13 +6945,23 @@ app = FastAPI(title=APP_TITLE)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 PUBLIC_PATHS = {
+    "/",
     "/login",
     "/register",
     "/api/health",
+    "/api/public-config",
     "/api/auth/config",
     "/api/auth/login",
     "/api/auth/register",
 }
+
+
+def guest_media_path(path: str) -> bool:
+    return bool(
+        path in {"/api/media-jobs", "/api/bilibili/pages"}
+        or re.fullmatch(r"/api/jobs/[0-9a-f]{32}", path)
+        or re.fullmatch(r"/api/artifacts/[0-9a-f]{32}", path)
+    )
 
 
 def request_origin_allowed(request: Request) -> bool:
@@ -6682,7 +6991,14 @@ async def account_session_middleware(request: Request, call_next: Callable[[Requ
     if path in {"/login", "/register"} and user is not None:
         return RedirectResponse(url="/", status_code=303)
     is_provider_audio = path.startswith("/api/provider-audio/")
-    if path not in PUBLIC_PATHS and not is_static and not is_provider_audio and user is None:
+    is_guest_media = guest_media_path(path)
+    if (
+        path not in PUBLIC_PATHS
+        and not is_static
+        and not is_provider_audio
+        and not is_guest_media
+        and user is None
+    ):
         if path.startswith("/api/"):
             return JSONResponse(
                 status_code=401,
@@ -6690,11 +7006,15 @@ async def account_session_middleware(request: Request, call_next: Callable[[Requ
                 headers={"Cache-Control": "no-store"},
             )
         return RedirectResponse(url="/login", status_code=303)
-    return await call_next(request)
+    response = await call_next(request)
+    if is_static and request.query_params.get("v"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return response
 
 
 @app.on_event("startup")
 def startup() -> None:
+    global MEDIA_CLEANUP_LAST_RUN
     initialize_auth_db()
     with UPLOAD_RESERVATION_LOCK:
         UPLOAD_RESERVATIONS.clear()
@@ -6707,7 +7027,9 @@ def startup() -> None:
     MEDIA_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(MEDIA_ARTIFACT_DIR, 0o700)
     cleanup_stale_asr_tmp()
-    cleanup_stale_media_artifacts()
+    with MEDIA_CLEANUP_GATE_LOCK:
+        MEDIA_CLEANUP_LAST_RUN = 0
+    maybe_cleanup_stale_media_artifacts()
     cleanup_result_cache()
     initialize_cloud_services()
     JOB_MANAGER.start()
@@ -6745,11 +7067,54 @@ def health() -> JSONResponse:
     )
 
 
+def public_media_capabilities() -> dict[str, Any]:
+    ffmpeg_ready = bool(shutil.which("ffmpeg"))
+    ffprobe_ready = bool(shutil.which("ffprobe"))
+    douyin = douyin_adapter_status()
+    douyin_ready = bool(
+        douyin["enabled"]
+        and douyin["api_adapter_ready"]
+        and douyin["playwright_ready"]
+        and douyin["chromium_ready"]
+    )
+    media_ready = ffmpeg_ready and ffprobe_ready
+    return {
+        "status": "ok",
+        "features": {
+            "media": media_ready,
+            "guest_media": bool(media_ready and guest_media_enabled()),
+        },
+        "platforms": {
+            "bilibili": True,
+            "douyin": douyin_ready,
+        },
+        "guest_media": {
+            "enabled": bool(media_ready and guest_media_enabled()),
+            "media_types": ["video", "audio"],
+            "max_bytes": GUEST_MEDIA_MAX_BYTES,
+            "max_duration_seconds": GUEST_MEDIA_MAX_DURATION_SECONDS,
+            "bilibili_max_video_height": GUEST_MEDIA_MAX_VIDEO_HEIGHT,
+            "artifact_ttl_seconds": GUEST_MEDIA_ARTIFACT_TTL_SECONDS,
+        },
+        "account_required": ["subtitle", "upload", "cloud_asr"],
+    }
+
+
+@app.get("/api/public-config")
+def api_public_config() -> JSONResponse:
+    JOB_MANAGER.cleanup()
+    maybe_cleanup_stale_media_artifacts()
+    return JSONResponse(
+        public_media_capabilities(),
+        headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=30"},
+    )
+
+
 @app.get("/api/client-config")
 def api_client_config(request: Request) -> JSONResponse:
     require_auth_user(request)
     JOB_MANAGER.cleanup()
-    cleanup_stale_media_artifacts()
+    maybe_cleanup_stale_media_artifacts()
     ffmpeg_ready = bool(shutil.which("ffmpeg"))
     ffprobe_ready = bool(shutil.which("ffprobe"))
     local_ready = bool(local_asr_enabled() and ffmpeg_ready and ffprobe_ready)
@@ -6937,6 +7302,7 @@ def api_auth_logout_all(request: Request) -> JSONResponse:
 
 @app.get("/api/bilibili/pages")
 def api_bilibili_pages(
+    request: Request,
     input: str = Query(..., min_length=2, max_length=MAX_INPUT_LENGTH),
     use_cookie: bool = Query(False),
 ) -> dict[str, Any]:
@@ -6951,7 +7317,7 @@ def api_bilibili_pages(
             )
         bvid, canonical_url, data, selected_page, _ = bili_view_context(
             canonical,
-            cookie_allowed(use_cookie),
+            cookie_allowed(use_cookie) if auth_user_from_request(request) is not None else False,
         )
     except ExtractionFailure as exc:
         raise HTTPException(
@@ -7111,13 +7477,27 @@ def api_create_job(req: ExtractRequest, request: Request) -> JSONResponse:
 
 @app.post("/api/media-jobs", status_code=202)
 def api_create_media_job(req: MediaRequest, request: Request) -> JSONResponse:
-    user = require_auth_user(request)
-    job = submit_media_job(req, user.user_id, request_idempotency_key(request))
-    return JSONResponse(
+    owner_id, guest, issued_session = media_request_owner(request, create_guest=True)
+    job = submit_media_job(
+        req,
+        owner_id,
+        request_idempotency_key(request),
+        guest=guest,
+    )
+    response = JSONResponse(
         public_job_payload(job),
         status_code=202,
         headers={"Cache-Control": "no-store"},
     )
+    if issued_session is not None:
+        token, identity = issued_session
+        set_guest_cookie(
+            response,
+            token,
+            identity.expires_at,
+            secure=env_bool("AUTH_COOKIE_SECURE", True),
+        )
+    return response
 
 
 @app.post("/api/upload-jobs", status_code=202)
@@ -7135,10 +7515,12 @@ async def api_create_upload_job(
     ),
     quality: Literal["fast", "accurate"] = Query("accurate"),
     asr_mode: Literal["auto", "high_accuracy", "economy"] = Query("auto"),
+    cloud_consent: bool = Query(False),
     embedded_subtitles: bool = Query(False),
     force_refresh: bool = Query(False),
 ) -> JSONResponse:
     user = require_auth_user(request)
+    enforce_cloud_consent(asr_mode, cloud_consent)
     hotwords = request_asr_hotwords(request)
     idempotency_key = request_idempotency_key(request)
     content_length = request_content_length(request)
@@ -7150,6 +7532,7 @@ async def api_create_upload_job(
             hotwords,
             quality,
             asr_mode,
+            cloud_consent,
             embedded_subtitles,
             force_refresh,
             content_length,
@@ -7192,6 +7575,7 @@ async def api_create_upload_job(
         hotwords=hotwords,
         quality=quality,
         asr_mode=asr_mode,
+        cloud_consent=cloud_consent,
         embedded_subtitles=embedded_subtitles,
         force_refresh=force_refresh,
     )
@@ -7243,9 +7627,9 @@ async def api_create_upload_job(
 
 @app.get("/api/jobs/{job_id}")
 def api_get_job(job_id: str, request: Request) -> JSONResponse:
-    user = require_auth_user(request)
+    owner_id, _, _ = media_request_owner(request, create_guest=False)
     try:
-        job = JOB_MANAGER.get(job_id, owner_id=user.user_id)
+        job = JOB_MANAGER.get(job_id, owner_id=owner_id)
     except JobNotFound as exc:
         raise HTTPException(
             status_code=404,
@@ -7261,8 +7645,8 @@ def api_get_job(job_id: str, request: Request) -> JSONResponse:
 
 @app.get("/api/artifacts/{artifact_token}")
 def api_download_artifact(artifact_token: str, request: Request) -> FileResponse:
-    user = require_auth_user(request)
-    path, metadata = load_media_artifact(artifact_token, user.user_id)
+    owner_id, _, _ = media_request_owner(request, create_guest=False)
+    path, metadata = load_media_artifact(artifact_token, owner_id)
     filename = str(metadata.get("filename") or path.name)
     content_type = str(metadata.get("content_type") or "application/octet-stream")
     return FileResponse(
@@ -7278,9 +7662,9 @@ def api_download_artifact(artifact_token: str, request: Request) -> FileResponse
 
 @app.delete("/api/jobs/{job_id}")
 def api_cancel_job(job_id: str, request: Request) -> JSONResponse:
-    user = require_auth_user(request)
+    owner_id, _, _ = media_request_owner(request, create_guest=False)
     try:
-        job = JOB_MANAGER.cancel(job_id, owner_id=user.user_id)
+        job = JOB_MANAGER.cancel(job_id, owner_id=owner_id)
     except JobNotFound as exc:
         raise HTTPException(
             status_code=404,

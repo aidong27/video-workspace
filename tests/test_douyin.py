@@ -295,6 +295,69 @@ class DouyinUrlTests(unittest.TestCase):
         self.assertTrue(metadata["media_urls_refreshed"])
         refresh.assert_called_once_with(old.webpage_url, force_refresh=True)
 
+    def test_refreshed_media_detail_rechecks_duration_before_download(self) -> None:
+        old = douyin.DouyinVideo(
+            video_id="6961737553342991651",
+            title="old",
+            author=None,
+            webpage_url="https://www.douyin.com/video/6961737553342991651",
+            duration=3,
+            media_urls=["https://cdn.invalid/expired"],
+            tracks=[],
+            cookies={},
+        )
+        fresh = douyin.DouyinVideo(
+            video_id=old.video_id,
+            title="fresh",
+            author=None,
+            webpage_url=old.webpage_url,
+            duration=120,
+            media_urls=["https://cdn.invalid/fresh"],
+            tracks=[],
+            cookies={},
+        )
+
+        class Response:
+            headers = {"content-length": "1024", "content-type": "video/mp4"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                raise RuntimeError("expired URL")
+
+            def iter_bytes(self, _size):
+                return iter(())
+
+        class Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def stream(self, _method, _url):
+                return Response()
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            douyin.httpx, "Client", return_value=Client()
+        ), patch.object(
+            douyin,
+            "get_douyin_video",
+            return_value=fresh,
+        ) as refresh, self.assertRaises(douyin.DouyinAdapterError) as raised:
+            douyin.download_douyin_media(
+                old,
+                Path(directory),
+                max_duration_seconds=30,
+            )
+
+        self.assertEqual(raised.exception.reason, "media_duration_too_long")
+        refresh.assert_called_once_with(old.webpage_url, force_refresh=True)
+
 
 if __name__ == "__main__":
     unittest.main()

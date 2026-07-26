@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.asr.signing import SignedAudioStore
+from app.guest import GuestMediaRateLimiter, GuestSessionCodec
 
 
 class ApiIntegrationTests(unittest.TestCase):
@@ -561,6 +562,289 @@ class ApiIntegrationTests(unittest.TestCase):
         forbidden_job = self.client.get(f"/api/jobs/{job['id']}")
         self.assertEqual(forbidden_job.status_code, 404)
 
+    def test_guest_access_only_exposes_media_and_safe_public_config(self) -> None:
+        self.client.post("/api/auth/logout")
+        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
+        limiter = GuestMediaRateLimiter(session_limit=6, global_limit=24)
+        with patch.dict(
+            os.environ,
+            {"GUEST_MEDIA_ENABLED": "true"},
+        ), patch.object(
+            main,
+            "GUEST_SESSION_CODEC",
+            codec,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_RATE_LIMITER",
+            limiter,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_MAX_BYTES",
+            1024,
+        ):
+            page = self.client.get("/")
+            config = self.client.get("/api/public-config")
+            subtitle = self.client.post(
+                "/api/jobs",
+                json={"input": "BV14jFvzbEvj", "format": "txt"},
+            )
+            upload = self.client.post(
+                "/api/upload-jobs?filename=clip.mp4",
+                content=b"video",
+            )
+
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(config.status_code, 200)
+        self.assertTrue(config.json()["features"]["guest_media"])
+        self.assertEqual(config.json()["guest_media"]["bilibili_max_video_height"], 720)
+        self.assertNotIn("max_video_height", config.json()["guest_media"])
+        self.assertEqual(config.json()["account_required"], ["subtitle", "upload", "cloud_asr"])
+        self.assertEqual(subtitle.status_code, 401)
+        self.assertEqual(upload.status_code, 401)
+        encoded = json.dumps(config.json()).lower()
+        for forbidden in (
+            str(self.root).lower(),
+            "service_version",
+            "asr_model",
+            "server",
+            "workspace",
+            "api_key",
+            "free_bytes",
+            "process_rss",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_guest_media_cookie_job_and_artifact_are_owner_scoped(self) -> None:
+        self.client.post("/api/auth/logout")
+        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
+        limiter = GuestMediaRateLimiter(session_limit=6, global_limit=24)
+        seen_requests: list[main.MediaJobRequest] = []
+
+        def fake_media_result(request: main.MediaJobRequest) -> dict:
+            seen_requests.append(request)
+            directory = main.media_artifact_directory(request.artifact_token)
+            directory.mkdir(parents=True, mode=0o700)
+            final = directory / "artifact.mp4"
+            final.write_bytes(b"guest-video")
+            return main.finalize_media_artifact(
+                request,
+                final,
+                "video/mp4",
+                {
+                    "id": "BV14jFvzbEvj",
+                    "title": "访客媒体",
+                    "duration": 9,
+                    "webpage_url": request.input,
+                    "source_container": "mp4",
+                },
+                time.monotonic(),
+            )
+
+        def wait_for_job(client: TestClient, job: dict) -> dict:
+            deadline = time.monotonic() + 2
+            while job["status"] not in {"completed", "failed"} and time.monotonic() < deadline:
+                time.sleep(0.01)
+                job = client.get(f"/api/jobs/{job['id']}").json()
+            return job
+
+        with patch.dict(
+            os.environ,
+            {"GUEST_MEDIA_ENABLED": "true", "AUTH_COOKIE_SECURE": "true"},
+        ), patch.object(
+            main,
+            "GUEST_SESSION_CODEC",
+            codec,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_RATE_LIMITER",
+            limiter,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_MAX_BYTES",
+            1024,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_MAX_DURATION_SECONDS",
+            1800,
+        ), patch.object(
+            main,
+            "media_extraction_payload",
+            side_effect=fake_media_result,
+        ):
+            first = self.client.post(
+                "/api/media-jobs",
+                json={
+                    "input": "BV14jFvzbEvj",
+                    "media_type": "video",
+                    "use_cookie": True,
+                },
+                headers={"Idempotency-Key": "guest-media-owner-1"},
+            )
+            self.assertEqual(first.status_code, 202)
+            cookie = first.headers.get("set-cookie", "").lower()
+            self.assertIn("caption_guest=", cookie)
+            self.assertIn("httponly", cookie)
+            self.assertIn("secure", cookie)
+            self.assertIn("samesite=lax", cookie)
+            first_job = wait_for_job(self.client, first.json())
+            self.assertEqual(first_job["status"], "completed")
+            self.assertTrue(seen_requests[0].guest)
+            self.assertFalse(seen_requests[0].use_cookie)
+            self.assertLess(seen_requests[0].owner_id, 0)
+            self.assertEqual(seen_requests[0].max_bytes, 1024)
+            artifact_url = first_job["result"]["download_url"]
+            self.assertEqual(self.client.get(artifact_url).content, b"guest-video")
+
+            other = TestClient(main.app, base_url="https://testserver")
+            second = other.post(
+                "/api/media-jobs",
+                json={"input": "BV1xx411c7mD", "media_type": "video"},
+                headers={"Idempotency-Key": "guest-media-owner-2"},
+            )
+            self.assertEqual(second.status_code, 202)
+            wait_for_job(other, second.json())
+            self.assertEqual(other.get(f"/api/jobs/{first_job['id']}").status_code, 404)
+            self.assertEqual(other.get(artifact_url).status_code, 404)
+            other.close()
+
+    def test_guest_idempotent_reuse_does_not_consume_another_allowance(self) -> None:
+        self.client.post("/api/auth/logout")
+        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
+        limiter = GuestMediaRateLimiter(session_limit=1, global_limit=10)
+        completed = {
+            "ok": True,
+            "kind": "media",
+            "media_type": "video",
+            "filename": "video.mp4",
+            "content_type": "video/mp4",
+            "size": 1,
+            "download_url": "/api/artifacts/" + "a" * 32,
+            "metadata": {"platform": "bilibili", "title": "cached"},
+        }
+        with patch.dict(
+            os.environ,
+            {"GUEST_MEDIA_ENABLED": "true"},
+        ), patch.object(
+            main,
+            "GUEST_SESSION_CODEC",
+            codec,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_RATE_LIMITER",
+            limiter,
+        ), patch.object(
+            main,
+            "GUEST_MEDIA_MAX_BYTES",
+            1024,
+        ), patch.object(
+            main.JOB_MANAGER,
+            "submit",
+            return_value={
+                "id": "b" * 32,
+                "status": "completed",
+                "result": completed,
+                "reused": False,
+            },
+        ) as submit:
+            headers = {"Idempotency-Key": "guest-idempotent-1"}
+            request = {"input": "BV14jFvzbEvj", "media_type": "video"}
+            first = self.client.post("/api/media-jobs", json=request, headers=headers)
+            self.assertEqual(first.status_code, 202)
+            identity = codec.resolve(self.client.cookies.get("caption_guest"))
+            self.assertIsNotNone(identity)
+            with patch.object(
+                main.JOB_MANAGER,
+                "get_by_idempotency",
+                return_value={
+                    "id": "b" * 32,
+                    "status": "completed",
+                    "result": completed,
+                    "reused": True,
+                },
+            ):
+                repeated = self.client.post("/api/media-jobs", json=request, headers=headers)
+            self.assertEqual(repeated.status_code, 202)
+            self.assertTrue(repeated.json()["reused"])
+            self.assertEqual(submit.call_count, 1)
+            limit = limiter.consume(identity.owner_id)
+            self.assertIsNotNone(limit)
+            self.assertEqual(limit.reason, "guest_media_session_limit")
+
+    def test_guest_allowance_is_refunded_when_storage_reservation_fails(self) -> None:
+        limiter = GuestMediaRateLimiter(session_limit=1, global_limit=10)
+        owner_id = -123
+        with patch.object(
+            main,
+            "GUEST_MEDIA_RATE_LIMITER",
+            limiter,
+        ), patch.object(
+            main,
+            "reserve_media_artifact",
+            side_effect=main.HTTPException(
+                status_code=429,
+                detail={"reason": "media_storage_busy"},
+            ),
+        ):
+            with self.assertRaises(main.HTTPException):
+                main.submit_media_job(
+                    main.MediaRequest(
+                        input="BV14jFvzbEvj",
+                        media_type="video",
+                    ),
+                    owner_id,
+                    None,
+                    guest=True,
+                )
+
+        self.assertIsNone(limiter.consume(owner_id, now=time.time()))
+
+    def test_cloud_modes_require_explicit_server_side_consent(self) -> None:
+        denied = self.client.post(
+            "/api/jobs",
+            json={
+                "input": "BV14jFvzbEvj",
+                "format": "txt",
+                "asr_mode": "high_accuracy",
+            },
+        )
+        self.assertEqual(denied.status_code, 409)
+        self.assertEqual(denied.json()["detail"]["reason"], "cloud_consent_required")
+
+        cached = {
+            "ok": True,
+            "format": "txt",
+            "filename": "cloud.txt",
+            "content_type": "text/plain; charset=utf-8",
+            "metadata": {"platform": "bilibili", "source": "asr_aliyun"},
+            "content": "cloud transcript",
+        }
+        with patch.object(main, "cached_extraction_payload", return_value=cached):
+            allowed = self.client.post(
+                "/api/jobs",
+                json={
+                    "input": "BV14jFvzbEvj",
+                    "format": "txt",
+                    "asr_mode": "high_accuracy",
+                    "cloud_consent": True,
+                },
+            )
+        self.assertEqual(allowed.status_code, 202)
+        self.assertEqual(allowed.json()["status"], "completed")
+
+        upload_denied = self.client.post(
+            "/api/upload-jobs?filename=clip.mp4&asr_mode=economy",
+            content=b"video",
+        )
+        self.assertEqual(upload_denied.status_code, 409)
+        self.assertEqual(upload_denied.json()["detail"]["reason"], "cloud_consent_required")
+
+    def test_versioned_static_assets_are_cacheable_but_media_is_not(self) -> None:
+        versioned = self.client.get("/static/app.js?v=20260727-2")
+        plain = self.client.get("/static/app.js")
+        self.assertEqual(versioned.status_code, 200)
+        self.assertIn("immutable", versioned.headers["cache-control"])
+        self.assertNotIn("immutable", plain.headers.get("cache-control", ""))
+
 
 class FrontendRecoveryTests(unittest.TestCase):
     def test_frontend_defaults_to_local_base_chinese_with_platform_subtitles(self) -> None:
@@ -606,6 +890,11 @@ class FrontendRecoveryTests(unittest.TestCase):
             "rail-audio",
             "account-popover",
             "password-dialog",
+            "guest-access-banner",
+            "cloud-mode-zone",
+            "cloud-confirm-dialog",
+            "link-input-panel",
+            "upload-input-panel",
         ):
             self.assertIn(f'id="{element_id}"', page)
         ids = re.findall(r'\bid="([^"]+)"', page)
@@ -613,6 +902,7 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function renderOutputContent()", script)
         self.assertIn("function updateStageTrack(", script)
         self.assertIn("function retryAccurate()", script)
+        self.assertIn("function submitCurrentForm()", script)
         self.assertIn("function changeAccountPassword(", script)
         self.assertIn("function syncRailNavigation(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
@@ -621,7 +911,13 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("state.capabilities.features.local_processing", local_ready_block)
         self.assertIn('autoBackend === "local"', script)
         self.assertIn('state.capabilities.asr_modes.auto.available', script)
-        self.assertIn('apiFetch("/api/client-config"', script)
+        self.assertIn('state.user ? "/api/client-config" : "/api/public-config"', script)
+        self.assertIn("cloud_consent: true", script)
+        submit_block = script.split("function submitCurrentForm()", 1)[1].split(
+            "elements.form.addEventListener", 1
+        )[0]
+        self.assertLess(submit_block.index("validateInput()"), submit_block.index("requestCloudConfirmation"))
+        self.assertLess(submit_block.index("validateUpload()"), submit_block.index("requestCloudConfirmation"))
         self.assertIn("uploads.max_bytes", script)
         self.assertIn("body.dialog-open", css)
         self.assertNotIn("linear-gradient", css)
@@ -640,6 +936,12 @@ class FrontendRecoveryTests(unittest.TestCase):
             "staging_reserved_bytes",
         ):
             self.assertNotIn(internal_field, script)
+
+        example = (main.STATIC_DIR.parent.parent / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("GUEST_SESSION_TTL_SECONDS=", example)
+        self.assertIn("GUEST_MEDIA_MAX_ACTIVE=", example)
+        self.assertIn('"GUEST_SESSION_TTL_SECONDS"', (main.STATIC_DIR.parent / "main.py").read_text())
+        self.assertIn('"GUEST_MEDIA_MAX_ACTIVE"', (main.STATIC_DIR.parent / "main.py").read_text())
 
     def test_user_preferences_exclude_links_and_hotwords(self) -> None:
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")

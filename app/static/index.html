@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f7f8fa">
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260726-1">
-  <script src="/static/app.js?v=20260726-1" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260727-2">
+  <script src="/static/app.js?v=20260727-2" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -71,7 +71,15 @@
           </section>
         </div>
 
-        <div class="account-area" id="account-area" aria-busy="true">
+        <a class="guest-login-button" id="guest-login-button" href="/login" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path>
+            <path d="m10 17 5-5-5-5M15 12H3"></path>
+          </svg>
+          <span>登录 / 注册</span>
+        </a>
+
+        <div class="account-area" id="account-area" aria-busy="true" hidden>
           <button
             class="account-trigger"
             id="account-trigger"
@@ -159,6 +167,7 @@
             <path d="M7 11h2M13 11h4M7 15h4M15 15h2"></path>
           </svg>
           <span><strong>字幕提取</strong><small>链接或本地视频</small></span>
+          <em class="rail-access-badge" id="rail-subtitle-access" hidden>登录</em>
         </button>
         <button id="rail-video" type="button" data-operation="video">
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -206,6 +215,20 @@
           </button>
         </div>
 
+        <div class="guest-access-banner" id="guest-access-banner" hidden>
+          <span class="guest-access-icon" aria-hidden="true">
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="M12 3v12M7 10l5 5 5-5"></path>
+              <path d="M5 21h14"></path>
+            </svg>
+          </span>
+          <span>
+            <strong>免登录媒体提取</strong>
+            <small>视频和音频可直接使用</small>
+          </span>
+          <a href="/login">登录解锁字幕</a>
+        </div>
+
         <fieldset class="field-group operation-group">
           <legend>提取内容</legend>
           <div class="segmented-control operation-control">
@@ -244,24 +267,49 @@
         </fieldset>
 
         <section class="input-section">
-          <fieldset class="field-group input-mode-group" id="input-mode-group">
+          <fieldset class="field-group input-mode-group source-choice-group" id="input-mode-group">
             <legend>视频来源</legend>
-            <div class="segmented-control input-mode-control">
-              <label>
+            <div class="source-choice-grid input-mode-control">
+              <label class="source-choice">
                 <input type="radio" name="input-mode" value="link" checked>
-                <span>视频链接</span>
+                <span class="source-choice-card">
+                  <i class="source-choice-icon" aria-hidden="true">
+                    <svg class="icon" viewBox="0 0 24 24">
+                      <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"></path>
+                      <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"></path>
+                    </svg>
+                  </i>
+                  <span><strong>视频链接</strong><small>B站或抖音</small></span>
+                  <svg class="icon source-choice-check" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"></path>
+                  </svg>
+                </span>
               </label>
-              <label>
+              <label class="source-choice">
                 <input type="radio" name="input-mode" value="upload">
-                <span>上传文件</span>
+                <span class="source-choice-card">
+                  <i class="source-choice-icon upload" aria-hidden="true">
+                    <svg class="icon" viewBox="0 0 24 24">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                      <path d="m17 8-5-5-5 5M12 3v12"></path>
+                    </svg>
+                  </i>
+                  <span><strong>上传文件</strong><small>本地视频</small></span>
+                  <svg class="icon source-choice-check" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"></path>
+                  </svg>
+                </span>
               </label>
             </div>
           </fieldset>
 
-          <div id="link-input-panel">
-            <label class="field-label" for="video-input">链接或 BV 号</label>
+          <div class="source-panel" id="link-input-panel">
+            <div class="source-panel-heading">
+              <label class="field-label" for="video-input">粘贴视频链接</label>
+              <span>B站 · 抖音 · BV 号</span>
+            </div>
             <div class="input-combo">
-              <textarea id="video-input" name="input" rows="3" maxlength="512" required autocomplete="off" spellcheck="false" placeholder="粘贴 B站或抖音视频链接"></textarea>
+              <textarea id="video-input" name="input" rows="2" maxlength="512" required autocomplete="off" spellcheck="false" placeholder="https://www.bilibili.com/video/..."></textarea>
               <button class="input-action" id="paste-input" type="button">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
                   <rect width="14" height="14" x="8" y="8" rx="2"></rect>
@@ -280,8 +328,11 @@
             </div>
           </div>
 
-          <div class="upload-panel" id="upload-input-panel" hidden>
-            <label class="field-label" for="video-file">视频文件</label>
+          <div class="upload-panel source-panel" id="upload-input-panel" hidden>
+            <div class="source-panel-heading">
+              <label class="field-label" for="video-file">上传本地视频</label>
+              <span id="upload-limit">正在读取限制</span>
+            </div>
             <input class="visually-hidden" id="video-file" type="file" accept="video/*,.mkv,.flv,.ts,.mts,.m2ts,.wmv">
             <label class="upload-dropzone" id="upload-dropzone" for="video-file">
               <span class="upload-symbol" aria-hidden="true">
@@ -290,12 +341,11 @@
                   <path d="m17 8-5-5-5 5M12 3v12"></path>
                 </svg>
               </span>
-              <strong id="upload-file-title">选择视频</strong>
-              <span id="upload-file-detail">也可以拖放到这里</span>
+              <strong id="upload-file-title">选择视频文件</strong>
+              <span id="upload-file-detail">点击选择，或拖放到此处</span>
             </label>
             <div class="input-feedback upload-feedback">
               <p class="field-error" id="upload-error" role="alert"></p>
-              <span class="upload-limit" id="upload-limit">正在读取限制</span>
             </div>
           </div>
         </section>
@@ -319,29 +369,57 @@
         </fieldset>
 
         <fieldset class="field-group precision-group" id="quality-field-group">
-          <legend>识别服务</legend>
+          <legend>识别方式</legend>
           <div class="quality-options">
-            <label>
+            <label class="quality-option local-quality-option">
               <input type="radio" name="asr-mode" value="auto" checked>
               <span>
-                <strong id="asr-auto-title">本地基础</strong>
-                <small id="asr-auto-detail">本地处理</small>
+                <i class="quality-icon" aria-hidden="true">
+                  <svg class="icon" viewBox="0 0 24 24">
+                    <rect width="18" height="12" x="3" y="4" rx="2"></rect>
+                    <path d="M8 20h8M12 16v4"></path>
+                  </svg>
+                </i>
+                <span>
+                  <strong id="asr-auto-title">本地基础</strong>
+                  <small id="asr-auto-detail">默认 · 不使用云端额度</small>
+                </span>
+                <em>推荐</em>
               </span>
             </label>
-            <label>
-              <input type="radio" name="asr-mode" value="high_accuracy">
-              <span>
-                <strong>云端高精度</strong>
-                <small>千问 · 高级</small>
-              </span>
-            </label>
-            <label>
-              <input type="radio" name="asr-mode" value="economy">
-              <span>
-                <strong>云端经济</strong>
-                <small>Paraformer · 高级</small>
-              </span>
-            </label>
+            <section class="cloud-mode-zone" id="cloud-mode-zone">
+              <header>
+                <span>
+                  <i class="cloud-zone-icon" aria-hidden="true">
+                    <svg class="icon" viewBox="0 0 24 24">
+                      <path d="M17.5 19H9a7 7 0 1 1 6.7-9h1.8a4.5 4.5 0 1 1 0 9Z"></path>
+                    </svg>
+                  </i>
+                  <span>
+                    <strong>云端增强</strong>
+                    <small>会消耗站点的阿里云额度</small>
+                  </span>
+                </span>
+                <em>计费服务</em>
+              </header>
+              <div class="cloud-quality-options">
+                <label class="quality-option">
+                  <input type="radio" name="asr-mode" value="high_accuracy">
+                  <span>
+                    <strong>千问 ASR</strong>
+                    <small>高精度 · 复杂口音</small>
+                  </span>
+                </label>
+                <label class="quality-option">
+                  <input type="radio" name="asr-mode" value="economy">
+                  <span>
+                    <strong>Paraformer</strong>
+                    <small>经济 · 普通话</small>
+                  </span>
+                </label>
+              </div>
+              <p>只有平台字幕未命中且你明确确认后，才会调用云端。</p>
+            </section>
           </div>
           <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时在本站内部识别</p>
         </fieldset>
@@ -584,6 +662,44 @@
           <button class="primary-dialog-button" id="submit-password" type="submit">更新密码</button>
         </div>
       </form>
+    </section>
+  </div>
+
+  <div class="dialog-backdrop" id="cloud-confirm-dialog" hidden>
+    <section class="account-dialog cloud-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="cloud-confirm-title">
+      <header>
+        <div>
+          <p class="eyebrow">云端计费确认</p>
+          <h2 id="cloud-confirm-title">使用云端增强识别</h2>
+        </div>
+        <button class="icon-button" id="close-cloud-confirm" type="button" title="关闭" aria-label="关闭">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </header>
+      <div class="cloud-confirm-body">
+        <div class="cloud-confirm-summary">
+          <span aria-hidden="true">
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="M12 3v18M16 7.5c0-1.4-1.8-2.5-4-2.5S8 6.1 8 7.5s1.8 2.5 4 2.5 4 1.1 4 2.5-1.8 2.5-4 2.5-4-1.1-4-2.5"></path>
+            </svg>
+          </span>
+          <span>
+            <strong id="cloud-confirm-model">千问 ASR · 高精度</strong>
+            <small>平台已有字幕仍会优先使用，不会重复计费。</small>
+          </span>
+        </div>
+        <p>没有可用平台字幕时，临时音频会发送至阿里云百炼，并消耗站点账户额度。任务完成后会清理本站临时文件。</p>
+        <label class="cloud-confirm-check">
+          <input id="cloud-confirm-check" type="checkbox">
+          <span>我确认本次任务可以使用云端额度</span>
+        </label>
+        <div class="dialog-actions">
+          <button class="secondary-dialog-button" id="cancel-cloud-confirm" type="button">返回本地模式</button>
+          <button class="cloud-confirm-button" id="submit-cloud-confirm" type="button" disabled>确认并提交</button>
+        </div>
+      </div>
     </section>
   </div>
 

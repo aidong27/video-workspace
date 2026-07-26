@@ -54,6 +54,8 @@
     bilibiliChip: $("bilibili-chip"),
     douyinChip: $("douyin-chip"),
     uploadChip: $("upload-chip"),
+    guestLoginButton: $("guest-login-button"),
+    guestAccessBanner: $("guest-access-banner"),
     accountArea: $("account-area"),
     accountAvatar: $("account-avatar"),
     accountAvatarLarge: $("account-avatar-large"),
@@ -75,8 +77,16 @@
     closePasswordDialog: $("close-password-dialog"),
     cancelPasswordDialog: $("cancel-password-dialog"),
     submitPassword: $("submit-password"),
+    cloudModeZone: $("cloud-mode-zone"),
+    cloudConfirmDialog: $("cloud-confirm-dialog"),
+    cloudConfirmModel: $("cloud-confirm-model"),
+    cloudConfirmCheck: $("cloud-confirm-check"),
+    closeCloudConfirm: $("close-cloud-confirm"),
+    cancelCloudConfirm: $("cancel-cloud-confirm"),
+    submitCloudConfirm: $("submit-cloud-confirm"),
     railNewTask: $("rail-new-task"),
     railSubtitle: $("rail-subtitle"),
+    railSubtitleAccess: $("rail-subtitle-access"),
     railVideo: $("rail-video"),
     railAudio: $("rail-audio"),
     resultKicker: $("result-kicker"),
@@ -141,6 +151,7 @@
     current: null,
     resuming: false,
     user: null,
+    guest: false,
     capabilities: null,
     history: [],
     uploadMaxBytes: 512 * 1024 * 1024,
@@ -150,7 +161,8 @@
     mobileView: "compose",
     preferencesLoaded: false,
     pageLookupTimer: null,
-    biliBaseUrl: ""
+    biliBaseUrl: "",
+    pendingCloudAction: null
   };
 
   const sourceLabels = {
@@ -220,6 +232,13 @@
     job_not_found: "服务可能已重启或任务已过期，请重新提交。",
     idempotency_conflict: "这次提交与上一次请求不一致，请重新提交。",
     authentication_required: "登录已失效，正在返回登录页。",
+    guest_session_expired: "游客任务凭据已失效，请重新提交。",
+    guest_media_busy: "当前已有一个免登录媒体任务，请等待完成。",
+    guest_media_session_limit: "这个浏览器的免登录提取次数较多，请稍后再试。",
+    guest_media_global_limit: "当前免登录提取请求较多，请稍后再试。",
+    guest_media_duration_too_long: "视频时长超过免登录提取限制，请登录后重试。",
+    media_duration_too_long: "视频时长超过当前媒体提取限制。",
+    cloud_consent_required: "请先确认云端识别会消耗站点额度。",
     current_password_invalid: "当前密码不正确。",
     password_unchanged: "新密码不能与当前密码相同。",
     password_too_short: "新密码至少需要 8 个字符。",
@@ -259,6 +278,10 @@
     return `video-workspace-preferences-v1:${userId}`;
   }
 
+  function storageOwnerKey() {
+    return state.user ? String(state.user.id) : "guest";
+  }
+
   function loadPreferences(userId) {
     let value = {};
     try {
@@ -267,8 +290,11 @@
       value = {};
     }
     if (!value || typeof value !== "object" || Array.isArray(value)) value = {};
-    setSelectedOperation(["subtitle", "video", "audio"].includes(value.operation) ? value.operation : "subtitle");
-    setInputMode(value.inputMode === "upload" ? "upload" : "link");
+    const operation = ["subtitle", "video", "audio"].includes(value.operation)
+      ? value.operation
+      : state.user ? "subtitle" : "video";
+    setSelectedOperation(!state.user && operation === "subtitle" ? "video" : operation);
+    setInputMode(state.user && value.inputMode === "upload" ? "upload" : "link");
     setSelectedSource(["auto", "official", "asr"].includes(value.source) ? value.source : "auto");
     setSelectedAsrMode(
       ["auto", "high_accuracy", "economy"].includes(value.asrMode)
@@ -287,7 +313,7 @@
   }
 
   function savePreferences() {
-    if (!state.user || !state.preferencesLoaded) return;
+    if (!state.preferencesLoaded) return;
     const value = {
       operation: selectedOperation(),
       inputMode: selectedInputMode(),
@@ -302,7 +328,7 @@
       wrapOutput: state.wrapOutput
     };
     try {
-      localStorage.setItem(preferencesStorageKey(state.user.id), JSON.stringify(value));
+      localStorage.setItem(preferencesStorageKey(storageOwnerKey()), JSON.stringify(value));
     } catch (_) {
       return;
     }
@@ -318,9 +344,8 @@
   }
 
   function saveHistory() {
-    if (!state.user) return;
     try {
-      localStorage.setItem(historyStorageKey(state.user.id), JSON.stringify(state.history.slice(0, 8)));
+      localStorage.setItem(historyStorageKey(storageOwnerKey()), JSON.stringify(state.history.slice(0, 8)));
     } catch (_) {
       return;
     }
@@ -331,20 +356,19 @@
   }
 
   function clearActiveJob() {
-    if (!state.user) return;
     try {
-      localStorage.removeItem(activeJobStorageKey(state.user.id));
+      localStorage.removeItem(activeJobStorageKey(storageOwnerKey()));
     } catch (_) {
       return;
     }
   }
 
   function saveActiveJob() {
-    if (!state.user || !state.jobId || !state.currentPayload) return;
+    if (!state.jobId || !state.currentPayload) return;
     try {
       const persistedPayload = Object.assign({}, state.currentPayload);
       delete persistedPayload.hotwords;
-      localStorage.setItem(activeJobStorageKey(state.user.id), JSON.stringify({
+      localStorage.setItem(activeJobStorageKey(storageOwnerKey()), JSON.stringify({
         jobId: state.jobId,
         payload: persistedPayload,
         startedAt: state.startedAt || Date.now(),
@@ -386,10 +410,10 @@
   }
 
   function resumeActiveJob() {
-    if (!state.user || state.busy) return;
+    if (state.busy) return;
     let saved;
     try {
-      saved = JSON.parse(localStorage.getItem(activeJobStorageKey(state.user.id)) || "null");
+      saved = JSON.parse(localStorage.getItem(activeJobStorageKey(storageOwnerKey())) || "null");
     } catch (_) {
       clearActiveJob();
       return;
@@ -413,7 +437,7 @@
 
   async function apiFetch(url, options) {
     const response = await fetch(url, options);
-    if (response.status === 401) {
+    if (response.status === 401 && state.user) {
       window.location.replace("/login");
     }
     return response;
@@ -435,10 +459,26 @@
     elements.accountTrigger.setAttribute("aria-expanded", String(visible));
   }
 
+  function applyAccessState() {
+    const isGuest = !state.user;
+    state.guest = isGuest;
+    elements.accountArea.hidden = isGuest;
+    elements.guestLoginButton.hidden = !isGuest;
+    elements.guestAccessBanner.hidden = !isGuest;
+    elements.railSubtitleAccess.hidden = !isGuest;
+    if (isGuest && selectedOperation() === "subtitle") {
+      setSelectedOperation("video");
+    }
+    syncInputMode();
+  }
+
   function setPasswordDialog(open) {
     const visible = Boolean(open);
     elements.passwordDialog.hidden = !visible;
-    document.body.classList.toggle("dialog-open", visible);
+    document.body.classList.toggle(
+      "dialog-open",
+      visible || !elements.cloudConfirmDialog.hidden
+    );
     if (visible) {
       setAccountMenu(false);
       elements.passwordError.textContent = "";
@@ -447,12 +487,74 @@
     }
   }
 
+  function setCloudConfirmDialog(open, resetMode) {
+    const visible = Boolean(open);
+    elements.cloudConfirmDialog.hidden = !visible;
+    document.body.classList.toggle(
+      "dialog-open",
+      visible || !elements.passwordDialog.hidden
+    );
+    if (!visible) {
+      state.pendingCloudAction = null;
+      elements.cloudConfirmCheck.checked = false;
+      elements.submitCloudConfirm.disabled = true;
+      if (resetMode) {
+        setSelectedAsrMode("auto");
+        syncPrecisionOptions();
+        savePreferences();
+      }
+      return;
+    }
+    setAccountMenu(false);
+    elements.cloudConfirmCheck.checked = false;
+    elements.submitCloudConfirm.disabled = true;
+    elements.cloudConfirmModel.textContent = selectedAsrMode() === "economy"
+      ? "Paraformer · 经济模式"
+      : "千问 ASR · 高精度";
+    requestAnimationFrame(() => elements.cloudConfirmCheck.focus());
+  }
+
+  function requestCloudConfirmation(action) {
+    if (!["high_accuracy", "economy"].includes(selectedAsrMode())) {
+      action();
+      return;
+    }
+    if (!state.user) {
+      showToast("云端识别需要先登录。", true);
+      window.location.assign("/login");
+      return;
+    }
+    state.pendingCloudAction = action;
+    setCloudConfirmDialog(true, false);
+  }
+
+  function confirmCloudAction() {
+    if (!elements.cloudConfirmCheck.checked || !state.pendingCloudAction) return;
+    const action = state.pendingCloudAction;
+    state.pendingCloudAction = null;
+    elements.cloudConfirmDialog.hidden = true;
+    elements.cloudConfirmCheck.checked = false;
+    elements.submitCloudConfirm.disabled = true;
+    document.body.classList.toggle("dialog-open", !elements.passwordDialog.hidden);
+    action();
+  }
+
   async function loadAccount() {
     try {
-      const response = await apiFetch("/api/auth/me", { cache: "no-store" });
+      const response = await fetch("/api/auth/me", { cache: "no-store" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok || !data.user) return;
+      if (response.status === 401 || !data.user) {
+        state.user = null;
+        applyAccessState();
+        loadPreferences("guest");
+        state.history = loadHistory("guest");
+        renderHistory();
+        resumeActiveJob();
+        return false;
+      }
+      if (!response.ok) throw new Error(String(response.status));
       state.user = data.user;
+      applyAccessState();
       elements.accountName.textContent = data.user.username;
       const initial = String(data.user.username || "?").charAt(0).toUpperCase();
       elements.accountAvatar.textContent = initial;
@@ -468,8 +570,10 @@
       renderHistory();
       if (state.jobId && state.busy) saveActiveJob();
       else resumeActiveJob();
+      return true;
     } catch (_) {
       elements.accountName.textContent = "连接失败";
+      return false;
     }
   }
 
@@ -702,14 +806,18 @@
   function updateSubmitLabel() {
     if (state.busy) return;
     const operation = selectedOperation();
+    const unavailable = operation !== "subtitle" && !state.mediaEnabled;
+    elements.extractButton.disabled = unavailable;
     elements.taskHeading.textContent = operation === "video"
       ? "提取视频"
       : operation === "audio" ? "提取音频" : "提取字幕";
-    elements.extractButtonLabel.textContent = operation === "video"
-      ? "提取视频"
-      : operation === "audio"
-        ? "提取音频"
-        : selectedInputMode() === "upload" ? "开始识别" : "开始提取";
+    elements.extractButtonLabel.textContent = unavailable
+      ? "当前暂不可用"
+      : operation === "video"
+        ? state.guest ? "免登录提取视频" : "提取视频"
+        : operation === "audio"
+          ? state.guest ? "免登录提取音频" : "提取音频"
+          : selectedInputMode() === "upload" ? "开始识别" : "开始提取";
   }
 
   function syncRailNavigation() {
@@ -719,39 +827,48 @@
       button.classList.toggle("active", selected);
       button.setAttribute("aria-current", selected ? "page" : "false");
       button.disabled = state.busy
+        || (button.dataset.operation === "subtitle" && state.guest)
         || (button.dataset.operation !== "subtitle" && !state.mediaEnabled);
     });
   }
 
   function syncInputMode() {
-    const operation = selectedOperation();
+    let operation = selectedOperation();
+    if (state.guest && operation === "subtitle") {
+      const videoRadio = elements.form.querySelector('input[name="operation"][value="video"]');
+      if (videoRadio) videoRadio.checked = true;
+      operation = "video";
+    }
     const mediaMode = operation !== "subtitle";
     const linkRadio = elements.form.querySelector('input[name="input-mode"][value="link"]');
     const uploadRadio = elements.form.querySelector('input[name="input-mode"][value="upload"]');
     if (mediaMode && uploadRadio.checked) linkRadio.checked = true;
     const uploadMode = !mediaMode && selectedInputMode() === "upload";
-    const uploadsEnabled = !state.capabilities
+    const uploadsEnabled = !state.guest && (!state.capabilities
       || !state.capabilities.uploads
-      || state.capabilities.uploads.enabled !== false;
+      || state.capabilities.uploads.enabled !== false);
     elements.inputModeGroup.hidden = mediaMode;
     elements.linkInputPanel.hidden = uploadMode;
     elements.uploadInputPanel.hidden = !uploadMode;
     elements.sourceFieldGroup.hidden = uploadMode || mediaMode;
     elements.subtitleFormatGrid.hidden = mediaMode;
+    elements.privacyNote.hidden = mediaMode;
     elements.platformAiRow.hidden = uploadMode || mediaMode || elements.embeddedSubtitles.checked;
     const cookieReady = Boolean(
       state.capabilities
       && state.capabilities.features
       && state.capabilities.features.bilibili_cookie
     );
-    elements.cookieRow.hidden = uploadMode || !cookieReady;
+    elements.cookieRow.hidden = state.guest || uploadMode || !cookieReady;
     elements.input.required = !uploadMode;
     elements.clearInput.title = uploadMode ? "清除视频" : "清空输入";
-    uploadRadio.disabled = state.busy || mediaMode || !uploadsEnabled;
+    uploadRadio.disabled = state.busy || state.guest || mediaMode || !uploadsEnabled;
     linkRadio.disabled = state.busy;
     elements.videoFile.disabled = state.busy || !uploadsEnabled;
     elements.form.querySelectorAll('input[name="operation"]').forEach((radio) => {
-      radio.disabled = state.busy || (radio.value !== "subtitle" && !state.mediaEnabled);
+      radio.disabled = state.busy
+        || (radio.value === "subtitle" && state.guest)
+        || (radio.value !== "subtitle" && !state.mediaEnabled);
     });
     syncRailNavigation();
     elements.forceRefreshLabel.textContent = mediaMode ? "重新获取平台信息" : "忽略已有结果";
@@ -812,7 +929,9 @@
     const autoUsesLocal = !state.capabilities || autoBackend === "local";
     const autoRadio = elements.form.querySelector('input[name="asr-mode"][value="auto"]');
     elements.asrAutoTitle.textContent = autoUsesLocal ? "本地基础" : "自动识别";
-    elements.asrAutoDetail.textContent = autoUsesLocal ? "本地处理" : "智能选择";
+    elements.asrAutoDetail.textContent = autoUsesLocal
+      ? "默认 · 不使用云端额度"
+      : "智能选择可用服务";
     elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
       const unavailable = radio.value === "auto"
         ? !autoReady
@@ -835,6 +954,10 @@
     elements.hotwords.disabled = state.busy || !subtitleMode;
     elements.hotwordsRow.hidden = !subtitleMode;
     const currentMode = selectedAsrMode();
+    elements.cloudModeZone.classList.toggle(
+      "selected",
+      currentMode === "high_accuracy" || currentMode === "economy"
+    );
     const currentModeReady = currentMode === "auto" ? autoReady : cloudReady;
     elements.qualityCaption.textContent = !currentModeReady
       ? "当前识别服务暂不可用，平台已有字幕仍可正常提取"
@@ -986,6 +1109,7 @@
           hotwords: elements.hotwords.value.trim() || null,
           quality: selectedQuality(),
           asr_mode: selectedAsrMode(),
+          cloud_consent: false,
           embedded_subtitles: selectedEmbeddedSubtitles(),
           use_cookie: elements.useCookie.checked,
           allow_platform_ai: elements.allowPlatformAi.checked,
@@ -1320,7 +1444,7 @@
         elements.forceRefresh.checked = false;
         updatePlatformDetect();
         schedulePageLookup();
-        runExtraction();
+        submitCurrentForm();
       });
       elements.recentList.appendChild(button);
     });
@@ -1460,7 +1584,7 @@
     }
   }
 
-  function runUpload() {
+  function runUpload(cloudConsent) {
     if (state.busy || !validateUpload()) return;
     const file = state.uploadFile;
     const payload = {
@@ -1473,6 +1597,7 @@
       hotwords: elements.hotwords.value.trim() || null,
       quality: selectedQuality(),
       asr_mode: selectedAsrMode(),
+      cloud_consent: Boolean(cloudConsent),
       embedded_subtitles: selectedEmbeddedSubtitles(),
       force_refresh: elements.forceRefresh.checked
     };
@@ -1482,6 +1607,7 @@
       format: payload.format,
       quality: payload.quality,
       asr_mode: payload.asr_mode,
+      cloud_consent: String(payload.cloud_consent),
       embedded_subtitles: String(payload.embedded_subtitles),
       force_refresh: String(payload.force_refresh)
     });
@@ -1655,13 +1781,16 @@
     elements.forceRefresh.checked = true;
     syncInputMode();
     savePreferences();
-    runExtraction({
-      source: "asr",
-      quality: "accurate",
-      asr_mode: "high_accuracy",
-      embedded_subtitles: false,
-      allow_platform_ai: false,
-      force_refresh: true
+    requestCloudConfirmation(() => {
+      runExtraction({
+        source: "asr",
+        quality: "accurate",
+        asr_mode: "high_accuracy",
+        cloud_consent: true,
+        embedded_subtitles: false,
+        allow_platform_ai: false,
+        force_refresh: true
+      });
     });
   }
 
@@ -1696,28 +1825,34 @@
       if (!healthResponse.ok) throw new Error(String(healthResponse.status));
       const health = await healthResponse.json();
       if (health.status !== "ok") throw new Error("unhealthy");
-      const configResponse = await apiFetch("/api/client-config", { cache: "no-store" });
+      const configEndpoint = state.user ? "/api/client-config" : "/api/public-config";
+      const configResponse = state.user
+        ? await apiFetch(configEndpoint, { cache: "no-store" })
+        : await fetch(configEndpoint, { cache: "no-store" });
       if (!configResponse.ok) throw new Error(String(configResponse.status));
       state.capabilities = await configResponse.json();
       const features = state.capabilities.features || {};
       const platforms = state.capabilities.platforms || {};
+      const isGuest = !state.user;
       elements.serviceState.className = "service-state online";
       elements.serviceLabel.textContent = "服务在线";
       elements.healthSummary.textContent = "已连接";
       setHealthValue(
         elements.healthLocal,
-        features.local_processing ? "可用" : "暂不可用",
-        features.local_processing ? "" : "warn"
+        isGuest ? "登录后可用" : features.local_processing ? "可用" : "暂不可用",
+        isGuest || features.local_processing ? "" : "warn"
       );
       setHealthValue(
         elements.healthCloud,
-        features.cloud_enhancement ? "可选" : "未启用",
-        features.cloud_enhancement ? "" : "warn"
+        isGuest ? "登录后可用" : features.cloud_enhancement ? "可选" : "未启用",
+        isGuest || features.cloud_enhancement ? "" : "warn"
       );
-      const filesReady = Boolean(features.uploads && features.media);
+      const filesReady = isGuest
+        ? Boolean(features.guest_media)
+        : Boolean(features.uploads && features.media);
       setHealthValue(
         elements.healthFiles,
-        filesReady ? "可用" : "部分受限",
+        filesReady ? isGuest ? "免登录可用" : "可用" : "部分受限",
         filesReady ? "" : "warn"
       );
       elements.bilibiliChip.classList.toggle("unavailable", platforms.bilibili === false);
@@ -1725,21 +1860,33 @@
         "unavailable",
         platforms.douyin === false
       );
-      const uploads = state.capabilities.uploads || {};
-      const uploadsEnabled = uploads.enabled !== false;
-      state.uploadMaxBytes = Number(uploads.max_bytes || state.uploadMaxBytes);
-      state.uploadExtensions = Array.isArray(uploads.allowed_extensions) ? uploads.allowed_extensions : [];
-      elements.uploadLimit.textContent = `最大 ${formatBytes(state.uploadMaxBytes)}`;
+      const uploads = isGuest ? {} : state.capabilities.uploads || {};
+      const uploadsEnabled = !isGuest && uploads.enabled !== false;
+      if (!isGuest) {
+        state.uploadMaxBytes = Number(uploads.max_bytes || state.uploadMaxBytes);
+        state.uploadExtensions = Array.isArray(uploads.allowed_extensions) ? uploads.allowed_extensions : [];
+        elements.uploadLimit.textContent = `最大 ${formatBytes(state.uploadMaxBytes)}`;
+      } else {
+        const guestMedia = state.capabilities.guest_media || {};
+        elements.uploadLimit.textContent = "登录后可上传";
+        elements.guestAccessBanner.querySelector("strong").textContent = guestMedia.enabled
+          ? `免登录可提取视频或音频，最长 ${Math.max(1, Math.round(Number(guestMedia.max_duration_seconds || 0) / 60))} 分钟`
+          : "免登录媒体提取暂不可用";
+      }
       elements.uploadChip.classList.toggle(
         "unavailable",
         !uploadsEnabled || platforms.upload === false
       );
-      const media = state.capabilities.media || {};
-      state.mediaEnabled = media.enabled !== false;
-      if (!state.mediaEnabled && selectedOperation() !== "subtitle") setSelectedOperation("subtitle");
+      const media = isGuest
+        ? state.capabilities.guest_media || {}
+        : state.capabilities.media || {};
+      state.mediaEnabled = media.enabled !== false && (!isGuest || features.guest_media === true);
+      if (!state.mediaEnabled && !isGuest && selectedOperation() !== "subtitle") {
+        setSelectedOperation("subtitle");
+      }
       if (!uploadsEnabled && selectedInputMode() === "upload") setInputMode("link");
       else syncInputMode();
-      elements.loginSection.hidden = !features.bilibili_qr_login;
+      elements.loginSection.hidden = isGuest || !features.bilibili_qr_login;
     } catch (_) {
       elements.serviceState.className = "service-state offline";
       elements.serviceLabel.textContent = "服务异常";
@@ -1751,7 +1898,7 @@
       elements.douyinChip.classList.add("unavailable");
       elements.uploadChip.classList.add("unavailable");
       state.mediaEnabled = false;
-      if (selectedOperation() !== "subtitle") setSelectedOperation("subtitle");
+      if (!state.guest && selectedOperation() !== "subtitle") setSelectedOperation("subtitle");
       syncInputMode();
     }
   }
@@ -1801,10 +1948,30 @@
     state.loginPollTimer = setInterval(() => pollLogin(data.qrcode_key), 2000);
   }
 
+  function submitCurrentForm() {
+    if (state.busy) return;
+    if (selectedInputMode() === "upload") {
+      if (!validateUpload()) return;
+    } else if (!validateInput()) {
+      return;
+    }
+    const action = selectedInputMode() === "upload"
+      ? () => runUpload(true)
+      : () => runExtraction({ cloud_consent: true });
+    if (
+      selectedOperation() === "subtitle"
+      && ["high_accuracy", "economy"].includes(selectedAsrMode())
+    ) {
+      requestCloudConfirmation(action);
+      return;
+    }
+    if (selectedInputMode() === "upload") runUpload(false);
+    else runExtraction();
+  }
+
   elements.form.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (selectedInputMode() === "upload") runUpload();
-    else runExtraction();
+    submitCurrentForm();
   });
   elements.form.querySelectorAll('input[name="input-mode"]').forEach((radio) => {
     radio.addEventListener("change", () => {
@@ -1832,7 +1999,7 @@
       showToast("当前任务完成后即可新建任务。", true);
       return;
     }
-    setSelectedOperation("subtitle");
+    setSelectedOperation(state.guest ? "video" : "subtitle");
     setInputMode("link");
     elements.input.value = "";
     elements.inputError.textContent = "";
@@ -1869,7 +2036,7 @@
   elements.input.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
       event.preventDefault();
-      if (selectedInputMode() === "link") runExtraction();
+      if (selectedInputMode() === "link") submitCurrentForm();
     }
   });
   elements.videoFile.addEventListener("change", () => {
@@ -1913,7 +2080,14 @@
   elements.format.addEventListener("change", () => {
     savePreferences();
     if (selectedOperation() === "subtitle" && selectedInputMode() === "link" && !state.busy && state.current && state.current.input === elements.input.value.trim()) {
-      runExtraction({ force_refresh: false });
+      if (["high_accuracy", "economy"].includes(selectedAsrMode())) {
+        requestCloudConfirmation(() => runExtraction({
+          force_refresh: false,
+          cloud_consent: true
+        }));
+      } else {
+        runExtraction({ force_refresh: false });
+      }
     }
   });
   elements.lang.addEventListener("change", savePreferences);
@@ -1950,6 +2124,15 @@
   elements.passwordDialog.addEventListener("click", (event) => {
     if (event.target === elements.passwordDialog) setPasswordDialog(false);
   });
+  elements.cloudConfirmCheck.addEventListener("change", () => {
+    elements.submitCloudConfirm.disabled = !elements.cloudConfirmCheck.checked;
+  });
+  elements.closeCloudConfirm.addEventListener("click", () => setCloudConfirmDialog(false, false));
+  elements.cancelCloudConfirm.addEventListener("click", () => setCloudConfirmDialog(false, true));
+  elements.submitCloudConfirm.addEventListener("click", confirmCloudAction);
+  elements.cloudConfirmDialog.addEventListener("click", (event) => {
+    if (event.target === elements.cloudConfirmDialog) setCloudConfirmDialog(false, false);
+  });
   document.addEventListener("click", (event) => {
     if (!elements.healthPopover.hidden && !event.target.closest(".health-menu")) {
       setHealthPopover(false);
@@ -1963,6 +2146,7 @@
     setHealthPopover(false);
     setAccountMenu(false);
     if (!elements.passwordDialog.hidden) setPasswordDialog(false);
+    if (!elements.cloudConfirmDialog.hidden) setCloudConfirmDialog(false, false);
   });
   elements.clearHistory.addEventListener("click", () => {
     state.history = [];
@@ -1972,13 +2156,17 @@
   elements.loginStart.addEventListener("click", startLogin);
   elements.logoutAccount.addEventListener("click", logoutAccount);
 
-  renderHistory();
-  applyWrapPreference();
-  setMobileView("compose");
-  updatePlatformDetect();
-  syncInputMode();
-  loadAccount();
-  loadHealth();
+  async function initializeApp() {
+    renderHistory();
+    applyWrapPreference();
+    setMobileView("compose");
+    updatePlatformDetect();
+    syncInputMode();
+    await loadAccount();
+    await loadHealth();
+    requestAnimationFrame(() => document.body.classList.add("app-ready"));
+  }
+
+  initializeApp();
   setInterval(loadHealth, 30000);
-  requestAnimationFrame(() => document.body.classList.add("app-ready"));
 })();

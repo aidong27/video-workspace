@@ -276,6 +276,14 @@ class JobManager:
                 "max_pending": self.max_pending,
             }
 
+    def owner_stats(self, owner_id: int) -> dict[str, int]:
+        with self.lock:
+            owned = [item for item in self.records.values() if item.owner_id == owner_id]
+            return {
+                "queued": sum(item.status == "queued" for item in owned),
+                "running": sum(item.status == "running" for item in owned),
+            }
+
     def cleanup(self) -> int:
         now = time.time()
         removed = 0

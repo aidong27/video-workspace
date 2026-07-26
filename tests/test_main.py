@@ -906,6 +906,59 @@ class LocalMediaFixtureTests(unittest.TestCase):
 
 
 class ResourceSafetyTests(unittest.TestCase):
+    def test_ytdlp_worker_enforces_guest_duration_and_bounded_height(self) -> None:
+        messages: list[dict] = []
+        captured: dict = {}
+        case = self
+
+        class FakeQueue:
+            def put(self, value, timeout=None):
+                del timeout
+                messages.append(value)
+
+            def put_nowait(self, value):
+                messages.append(value)
+
+        class FakeYdl:
+            def __init__(self, options):
+                captured.update(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def extract_info(self, _url, download):
+                case.assertTrue(download)
+                reason = captured["match_filter"]({"duration": 61})
+                raise RuntimeError(reason)
+
+        payload = {
+            "url": "https://www.bilibili.com/video/BV14jFvzbEvj",
+            "target_dir": ".",
+            "mode": "media",
+            "media_type": "video",
+            "max_bytes": 1024,
+            "max_duration_seconds": 60,
+            "max_video_height": 720,
+            "duration_limit_reason": "guest_media_duration_too_long",
+        }
+        with patch.object(main, "YoutubeDL", FakeYdl), patch.object(
+            main.os,
+            "setsid",
+            return_value=None,
+        ):
+            main.ytdlp_download_worker(payload, FakeQueue())
+
+        result = next(item for item in messages if item.get("kind") == "result")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "guest_media_duration_too_long")
+        self.assertEqual(
+            captured["format"],
+            "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        )
+
     def test_audio_normalization_applies_only_the_configured_filter(self) -> None:
         def fake_run(command, **_kwargs):
             Path(command[-1]).write_bytes(b"wav")
