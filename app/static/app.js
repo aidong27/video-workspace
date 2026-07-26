@@ -47,10 +47,10 @@
     serviceLabel: $("service-label"),
     healthTrigger: $("health-trigger"),
     healthPopover: $("health-popover"),
-    healthVersion: $("health-version"),
-    healthQueue: $("health-queue"),
-    healthAsr: $("health-asr"),
-    healthDisk: $("health-disk"),
+    healthSummary: $("health-summary"),
+    healthLocal: $("health-local"),
+    healthCloud: $("health-cloud"),
+    healthFiles: $("health-files"),
     bilibiliChip: $("bilibili-chip"),
     douyinChip: $("douyin-chip"),
     uploadChip: $("upload-chip"),
@@ -141,12 +141,11 @@
     current: null,
     resuming: false,
     user: null,
-    health: null,
+    capabilities: null,
     history: [],
     uploadMaxBytes: 512 * 1024 * 1024,
     uploadExtensions: [],
     mediaEnabled: true,
-    mediaMaxBytes: 1000 * 1000 * 1000,
     wrapOutput: true,
     mobileView: "compose",
     preferencesLoaded: false,
@@ -171,8 +170,8 @@
     asr_busy: "等待语音识别资源超时，请稍后重试。",
     asr_duration_too_long: "视频时长超过当前服务限制。",
     asr_timeout: "语音识别超时，可稍后重试或使用更短的视频。",
-    asr_worker_crashed: "语音识别进程意外退出，可能是内存不足，请稍后重试。",
-    asr_model_download_failed: "语音识别模型不可用，请检查模型缓存与服务器网络。",
+    asr_worker_crashed: "基础识别意外中断，请稍后重试。",
+    asr_model_download_failed: "基础识别暂不可用，请稍后重试。",
     download_failed: "视频、音频或字幕下载失败，请稍后重试。",
     asr_failed: "本地语音识别失败，请稍后重试。",
     asr_provider_not_configured: "云端语音识别尚未完成配置。",
@@ -202,16 +201,16 @@
     upload_video_missing: "选择的文件不包含视频画面。",
     upload_audio_missing: "这个视频没有可识别的音轨。",
     upload_too_large: "视频文件超过当前上传限制。",
-    upload_storage_busy: "服务器上传暂存空间正忙，请稍后再试。",
+    upload_storage_busy: "上传空间正忙，请稍后再试。",
     upload_interrupted: "视频上传中断，请重试。",
     upload_expired: "上传视频已过期，请重新选择。",
-    media_storage_busy: "服务器媒体暂存空间正忙，请稍后再试。",
+    media_storage_busy: "媒体处理空间正忙，请稍后再试。",
     media_too_large: "媒体文件超过当前下载限制。",
     video_stream_missing: "没有找到可下载的视频画面。",
     audio_stream_missing: "没有找到可提取的音轨。",
     media_convert_failed: "音频转换失败，请稍后重试。",
     ffmpeg_failed: "媒体探测或转换失败，请确认文件可正常播放。",
-    disk_space_low: "服务器剩余磁盘空间不足，请稍后重试。",
+    disk_space_low: "处理空间暂时不足，请稍后重试。",
     no_audio_stream: "视频没有音轨，无法识别语音或生成 MP3。",
     subtitle_unavailable: "没有找到可读取的字幕或语音内容。",
     job_queue_full: "任务队列已满，请稍后重试。",
@@ -408,7 +407,7 @@
     const platform = saved.payload.kind === "upload" ? "upload" : detectPlatform(saved.payload.input || "");
     elements.resultKicker.textContent = `${platformLabel(platform)}任务`;
     elements.resultTitle.textContent = "正在恢复任务";
-    showStatus("processing", "正在恢复任务", "正在读取服务器上的处理进度", 4, "…");
+    showStatus("processing", "正在恢复任务", "正在读取最新处理进度", 4, "…");
     pollJob();
   }
 
@@ -731,14 +730,20 @@
     const uploadRadio = elements.form.querySelector('input[name="input-mode"][value="upload"]');
     if (mediaMode && uploadRadio.checked) linkRadio.checked = true;
     const uploadMode = !mediaMode && selectedInputMode() === "upload";
-    const uploadsEnabled = !state.health || !state.health.uploads || state.health.uploads.enabled !== false;
+    const uploadsEnabled = !state.capabilities
+      || !state.capabilities.uploads
+      || state.capabilities.uploads.enabled !== false;
     elements.inputModeGroup.hidden = mediaMode;
     elements.linkInputPanel.hidden = uploadMode;
     elements.uploadInputPanel.hidden = !uploadMode;
     elements.sourceFieldGroup.hidden = uploadMode || mediaMode;
     elements.subtitleFormatGrid.hidden = mediaMode;
     elements.platformAiRow.hidden = uploadMode || mediaMode || elements.embeddedSubtitles.checked;
-    const cookieReady = Boolean(state.health && state.health.cookie_enabled && state.health.cookie_configured);
+    const cookieReady = Boolean(
+      state.capabilities
+      && state.capabilities.features
+      && state.capabilities.features.bilibili_cookie
+    );
     elements.cookieRow.hidden = uploadMode || !cookieReady;
     elements.input.required = !uploadMode;
     elements.clearInput.title = uploadMode ? "清除视频" : "清空输入";
@@ -772,17 +777,18 @@
   }
 
   function isLocalAsrReady() {
-    if (!state.health) return true;
-    return state.health.local_asr_enabled === true
-      && state.health.ffmpeg_available === true
-      && state.health.ffprobe_available === true;
+    if (!state.capabilities) return true;
+    return Boolean(
+      state.capabilities.features
+      && state.capabilities.features.local_processing
+    );
   }
 
   function syncPrecisionOptions() {
     const subtitleMode = selectedOperation() === "subtitle";
-    const videoSubtitleReady = !state.health
-      || !state.health.ocr
-      || state.health.ocr.embedded_tracks_enabled !== false;
+    const videoSubtitleReady = !state.capabilities
+      || !state.capabilities.features
+      || state.capabilities.features.embedded_subtitles !== false;
     elements.embeddedSubtitles.disabled = state.busy || !subtitleMode || !videoSubtitleReady;
     const embedded = subtitleMode && selectedEmbeddedSubtitles();
     if (embedded) {
@@ -792,23 +798,21 @@
     elements.embeddedSubtitleRow.hidden = !subtitleMode;
     const localReady = isLocalAsrReady();
     const cloudReady = Boolean(
-      state.health
-      && state.health.cloud_asr
-      && state.health.cloud_asr.enabled
-      && state.health.cloud_asr.configured
+      state.capabilities
+      && state.capabilities.features
+      && state.capabilities.features.cloud_enhancement
     );
-    const autoBackend = state.health
-      && state.health.asr_modes
-      && state.health.asr_modes.auto
-      ? state.health.asr_modes.auto.backend
+    const autoBackend = state.capabilities
+      && state.capabilities.asr_modes
+      && state.capabilities.asr_modes.auto
+      ? state.capabilities.asr_modes.auto.processing
       : null;
-    const autoReady = !state.health
-      || (autoBackend === "local" && localReady)
-      || (autoBackend === "cloud" && cloudReady);
-    const autoUsesLocal = !state.health || autoBackend === "local";
+    const autoReady = !state.capabilities
+      || Boolean(state.capabilities.asr_modes && state.capabilities.asr_modes.auto.available);
+    const autoUsesLocal = !state.capabilities || autoBackend === "local";
     const autoRadio = elements.form.querySelector('input[name="asr-mode"][value="auto"]');
     elements.asrAutoTitle.textContent = autoUsesLocal ? "本地基础" : "自动识别";
-    elements.asrAutoDetail.textContent = autoUsesLocal ? "服务器处理" : "按可用服务处理";
+    elements.asrAutoDetail.textContent = autoUsesLocal ? "本地处理" : "智能选择";
     elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
       const unavailable = radio.value === "auto"
         ? !autoReady
@@ -816,7 +820,7 @@
       radio.disabled = state.busy || !subtitleMode || unavailable;
     });
     if (
-      state.health
+      state.capabilities
       && selectedAsrMode() !== "auto"
       && !cloudReady
       && autoRadio
@@ -831,18 +835,23 @@
     elements.hotwords.disabled = state.busy || !subtitleMode;
     elements.hotwordsRow.hidden = !subtitleMode;
     const currentMode = selectedAsrMode();
-    elements.qualityCaption.textContent = embedded
-      ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
-      : currentMode === "economy"
-        ? "平台字幕优先；没有字幕时发送临时音频至 Paraformer"
-        : currentMode === "high_accuracy"
-          ? "平台字幕优先；没有字幕时发送临时音频至千问 ASR"
-          : autoUsesLocal
-            ? "先提取平台字幕，没有字幕时由服务器本地识别"
-            : "先提取平台字幕，没有字幕时使用当前可用识别服务";
-    elements.privacyNote.textContent = currentMode === "auto" && localReady
-      ? "基础模式在本机完成语音识别，不会把音频发送给云端。临时媒体会在任务结束后自动删除，识别结果可能存在误差。"
-      : "云端高级模式会把临时音频发送至阿里云百炼处理；本地副本在任务结束后删除，服务端临时副本按供应商规则自动过期。";
+    const currentModeReady = currentMode === "auto" ? autoReady : cloudReady;
+    elements.qualityCaption.textContent = !currentModeReady
+      ? "当前识别服务暂不可用，平台已有字幕仍可正常提取"
+      : embedded
+        ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
+        : currentMode === "economy"
+          ? "平台字幕优先；没有字幕时发送临时音频至 Paraformer"
+          : currentMode === "high_accuracy"
+            ? "平台字幕优先；没有字幕时发送临时音频至千问 ASR"
+            : autoUsesLocal
+              ? "先提取平台字幕，没有字幕时在本站内部识别"
+              : "先提取平台字幕，没有字幕时使用当前可用识别服务";
+    elements.privacyNote.textContent = !currentModeReady
+      ? "平台字幕提取不受影响；需要语音识别时请稍后重试。"
+      : currentMode === "auto" && localReady
+        ? "基础模式在本站内部完成语音识别，不会把音频发送给第三方云端。临时媒体会在任务结束后自动删除。"
+        : "云端高级模式会把临时音频发送至阿里云百炼处理；任务完成后会清理本站临时副本。";
     elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
   }
 
@@ -1135,12 +1144,6 @@
     if (meta.entry_count) addChip(`${meta.entry_count} 条`);
     if (meta.language) addChip(`语言 ${String(meta.language).toUpperCase()}`);
     if (meta.elapsed_seconds !== undefined) addChip(`用时 ${formatElapsed(meta.elapsed_seconds)}`);
-    if (meta.asr_model) addChip(meta.asr_model, "asr");
-    if (meta.asr_provider_seconds != null) addChip(`计费 ${formatDuration(meta.asr_provider_seconds)}`);
-    if (meta.estimated_cost_cny != null) {
-      addChip(`估算 ¥${Number(meta.estimated_cost_cny).toFixed(4)}`);
-    }
-    if (meta.asr_worker_reused) addChip("模型已热启动", "cache");
     elements.metadataStrip.hidden = false;
   }
 
@@ -1155,7 +1158,7 @@
       return "画面未识别到稳定字幕，本次已自动改用精确语音识别。";
     }
     if (meta.platform === "upload") {
-      return "识别完成，服务器中的临时视频已自动删除。";
+      return "识别完成，临时视频已自动删除。";
     }
     if (meta.source === "asr_local" && meta.requested_source === "auto") {
       return `未找到可用的${platformLabel(meta.platform)}字幕，本次已使用本地语音识别。`;
@@ -1360,7 +1363,7 @@
     elements.cancelJob.textContent = "取消排队";
     elements.cancelJob.hidden = true;
     if (job.status === "running") {
-      const detail = stageDetails[job.stage] || "服务器正在处理当前任务";
+      const detail = stageDetails[job.stage] || "正在处理当前任务";
       showStatus("processing", job.message || "正在处理视频", detail, job.progress || 8, "…");
       updateStageTrack(job.stage, job.progress || 8, "running");
       return;
@@ -1689,82 +1692,61 @@
 
   async function loadHealth() {
     try {
-      const response = await fetch("/api/health", { cache: "no-store" });
-      if (!response.ok) throw new Error(String(response.status));
-      state.health = await response.json();
-      const jobs = state.health.jobs || {};
+      const healthResponse = await fetch("/api/health", { cache: "no-store" });
+      if (!healthResponse.ok) throw new Error(String(healthResponse.status));
+      const health = await healthResponse.json();
+      if (health.status !== "ok") throw new Error("unhealthy");
+      const configResponse = await apiFetch("/api/client-config", { cache: "no-store" });
+      if (!configResponse.ok) throw new Error(String(configResponse.status));
+      state.capabilities = await configResponse.json();
+      const features = state.capabilities.features || {};
+      const platforms = state.capabilities.platforms || {};
       elements.serviceState.className = "service-state online";
-      elements.serviceLabel.textContent = jobs.running || jobs.queued
-        ? `队列 ${Number(jobs.running || 0) + Number(jobs.queued || 0)}/${jobs.max_pending || 8}`
-        : "服务在线";
-      elements.healthVersion.textContent = state.health.service_version || "1.0 Beta";
-      const queueTotal = Number(jobs.running || 0) + Number(jobs.queued || 0);
+      elements.serviceLabel.textContent = "服务在线";
+      elements.healthSummary.textContent = "已连接";
       setHealthValue(
-        elements.healthQueue,
-        queueTotal ? `${queueTotal} 个处理中` : "空闲",
-        Number(jobs.queued || 0) >= Number(jobs.max_pending || 8) ? "warn" : ""
+        elements.healthLocal,
+        features.local_processing ? "可用" : "暂不可用",
+        features.local_processing ? "" : "warn"
       );
-      const localAsrReady = isLocalAsrReady();
-      const cloudAsrReady = Boolean(
-        state.health.cloud_asr
-        && state.health.cloud_asr.enabled
-        && state.health.cloud_asr.configured
+      setHealthValue(
+        elements.healthCloud,
+        features.cloud_enhancement ? "可选" : "未启用",
+        features.cloud_enhancement ? "" : "warn"
       );
-      if (state.health.asr_enabled === false) {
-        setHealthValue(elements.healthAsr, "未启用", "error");
-      } else if (localAsrReady && cloudAsrReady) {
-        setHealthValue(elements.healthAsr, "本地 + 云端可用", "");
-      } else if (localAsrReady) {
-        setHealthValue(
-          elements.healthAsr,
-          state.health.asr_worker_warm ? "本地模型已就绪" : "本地识别可用",
-          ""
-        );
-      } else if (state.health.cloud_asr && state.health.cloud_asr.enabled) {
-        setHealthValue(
-          elements.healthAsr,
-          cloudAsrReady ? "云端高级可用" : "云端配置异常",
-          cloudAsrReady ? "" : "error"
-        );
-      } else {
-        setHealthValue(elements.healthAsr, "可用", "");
-      }
-      const disk = state.health.disk || {};
-      if (disk.available === false) {
-        setHealthValue(elements.healthDisk, "空间偏低", "error");
-      } else if (disk.free_bytes == null) {
-        setHealthValue(elements.healthDisk, "无法读取", "warn");
-      } else {
-        setHealthValue(elements.healthDisk, `正常 · ${formatBytes(disk.free_bytes)}`, "");
-      }
-      const platforms = state.health.platforms || {};
-      elements.bilibiliChip.classList.toggle("unavailable", platforms.bilibili && platforms.bilibili.status !== "ready");
+      const filesReady = Boolean(features.uploads && features.media);
+      setHealthValue(
+        elements.healthFiles,
+        filesReady ? "可用" : "部分受限",
+        filesReady ? "" : "warn"
+      );
+      elements.bilibiliChip.classList.toggle("unavailable", platforms.bilibili === false);
       elements.douyinChip.classList.toggle(
         "unavailable",
-        !platforms.douyin || platforms.douyin.enabled === false || platforms.douyin.status !== "ready"
+        platforms.douyin === false
       );
-      const uploads = state.health.uploads || {};
+      const uploads = state.capabilities.uploads || {};
       const uploadsEnabled = uploads.enabled !== false;
-      state.uploadMaxBytes = Number(uploads.client_max_bytes || uploads.max_bytes || state.uploadMaxBytes);
+      state.uploadMaxBytes = Number(uploads.max_bytes || state.uploadMaxBytes);
       state.uploadExtensions = Array.isArray(uploads.allowed_extensions) ? uploads.allowed_extensions : [];
-      elements.uploadLimit.textContent = uploads.edge_limited
-        ? `公网最大 ${formatBytes(state.uploadMaxBytes)}`
-        : `最大 ${formatBytes(state.uploadMaxBytes)}`;
-      elements.uploadChip.classList.toggle("unavailable", !uploadsEnabled);
-      const media = state.health.media || {};
+      elements.uploadLimit.textContent = `最大 ${formatBytes(state.uploadMaxBytes)}`;
+      elements.uploadChip.classList.toggle(
+        "unavailable",
+        !uploadsEnabled || platforms.upload === false
+      );
+      const media = state.capabilities.media || {};
       state.mediaEnabled = media.enabled !== false;
-      state.mediaMaxBytes = Number(media.max_bytes || state.mediaMaxBytes);
       if (!state.mediaEnabled && selectedOperation() !== "subtitle") setSelectedOperation("subtitle");
       if (!uploadsEnabled && selectedInputMode() === "upload") setInputMode("link");
       else syncInputMode();
-      elements.loginSection.hidden = !state.health.web_qr_login_enabled;
+      elements.loginSection.hidden = !features.bilibili_qr_login;
     } catch (_) {
       elements.serviceState.className = "service-state offline";
       elements.serviceLabel.textContent = "服务异常";
-      elements.healthVersion.textContent = "连接失败";
-      setHealthValue(elements.healthQueue, "无法读取", "error");
-      setHealthValue(elements.healthAsr, "无法读取", "error");
-      setHealthValue(elements.healthDisk, "无法读取", "error");
+      elements.healthSummary.textContent = "连接失败";
+      setHealthValue(elements.healthLocal, "无法读取", "error");
+      setHealthValue(elements.healthCloud, "无法读取", "error");
+      setHealthValue(elements.healthFiles, "无法读取", "error");
       elements.bilibiliChip.classList.add("unavailable");
       elements.douyinChip.classList.add("unavailable");
       elements.uploadChip.classList.add("unavailable");

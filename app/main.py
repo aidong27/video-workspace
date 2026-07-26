@@ -116,13 +116,53 @@ class ResultKeyLockEntry:
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.3")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.4")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
+PUBLIC_RESULT_METADATA_FIELDS = frozenset(
+    {
+        "title",
+        "id",
+        "webpage_url",
+        "source",
+        "track_source_type",
+        "language",
+        "subtitle_format",
+        "warning",
+        "note",
+        "duration",
+        "platform",
+        "author",
+        "quality",
+        "asr_mode",
+        "requested_asr_mode",
+        "requested_source",
+        "requested_quality",
+        "embedded_subtitles_requested",
+        "ocr_fallback_to_asr",
+        "subtitle_source",
+        "subtitle_stream_language",
+        "quality_warning",
+        "cache_hit",
+        "entry_count",
+        "character_count",
+        "elapsed_seconds",
+        "processing_seconds",
+        "force_refresh",
+        "media_type",
+        "media_bytes",
+        "source_container",
+        "artifact_ttl_seconds",
+        "original_filename",
+        "uploaded_bytes",
+        "input_type",
+    }
 )
 ASR_TMP_DIR = Path(os.getenv("ASR_TMP_DIR", "/opt/bili-subtitle-tool/var/tmp"))
 ASR_MODEL_DIR = Path(os.getenv("ASR_MODEL_DIR", "/opt/bili-subtitle-tool/var/models"))
@@ -2328,6 +2368,16 @@ def seconds_to_vtt(value: float) -> str:
     return seconds_to_srt(value).replace(",", ".")
 
 
+def public_result_metadata(meta: Any) -> dict[str, Any]:
+    if not isinstance(meta, dict):
+        return {}
+    return {
+        key: copy.deepcopy(meta[key])
+        for key in PUBLIC_RESULT_METADATA_FIELDS
+        if key in meta and meta[key] is not None
+    }
+
+
 def render_entries(entries: list[SubtitleEntry], output_format: str, meta: dict[str, Any]) -> str:
     fmt = "markdown" if output_format == "md" else output_format
     if fmt == "json":
@@ -2364,6 +2414,75 @@ def rendered_raw_content(meta: dict[str, Any], output_format: str) -> str | None
     if not raw_entries:
         return None
     return render_entries(raw_entries, output_format, meta)
+
+
+def public_result_payload(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    payload = copy.deepcopy(result)
+    metadata = public_result_metadata(payload.get("metadata"))
+    if "metadata" in payload:
+        payload["metadata"] = metadata
+    if payload.get("format") == "json":
+        for field in ("content", "raw_content"):
+            content = payload.get(field)
+            if not isinstance(content, str):
+                continue
+            try:
+                document = json.loads(content)
+            except (TypeError, ValueError):
+                payload[field] = ""
+                continue
+            if not isinstance(document, dict):
+                payload[field] = ""
+                continue
+            document["metadata"] = metadata
+            payload[field] = json.dumps(document, ensure_ascii=False, indent=2)
+    return payload
+
+
+def public_error_payload(error: Any) -> dict[str, Any]:
+    if not isinstance(error, dict):
+        return {
+            "reason": "task_failed",
+            "code": "task_failed",
+            "message": "任务处理失败，请稍后重试。",
+            "retryable": True,
+        }
+    allowed = {"source", "reason", "code", "message", "retryable"}
+    return {
+        key: copy.deepcopy(error[key])
+        for key in allowed
+        if key in error and error[key] is not None
+    }
+
+
+def public_job_payload(job: Any) -> dict[str, Any]:
+    if not isinstance(job, dict):
+        return {}
+    allowed = {
+        "id",
+        "status",
+        "stage",
+        "progress",
+        "message",
+        "queue_position",
+        "created_at",
+        "updated_at",
+        "reused",
+        "platform",
+        "error_status",
+    }
+    payload = {
+        key: copy.deepcopy(job[key])
+        for key in allowed
+        if key in job and job[key] is not None
+    }
+    if job.get("status") == "completed" and "result" in job:
+        payload["result"] = public_result_payload(job["result"])
+    elif job.get("status") == "failed" and "error" in job:
+        payload["error"] = public_error_payload(job["error"])
+    return payload
 
 
 def official_subtitle(req: ExtractRequest, allow_cookie: bool, source_label: str) -> tuple[list[SubtitleEntry], dict[str, Any]]:
@@ -6609,181 +6728,87 @@ def shutdown() -> None:
         CLOUD_SIGNED_AUDIO_STORE.cleanup()
 
 
+def cloud_asr_ready() -> bool:
+    return bool(
+        cloud_asr_enabled()
+        and CLOUD_ASR_INIT_ERROR is None
+        and cloud_audio_delivery_ready()
+        and CLOUD_USAGE_LEDGER is not None
+    )
+
+
 @app.get("/api/health")
-def health() -> dict[str, Any]:
+def health() -> JSONResponse:
+    return JSONResponse(
+        {"status": "ok"},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/client-config")
+def api_client_config(request: Request) -> JSONResponse:
+    require_auth_user(request)
     JOB_MANAGER.cleanup()
     cleanup_stale_media_artifacts()
+    ffmpeg_ready = bool(shutil.which("ffmpeg"))
+    ffprobe_ready = bool(shutil.which("ffprobe"))
+    local_ready = bool(local_asr_enabled() and ffmpeg_ready and ffprobe_ready)
+    cloud_ready = cloud_asr_ready()
+    processing_ready = local_ready or cloud_ready
     douyin = douyin_adapter_status()
-    ffmpeg_available = bool(shutil.which("ffmpeg"))
-    ffprobe_available = bool(shutil.which("ffprobe"))
-    try:
-        disk = disk_space_status(MEDIA_ARTIFACT_DIR)
-        disk_payload = {
-            "available": disk.available,
-            "free_bytes": disk.free_bytes,
-            "free_ratio": round(disk.free_ratio, 4),
-            "minimum_free_bytes": disk.minimum_free_bytes,
-            "minimum_free_ratio": MIN_FREE_DISK_RATIO,
-        }
-    except OSError:
-        disk_payload = {
-            "available": False,
-            "free_bytes": None,
-            "free_ratio": None,
-            "minimum_free_bytes": MIN_FREE_DISK_BYTES,
-            "minimum_free_ratio": MIN_FREE_DISK_RATIO,
-        }
-    return {
+    douyin_ready = bool(
+        douyin["enabled"]
+        and douyin["api_adapter_ready"]
+        and douyin["playwright_ready"]
+        and douyin["chromium_ready"]
+    )
+    auto_backend = selected_asr_backend("auto")
+    auto_ready = local_ready if auto_backend == "local" else cloud_ready
+    payload = {
         "status": "ok",
-        "service_version": SERVICE_VERSION,
-        "cookie_enabled": cookie_enabled(),
-        "cookie_configured": bool(configured_cookie_header()),
-        "web_qr_login_enabled": web_qr_login_enabled(),
-        "asr_enabled": any_asr_enabled(),
-        "local_asr_enabled": local_asr_enabled(),
-        "asr_model": DEFAULT_ASR_MODEL,
-        "asr_accurate_model": ACCURATE_ASR_MODEL,
-        "asr_persistent_worker": env_bool("ASR_PERSISTENT_WORKER", True),
-        "asr_prewarm": env_bool("ASR_PREWARM", True),
-        "asr_worker_alive": asr_worker_alive(),
-        "asr_worker_warm": ASR_WORKER_WARM and asr_worker_alive(),
-        "ffmpeg_available": ffmpeg_available,
-        "ffprobe_available": ffprobe_available,
-        "disk": disk_payload,
-        "memory": runtime_memory_status(),
-        "asr_audio_quality": os.getenv("ASR_AUDIO_QUALITY", "best").strip().lower(),
-        "asr_audio_filter_enabled": bool(asr_audio_filter()),
-        "asr_audio_filter_hash": stable_config_hash(asr_audio_filter()),
-        "max_audio_seconds": ASR_MAX_AUDIO_SECONDS,
-        "asr_concurrency_limit": ASR_CONCURRENCY_LIMIT,
-        "asr_queue_wait_seconds": ASR_QUEUE_WAIT_SECONDS,
-        "asr_single_model_instance": True,
-        "asr_prewarm_quality": os.getenv("ASR_PREWARM_QUALITY", "accurate").strip().lower(),
-        "asr_worker_restart_count": max(0, ASR_WORKER_START_COUNT - 1),
-        "asr_worker_model_key": list(ASR_WORKER_MODEL_KEY) if ASR_WORKER_MODEL_KEY else None,
-        "default_request": {
-            "quality": "accurate",
-            "language": "zh",
-            "allow_platform_ai": True,
-            "asr_mode": "auto",
-            "asr_backend": selected_asr_backend("auto"),
-        },
-        "asr_modes": {
-            "auto": {
-                "backend": selected_asr_backend("auto"),
-                "label": "local_base",
-            },
-            "high_accuracy": {
-                "backend": selected_asr_backend("high_accuracy"),
-                "label": "cloud_qwen",
-            },
-            "economy": {
-                "backend": selected_asr_backend("economy"),
-                "label": "cloud_paraformer",
-            },
-        },
-        "extraction_modes": {
-            "fast": {
-                "model": DEFAULT_ASR_MODEL,
-                "beam_size": ASR_FAST_BEAM_SIZE,
-                "vad_filter": env_bool("ASR_VAD_FILTER", True),
-                "condition_on_previous_text": env_bool("ASR_CONDITION_ON_PREVIOUS_TEXT", False),
-            },
-            "accurate": {
-                "model": ACCURATE_ASR_MODEL,
-                "beam_size": ACCURATE_ASR_BEAM_SIZE,
-                "vad_filter": env_bool("ASR_ACCURATE_VAD_FILTER", True),
-                "condition_on_previous_text": env_bool(
-                    "ASR_ACCURATE_CONDITION_ON_PREVIOUS_TEXT",
-                    True,
-                ),
-            },
-        },
-        "ocr": {
-            "enabled": bool(
-                ffmpeg_available
+        "features": {
+            "local_processing": local_ready,
+            "cloud_enhancement": cloud_ready,
+            "embedded_subtitles": ffmpeg_ready,
+            "video_text_recognition": bool(
+                ffmpeg_ready
                 and importlib.util.find_spec("rapidocr") is not None
                 and importlib.util.find_spec("onnxruntime") is not None
             ),
-            "engine": "RapidOCR PP-OCRv6",
-            "embedded_tracks_enabled": ffmpeg_available,
-            "sample_fps": OCR_SAMPLE_FPS,
-            "max_frames": OCR_MAX_FRAMES,
+            "uploads": processing_ready,
+            "media": ffmpeg_ready and ffprobe_ready,
+            "bilibili_cookie": cookie_enabled() and bool(configured_cookie_header()),
+            "bilibili_qr_login": web_qr_login_enabled(),
+        },
+        "platforms": {
+            "bilibili": True,
+            "douyin": douyin_ready,
+            "upload": processing_ready,
+        },
+        "asr_modes": {
+            "auto": {
+                "available": auto_ready,
+                "processing": auto_backend,
+            },
+            "high_accuracy": {
+                "available": cloud_ready,
+                "processing": "cloud",
+            },
+            "economy": {
+                "available": cloud_ready,
+                "processing": "cloud",
+            },
         },
         "uploads": {
-            "enabled": any_asr_enabled(),
-            "max_bytes": UPLOAD_MAX_BYTES,
-            "client_max_bytes": PUBLIC_UPLOAD_MAX_BYTES,
-            "edge_limited": PUBLIC_UPLOAD_MAX_BYTES < UPLOAD_MAX_BYTES,
-            "staging_max_bytes": UPLOAD_STAGING_MAX_BYTES,
-            "staging_reserved_bytes": upload_staging_bytes(),
+            "enabled": processing_ready,
+            "max_bytes": PUBLIC_UPLOAD_MAX_BYTES,
             "allowed_extensions": sorted(UPLOAD_ALLOWED_EXTENSIONS),
         },
         "media": {
-            "enabled": ffmpeg_available and ffprobe_available,
-            "max_bytes": MEDIA_MAX_BYTES,
-            "staging_max_bytes": MEDIA_STAGING_MAX_BYTES,
-            "staging_reserved_bytes": media_staging_bytes(),
-            "artifact_ttl_seconds": MEDIA_ARTIFACT_TTL_SECONDS,
-            "audio_format": "mp3",
-            "video_max_height": 1080,
-        },
-        "result_cache_enabled": result_cache_enabled(),
-        "result_cache_ttl_seconds": RESULT_CACHE_TTL_SECONDS,
-        "result_cache_items": len(list(RESULT_CACHE_DIR.glob("*.json"))) if RESULT_CACHE_DIR.exists() else 0,
-        "platforms": {
-            "bilibili": {"enabled": True, "status": "ready"},
-            "douyin": {
-                "enabled": douyin["enabled"],
-                "status": "disabled"
-                if not douyin["enabled"]
-                else (
-                    "ready"
-                    if douyin["api_adapter_ready"] and douyin["playwright_ready"] and douyin["chromium_ready"]
-                    else "setup_required"
-                ),
-                "cookie_cached": douyin["cookie_cached"],
-            },
-        },
-        "jobs": JOB_MANAGER.stats(),
-        "cloud_asr": {
-            "enabled": cloud_asr_enabled(),
-            "configured": bool(
-                cloud_asr_enabled()
-                and CLOUD_ASR_INIT_ERROR is None
-                and cloud_audio_delivery_ready()
-                and CLOUD_USAGE_LEDGER is not None
-            ),
-            "state": (
-                "ready"
-                if (
-                    cloud_asr_enabled()
-                    and CLOUD_ASR_INIT_ERROR is None
-                    and cloud_audio_delivery_ready()
-                    and CLOUD_USAGE_LEDGER is not None
-                )
-                else ("disabled" if not cloud_asr_enabled() else "configuration_error")
-            ),
-            "provider": "aliyun",
-            "default_model": CLOUD_ASR_DEFAULT_MODEL,
-            "economy_model": CLOUD_ASR_ECONOMY_MODEL,
-            "audio_delivery": CLOUD_ASR_AUDIO_DELIVERY,
-            "provider_temporary_retention_seconds": (
-                CLOUD_TEMP_AUDIO_RETENTION_SECONDS
-                if CLOUD_ASR_AUDIO_DELIVERY == "aliyun_temp"
-                else 0
-            ),
-            "allow_paid": env_bool("ASR_ALLOW_PAID", False),
-            "monthly_free_seconds": CLOUD_ASR_MONTHLY_FREE_SECONDS,
-            "usage": cloud_usage_stats(),
-        },
-        "auth": {
-            "enabled": True,
-            "registration_enabled": invite_configured(),
-            "session_ttl_days": session_ttl_seconds() // 86400,
-            "max_sessions_per_user": max_sessions_per_user(),
+            "enabled": ffmpeg_ready and ffprobe_ready,
         },
     }
+    return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
 
 @app.api_route("/api/provider-audio/{token}", methods=["GET", "HEAD"])
@@ -7068,7 +7093,7 @@ def api_login_poll(qrcode_key: str = Query(..., min_length=8, max_length=128)) -
 @app.post("/api/extract")
 def api_extract(req: ExtractRequest, request: Request) -> JSONResponse:
     return JSONResponse(
-        run_legacy_extraction(req, request),
+        public_result_payload(run_legacy_extraction(req, request)),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -7077,14 +7102,22 @@ def api_extract(req: ExtractRequest, request: Request) -> JSONResponse:
 def api_create_job(req: ExtractRequest, request: Request) -> JSONResponse:
     user = require_auth_user(request)
     job = submit_extraction_job(req, user.user_id, request_idempotency_key(request))
-    return JSONResponse(job, status_code=202, headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        public_job_payload(job),
+        status_code=202,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/media-jobs", status_code=202)
 def api_create_media_job(req: MediaRequest, request: Request) -> JSONResponse:
     user = require_auth_user(request)
     job = submit_media_job(req, user.user_id, request_idempotency_key(request))
-    return JSONResponse(job, status_code=202, headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        public_job_payload(job),
+        status_code=202,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/upload-jobs", status_code=202)
@@ -7134,7 +7167,11 @@ async def api_create_upload_job(
         raise idempotency_conflict_error() from exc
     if existing is not None:
         existing["platform"] = "upload"
-        return JSONResponse(existing, status_code=202, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            public_job_payload(existing),
+            status_code=202,
+            headers={"Cache-Control": "no-store"},
+        )
     if JOB_MANAGER.stats()["queued"] >= JOB_QUEUE_MAX_PENDING:
         raise HTTPException(
             status_code=429,
@@ -7192,7 +7229,11 @@ async def api_create_upload_job(
                 ) from exc
             transferred = not bool(job.get("reused"))
         job["platform"] = "upload"
-        return JSONResponse(job, status_code=202, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            public_job_payload(job),
+            status_code=202,
+            headers={"Cache-Control": "no-store"},
+        )
     except JobIdempotencyConflict as exc:
         raise idempotency_conflict_error() from exc
     finally:
@@ -7215,7 +7256,7 @@ def api_get_job(job_id: str, request: Request) -> JSONResponse:
                 "retryable": True,
             },
         ) from exc
-    return JSONResponse(job, headers={"Cache-Control": "no-store"})
+    return JSONResponse(public_job_payload(job), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/artifacts/{artifact_token}")
@@ -7260,12 +7301,12 @@ def api_cancel_job(job_id: str, request: Request) -> JSONResponse:
                 "retryable": False,
             },
         )
-    return JSONResponse(job, headers={"Cache-Control": "no-store"})
+    return JSONResponse(public_job_payload(job), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/download")
 def api_download(req: ExtractRequest, request: Request) -> Response:
-    payload = run_legacy_extraction(req, request)
+    payload = public_result_payload(run_legacy_extraction(req, request))
     filename = str(payload["filename"])
     headers = {
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",

@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f7f8fa">
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260725-2">
-  <script src="/static/app.js?v=20260725-2" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260726-1">
+  <script src="/static/app.js?v=20260726-1" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -41,7 +41,7 @@
             type="button"
             aria-expanded="false"
             aria-controls="health-popover"
-            title="查看运行状态"
+            title="查看服务能力"
           >
             <span class="state-dot" aria-hidden="true"></span>
             <span id="service-label">正在连接</span>
@@ -49,23 +49,23 @@
               <path d="m9 18 6-6-6-6"></path>
             </svg>
           </button>
-          <section class="health-popover" id="health-popover" aria-label="运行状态" hidden>
+          <section class="health-popover" id="health-popover" aria-label="服务能力" hidden>
             <header>
-              <strong>运行状态</strong>
-              <span id="health-version">检查中</span>
+              <strong>服务能力</strong>
+              <span id="health-summary">正在检查</span>
             </header>
             <dl>
               <div>
-                <dt>任务队列</dt>
-                <dd id="health-queue">正在读取</dd>
+                <dt>基础识别</dt>
+                <dd id="health-local">正在读取</dd>
               </div>
               <div>
-                <dt>语音识别</dt>
-                <dd id="health-asr">正在读取</dd>
+                <dt>云端增强</dt>
+                <dd id="health-cloud">正在读取</dd>
               </div>
               <div>
-                <dt>存储空间</dt>
-                <dd id="health-disk">正在读取</dd>
+                <dt>文件处理</dt>
+                <dd id="health-files">正在读取</dd>
               </div>
             </dl>
           </section>
@@ -187,8 +187,8 @@
 
       <footer class="rail-footer">
         <span class="rail-status-dot" aria-hidden="true"></span>
-        <span>单机任务队列</span>
-        <strong>4C / 4G</strong>
+        <span>隐私优先处理</span>
+        <strong>已连接</strong>
       </footer>
     </aside>
 
@@ -325,7 +325,7 @@
               <input type="radio" name="asr-mode" value="auto" checked>
               <span>
                 <strong id="asr-auto-title">本地基础</strong>
-                <small id="asr-auto-detail">服务器处理</small>
+                <small id="asr-auto-detail">本地处理</small>
               </span>
             </label>
             <label>
@@ -343,7 +343,7 @@
               </span>
             </label>
           </div>
-          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时由服务器本地识别</p>
+          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时在本站内部识别</p>
         </fieldset>
 
         <label class="toggle-row embedded-subtitle-row" id="embedded-subtitle-row">

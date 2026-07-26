@@ -128,7 +128,7 @@
       }
       window.location.replace("/");
     } catch (_) {
-      showError("无法连接服务器，请检查网络后重试。");
+      showError("无法连接服务，请检查网络后重试。");
     } finally {
       setLoading(false);
     }
@@ -136,15 +136,19 @@
 
   async function loadStatus() {
     try {
-      const response = await fetch("/api/health", { cache: "no-store" });
-      if (!response.ok) throw new Error(String(response.status));
-      const health = await response.json();
-      registrationEnabled = Boolean(health.auth && health.auth.registration_enabled);
+      const [healthResponse, configResponse] = await Promise.all([
+        fetch("/api/health", { cache: "no-store" }),
+        fetch("/api/auth/config", { cache: "no-store" })
+      ]);
+      if (!healthResponse.ok || !configResponse.ok) throw new Error("status");
+      const health = await healthResponse.json();
+      const config = await configResponse.json();
+      if (health.status !== "ok") throw new Error("unhealthy");
+      registrationEnabled = Boolean(config.registration_enabled);
       elements.serviceStatus.className = "service-status online";
-      const version = health.service_version ? ` · ${health.service_version}` : "";
-      elements.serviceStatus.querySelector("strong").textContent = `服务在线${version}`;
+      elements.serviceStatus.querySelector("strong").textContent = "服务在线";
       if (isRegister && !registrationEnabled) {
-        showError("服务器尚未开放邀请注册。");
+        showError("当前尚未开放邀请注册。");
         elements.submit.disabled = true;
       }
     } catch (_) {

@@ -152,6 +152,64 @@ class ApiIntegrationTests(unittest.TestCase):
         retired = self.client.get("/api/download?input=BV14jFvzbEvj")
         self.assertEqual(retired.status_code, 410)
 
+    def test_completed_job_strips_runtime_metadata_from_browser_response(self) -> None:
+        internal_metadata = {
+            "platform": "bilibili",
+            "title": "测试视频",
+            "source": "asr_local",
+            "language": "zh",
+            "duration": 30,
+            "entry_count": 1,
+            "asr_model": "private-model-name",
+            "asr_compute_type": "int8",
+            "asr_cpu_threads": 3,
+            "asr_worker_reused": True,
+            "peak_rss_mb": 999,
+            "provider_task_id": "private-provider-task",
+            "estimated_cost_cny": 1.23,
+            "raw_metadata": {"internal": "private"},
+        }
+        result = {
+            "ok": True,
+            "format": "json",
+            "filename": "subtitle.json",
+            "content_type": "application/json; charset=utf-8",
+            "metadata": internal_metadata,
+            "content": json.dumps(
+                {
+                    "metadata": internal_metadata,
+                    "entries": [{"start": 0, "end": 1, "text": "测试"}],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        with patch.object(main, "cached_extraction_payload", return_value=result):
+            response = self.client.post(
+                "/api/jobs",
+                json={"input": "BV14jFvzbEvj", "format": "json"},
+            )
+            download = self.client.post(
+                "/api/download",
+                json={"input": "BV14jFvzbEvj", "format": "json"},
+                headers={"Idempotency-Key": "privacy-download-test"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(download.status_code, 200)
+        public_result = response.json()["result"]
+        self.assertEqual(public_result["metadata"]["title"], "测试视频")
+        self.assertEqual(public_result["metadata"]["source"], "asr_local")
+        self.assertNotIn("asr_model", public_result["metadata"])
+        self.assertNotIn("peak_rss_mb", public_result["metadata"])
+        exported = json.loads(public_result["content"])
+        self.assertEqual(exported["entries"][0]["text"], "测试")
+        self.assertEqual(exported["metadata"], public_result["metadata"])
+        encoded = json.dumps(response.json())
+        self.assertNotIn("private-model-name", encoded)
+        self.assertNotIn("private-provider-task", encoded)
+        self.assertNotIn("peak_rss_mb", encoded)
+        self.assertEqual(json.loads(download.text)["metadata"], public_result["metadata"])
+
     def test_public_file_response_and_health_work_on_new_starlette(self) -> None:
         login = self.client.get("/login")
         with patch.dict(
@@ -161,46 +219,71 @@ class ApiIntegrationTests(unittest.TestCase):
                 "DASHSCOPE_API_KEY": "private-api-key-value",
                 "DASHSCOPE_WORKSPACE_ID": "private-workspace-value",
             },
+        ), patch.object(
+            main,
+            "runtime_memory_status",
+            side_effect=AssertionError("public health must not inspect memory"),
+        ), patch.object(
+            main,
+            "disk_space_status",
+            side_effect=AssertionError("public health must not inspect disk"),
+        ), patch.object(
+            main,
+            "cloud_usage_stats",
+            side_effect=AssertionError("public health must not inspect provider usage"),
+        ), patch.object(
+            main,
+            "douyin_adapter_status",
+            side_effect=AssertionError("public health must not inspect adapters"),
         ):
             health = self.client.get("/api/health")
         self.assertEqual(login.status_code, 200)
         self.assertIn("text/html", login.headers["content-type"])
         self.assertEqual(health.status_code, 200)
-        self.assertEqual(health.json()["status"], "ok")
-        self.assertEqual(health.json()["extraction_modes"]["fast"]["model"], main.DEFAULT_ASR_MODEL)
-        self.assertEqual(health.json()["extraction_modes"]["accurate"]["model"], main.ACCURATE_ASR_MODEL)
-        self.assertIn("enabled", health.json()["ocr"])
-        self.assertIn("available", health.json()["disk"])
-        self.assertIn("process_rss_mb", health.json()["memory"])
-        self.assertIn("swap_used_mb", health.json()["memory"])
-        self.assertIn("ffmpeg_available", health.json())
-        self.assertTrue(health.json()["asr_single_model_instance"])
-        self.assertEqual(health.json()["default_request"]["quality"], "accurate")
-        self.assertEqual(health.json()["default_request"]["asr_mode"], "auto")
-        self.assertIn("asr_backend", health.json()["default_request"])
-        self.assertIn("auto", health.json()["asr_modes"])
-        self.assertTrue(health.json()["default_request"]["allow_platform_ai"])
-        self.assertTrue(health.json()["asr_audio_filter_enabled"])
-        self.assertIn(
-            health.json()["cloud_asr"]["audio_delivery"],
-            {"signed_url", "aliyun_temp"},
-        )
-        self.assertIn(
-            "provider_temporary_retention_seconds",
-            health.json()["cloud_asr"],
-        )
-        self.assertEqual(health.json()["uploads"]["client_max_bytes"], main.PUBLIC_UPLOAD_MAX_BYTES)
-        self.assertEqual(
-            health.json()["uploads"]["edge_limited"],
-            main.PUBLIC_UPLOAD_MAX_BYTES < main.UPLOAD_MAX_BYTES,
-        )
+        self.assertEqual(health.json(), {"status": "ok"})
+        self.assertEqual(health.headers["cache-control"], "no-store")
+
+        adapter = {
+            "enabled": True,
+            "api_adapter_ready": True,
+            "playwright_ready": True,
+            "chromium_ready": True,
+            "cookie_cached": True,
+        }
+        with patch.object(main, "douyin_adapter_status", return_value=adapter):
+            client_config = self.client.get("/api/client-config")
+        self.assertEqual(client_config.status_code, 200)
+        config = client_config.json()
+        self.assertEqual(config["status"], "ok")
+        self.assertEqual(config["uploads"]["max_bytes"], main.PUBLIC_UPLOAD_MAX_BYTES)
+        self.assertIn("local_processing", config["features"])
+        self.assertIn("cloud_enhancement", config["features"])
+        self.assertIn("auto", config["asr_modes"])
+        self.assertTrue(config["platforms"]["douyin"])
         encoded = json.dumps(health.json())
-        self.assertNotIn(str(self.root), encoded)
-        self.assertNotIn("AUTH_DB_PATH", encoded)
-        self.assertNotIn("INVITE_CODE_HASH", encoded)
-        self.assertNotIn("private-filter-value", encoded)
-        self.assertNotIn("private-api-key-value", encoded)
-        self.assertNotIn("private-workspace-value", encoded)
+        encoded += json.dumps(config)
+        for forbidden in (
+            str(self.root),
+            "AUTH_DB_PATH",
+            "INVITE_CODE_HASH",
+            "private-filter-value",
+            "private-api-key-value",
+            "private-workspace-value",
+            "service_version",
+            "process_rss",
+            "swap_used",
+            "free_bytes",
+            "max_pending",
+            "asr_model",
+            "provider_task_id",
+            "monthly_free_seconds",
+            "staging_reserved_bytes",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+        self.client.post("/api/auth/logout")
+        unauthenticated = self.client.get("/api/client-config")
+        self.assertEqual(unauthenticated.status_code, 401)
 
     def test_account_can_change_password_and_logout_all_sessions(self) -> None:
         wrong = self.client.post(
@@ -306,9 +389,9 @@ class ApiIntegrationTests(unittest.TestCase):
             "cookie_cached": True,
         }
         with patch.object(main, "douyin_adapter_status", return_value=adapter):
-            response = self.client.get("/api/health")
+            response = self.client.get("/api/client-config")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["platforms"]["douyin"]["status"], "disabled")
+        self.assertFalse(response.json()["platforms"]["douyin"])
 
     def test_raw_video_upload_creates_idempotent_cached_job_and_cleans_file(self) -> None:
         result = {
@@ -535,13 +618,28 @@ class FrontendRecoveryTests(unittest.TestCase):
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
             "function syncPrecisionOptions", 1
         )[0]
-        self.assertIn("state.health.ffmpeg_available === true", local_ready_block)
-        self.assertIn("state.health.ffprobe_available === true", local_ready_block)
-        self.assertIn('autoBackend === "local" && localReady', script)
-        self.assertIn('autoBackend === "cloud" && cloudReady', script)
-        self.assertIn("uploads.client_max_bytes", script)
+        self.assertIn("state.capabilities.features.local_processing", local_ready_block)
+        self.assertIn('autoBackend === "local"', script)
+        self.assertIn('state.capabilities.asr_modes.auto.available', script)
+        self.assertIn('apiFetch("/api/client-config"', script)
+        self.assertIn("uploads.max_bytes", script)
         self.assertIn("body.dialog-open", css)
         self.assertNotIn("linear-gradient", css)
+        self.assertNotIn("state.health", script)
+        self.assertNotIn("meta.asr_model", script)
+        self.assertNotIn("asr_provider_seconds", script)
+        self.assertNotIn("estimated_cost_cny", script)
+        self.assertNotIn("4C / 4G", page)
+        self.assertNotIn("单机任务队列", page)
+        self.assertNotIn("服务器", page + script)
+        for internal_field in (
+            "free_bytes",
+            "process_rss_mb",
+            "swap_used_mb",
+            "asr_worker_warm",
+            "staging_reserved_bytes",
+        ):
+            self.assertNotIn(internal_field, script)
 
     def test_user_preferences_exclude_links_and_hotwords(self) -> None:
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -569,6 +667,9 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertIn('getModifierState("CapsLock")', script)
         self.assertIn("setupPasswordToggle(", script)
+        self.assertIn('fetch("/api/auth/config"', script)
+        self.assertNotIn("service_version", script)
+        self.assertNotIn("服务器", script)
         self.assertNotIn("linear-gradient", css)
 
 

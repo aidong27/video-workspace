@@ -172,13 +172,13 @@ Cloud input is converted to a bounded mono MP3 only after media validation. `CLO
 
 `ASR_AUDIO_FILTER` is opt-in because filtering can damage quiet consonants. A conservative A/B candidate is `highpass=f=70,lowpass=f=7800,loudnorm=I=-20:TP=-2:LRA=11`; compare it against an empty filter on real source audio before enabling it in production.
 
-Cloud ASR metadata includes the actual provider/model, provider task ID, reported seconds, latency, estimated standard-price cost, raw segments, and normalized segments. The web result view can switch between raw and organized output.
+Cloud ASR diagnostics keep the provider/model, task ID, reported seconds, latency, estimated standard-price cost, raw segments, and normalized segments on the service side. Browser responses use a strict metadata allowlist and expose only task-facing fields such as source, language, duration, cache status, and elapsed time. The web result view can switch between raw and organized transcript text without receiving provider task IDs or runtime diagnostics.
 
 Uploads, media downloads, ASR normalization, and OCR preparation check both the absolute and proportional free-disk thresholds before starting. FFmpeg and ffprobe output is continuously drained but capped at `PROCESS_ERROR_OUTPUT_BYTES`, and timed-out processes are terminated, killed if necessary, and reaped.
 
 Run exactly one Uvicorn application worker. The heavy-work semaphore and signed-audio registry are process-local; multiple Uvicorn workers would bypass the global concurrency limit and invalidate task-local signed audio state.
 
-`GET /api/health` reports queue, FFmpeg/ffprobe, cloud-provider readiness, local quota totals, process memory/swap, and disk-threshold status without returning paths, API keys, workspace IDs, Cookie values, users, or environment variables. Reading health never invokes a provider or initializes a local model.
+Public `GET /api/health` returns only `{"status":"ok"}`. Signed-in clients use `GET /api/client-config` for a deliberately small capability document containing user-facing availability and upload constraints; neither endpoint returns queue totals, process or disk metrics, model names, provider usage, paths, API keys, workspace IDs, Cookie values, users, or environment variables. Reading either endpoint never invokes a provider or initializes a local model.
 
 The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for both quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model.
 
