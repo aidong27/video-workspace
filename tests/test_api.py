@@ -614,6 +614,40 @@ class ApiIntegrationTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, encoded)
 
+    def test_disabled_guest_media_blocks_new_jobs_from_existing_guest_session(self) -> None:
+        self.client.post("/api/auth/logout")
+        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
+        token, _ = codec.issue()
+        self.client.cookies.set("caption_guest", token)
+        queued_job = {
+            "id": "a" * 32,
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "message": "任务已进入队列",
+        }
+
+        with patch.dict(
+            os.environ,
+            {"GUEST_MEDIA_ENABLED": "false"},
+        ), patch.object(
+            main,
+            "GUEST_SESSION_CODEC",
+            codec,
+        ), patch.object(
+            main,
+            "submit_media_job",
+            return_value=queued_job,
+        ) as submit:
+            response = self.client.post(
+                "/api/media-jobs",
+                json={"input": "BV14jFvzbEvj", "media_type": "video"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"]["reason"], "guest_media_disabled")
+        submit.assert_not_called()
+
     def test_guest_media_cookie_job_and_artifact_are_owner_scoped(self) -> None:
         self.client.post("/api/auth/logout")
         codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
@@ -839,7 +873,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(upload_denied.json()["detail"]["reason"], "cloud_consent_required")
 
     def test_versioned_static_assets_are_cacheable_but_media_is_not(self) -> None:
-        versioned = self.client.get("/static/app.js?v=20260727-2")
+        versioned = self.client.get("/static/app.js?v=20260727-3")
         plain = self.client.get("/static/app.js")
         self.assertEqual(versioned.status_code, 200)
         self.assertIn("immutable", versioned.headers["cache-control"])
@@ -904,6 +938,8 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function retryAccurate()", script)
         self.assertIn("function submitCurrentForm()", script)
         self.assertIn("function changeAccountPassword(", script)
+        self.assertIn("guest_media_disabled", script)
+        self.assertIn("/static/app.js?v=20260727-3", page)
         self.assertIn("function syncRailNavigation(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
             "function syncPrecisionOptions", 1

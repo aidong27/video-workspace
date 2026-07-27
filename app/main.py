@@ -7478,6 +7478,15 @@ def api_create_job(req: ExtractRequest, request: Request) -> JSONResponse:
 @app.post("/api/media-jobs", status_code=202)
 def api_create_media_job(req: MediaRequest, request: Request) -> JSONResponse:
     owner_id, guest, issued_session = media_request_owner(request, create_guest=True)
+    if guest and not guest_media_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "guest_media_disabled",
+                "message": "免登录媒体提取暂时关闭，请登录后重试。",
+                "retryable": True,
+            },
+        )
     job = submit_media_job(
         req,
         owner_id,

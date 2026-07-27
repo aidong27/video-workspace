@@ -236,6 +236,7 @@
     guest_media_busy: "当前已有一个免登录媒体任务，请等待完成。",
     guest_media_session_limit: "这个浏览器的免登录提取次数较多，请稍后再试。",
     guest_media_global_limit: "当前免登录提取请求较多，请稍后再试。",
+    guest_media_disabled: "免登录媒体提取暂时关闭，请登录后重试。",
     guest_media_duration_too_long: "视频时长超过免登录提取限制，请登录后重试。",
     media_duration_too_long: "视频时长超过当前媒体提取限制。",
     cloud_consent_required: "请先确认云端识别会消耗站点额度。",
