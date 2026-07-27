@@ -7,7 +7,7 @@ A self-hosted FastAPI workspace for extracting subtitles, video, and audio from 
 - Bilibili: official/manual and platform AI subtitles are checked first. In the default mode, videos without a usable platform track enter local faster-whisper ASR.
 - Douyin: short-link normalization, anonymous browser session, signed metadata request, platform caption when available, then the selected ASR backend.
 - Upload: streamed file intake, real media validation, then local ASR or embedded/burned-in subtitle extraction. Uploaded video files are deleted after completion, failure, or queued cancellation.
-- Local ASR: the baseline `auto` mode uses one on-demand `small`/int8 faster-whisper model with single heavy-task concurrency.
+- Local ASR: the baseline `auto` mode uses one on-demand `small`/int8 faster-whisper model with single heavy-task concurrency and a balanced decoding profile.
 - Cloud ASR: explicit advanced modes use `qwen3-asr-flash-filetrans` for high accuracy or `paraformer-v2` for economy. Requests are made only by the server through separate provider adapters.
 - Embedded subtitles: text tracks are extracted first, RapidOCR handles burned-in text, and audio falls back to the selected ASR backend only when OCR finds no stable captions.
 - Direct media: Bilibili video up to 1080p, Douyin video, or MP3 audio. Binary results use owner-scoped temporary artifacts instead of JSON payloads and are deleted when the job expires.
@@ -116,7 +116,7 @@ Request parameters:
 - `hotwords`: optional names, terms, or abbreviations for the optional local-ASR compatibility path; limited to 300 characters and represented by a hash in cache metadata
 - `asr_mode`: `auto` uses the local baseline when available; `high_accuracy` and `economy` explicitly select the cloud Qwen and Paraformer modes
 - `cloud_consent`: must be `true` for either explicit cloud mode; the API enforces this independently of the browser confirmation dialog
-- `quality`: retained for backward compatibility with local ASR clients; defaults to `accurate`
+- `quality`: `balanced` is the default local profile; `fast` and `accurate` remain available for compatible API clients
 - `embedded_subtitles`: inspect an embedded text track or OCR burned-in video text; implies accurate processing
 - `allow_platform_ai`: use platform-generated captions before the selected ASR backend; defaults to `true`
 - `force_refresh`: bypass the result cache
@@ -219,7 +219,7 @@ media availability and public limits. Temporary media responses remain
 must not cache or publicly proxy artifact downloads; this keeps owner isolation
 intact and avoids treating a general CDN as a video-delivery service.
 
-The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for both quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model. Model loading checks the local cache before attempting a network request; once the production cache is seeded, set `ASR_MODEL_DOWNLOAD_ENABLED=false` to fail quickly instead of waiting on an unavailable model host. `ASR_MODEL_IDLE_SECONDS=900` releases the model after 15 idle minutes while retaining the worker process; set it to `0` only when lower cold-start latency matters more than idle memory.
+The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for all quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model. The default `balanced` profile uses beam 3 with VAD and cross-window context; `accurate` keeps beam 5 for explicit API callers and OCR fallback. Automatic second-pass correction is limited by `ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS` so a difficult long video does not silently double its processing time. Model loading checks the local cache before attempting a network request; once the production cache is seeded, set `ASR_MODEL_DOWNLOAD_ENABLED=false` to fail quickly instead of waiting on an unavailable model host. `ASR_MODEL_IDLE_SECONDS=900` releases the model after 15 idle minutes while retaining the worker process; set it to `0` only when lower cold-start latency matters more than idle memory.
 
 ## Douyin runtime
 

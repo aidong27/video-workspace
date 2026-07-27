@@ -31,7 +31,7 @@ class RequestDefaultsTests(unittest.TestCase):
         request = main.ExtractRequest(input="BV14jFvzbEvj")
 
         self.assertEqual(request.source, "auto")
-        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.quality, "balanced")
         self.assertEqual(request.lang, "zh")
         self.assertTrue(request.allow_platform_ai)
         self.assertEqual(request.asr_mode, "auto")
@@ -389,7 +389,7 @@ class CloudAsrPipelineTests(unittest.TestCase):
             size=123,
         )
 
-        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.quality, "balanced")
         self.assertEqual(request.lang, "zh")
         self.assertEqual(request.asr_mode, "auto")
 
@@ -418,21 +418,24 @@ class ResultCacheTests(unittest.TestCase):
         canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
         self.assertEqual(main.result_cache_key(first, canonical), main.result_cache_key(second, canonical))
 
-    def test_cache_key_separates_fast_accurate_and_video_ocr(self) -> None:
+    def test_cache_key_separates_local_profiles_and_video_ocr(self) -> None:
         canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
         fast = main.ExtractRequest(input=canonical, quality="fast", source="asr")
+        balanced = fast.model_copy(update={"quality": "balanced"})
         accurate = fast.model_copy(update={"quality": "accurate"})
         embedded = fast.model_copy(update={"embedded_subtitles": True})
 
         keys = {
             main.result_cache_key(fast, canonical),
+            main.result_cache_key(balanced, canonical),
             main.result_cache_key(accurate, canonical),
             main.result_cache_key(embedded, canonical),
         }
 
-        self.assertEqual(len(keys), 3)
+        self.assertEqual(len(keys), 4)
         self.assertEqual(main.effective_quality("fast", embedded_subtitles=True), "accurate")
         self.assertEqual(main.asr_profile("fast")["model"], main.DEFAULT_ASR_MODEL)
+        self.assertEqual(main.asr_profile("balanced")["model"], main.DEFAULT_ASR_MODEL)
         self.assertEqual(main.asr_profile("accurate")["model"], main.ACCURATE_ASR_MODEL)
 
     def test_cache_key_separates_cloud_provider_modes(self) -> None:
@@ -1750,15 +1753,19 @@ class RenderingTests(unittest.TestCase):
 
 
 class AsrWorkerTests(unittest.TestCase):
-    def test_fast_and_accurate_profiles_share_one_default_model_key(self) -> None:
+    def test_local_profiles_share_one_default_model_key(self) -> None:
         fast = main.asr_profile("fast")
+        balanced = main.asr_profile("balanced")
         accurate = main.asr_profile("accurate")
 
         for key in ("model", "compute_type", "device", "cpu_threads"):
+            self.assertEqual(fast[key], balanced[key])
             self.assertEqual(fast[key], accurate[key])
         self.assertEqual(fast["beam_size"], 3)
+        self.assertEqual(balanced["beam_size"], 3)
         self.assertEqual(accurate["beam_size"], 5)
         self.assertFalse(fast["condition_on_previous_text"])
+        self.assertTrue(balanced["condition_on_previous_text"])
         self.assertTrue(accurate["condition_on_previous_text"])
 
     def test_whisper_model_keeps_only_one_instance_and_unloads_on_switch(self) -> None:
@@ -1886,6 +1893,126 @@ class AsrWorkerTests(unittest.TestCase):
         encoded = json.dumps(metadata, ensure_ascii=False)
         self.assertNotIn("MQTT", encoded)
         self.assertNotIn("物联网课程", encoded)
+
+    def test_balanced_transcription_avoids_low_confidence_full_retry(self) -> None:
+        class Segment:
+            def __init__(self, start: float, text: str) -> None:
+                self.start = start
+                self.end = start + 1
+                self.text = text
+                self.avg_logprob = -1.8
+                self.no_speech_prob = 0.05
+                self.compression_ratio = 1.2
+
+        class Info:
+            language = "zh"
+            language_probability = 0.98
+            duration_after_vad = 90.0
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def transcribe(self, _audio_path: str, **options):
+                self.calls.append(options)
+                return [
+                    Segment(0, "第一段低置信度文本"),
+                    Segment(1, "第二段低置信度文本"),
+                ], Info()
+
+        model = FakeModel()
+        with patch.object(main, "whisper_model", return_value=model), patch.object(
+            main, "audio_duration_seconds", return_value=100.0
+        ):
+            result = main.transcribe_audio_payload("audio.wav", "zh", "balanced")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(model.calls[0]["beam_size"], 3)
+        self.assertTrue(model.calls[0]["condition_on_previous_text"])
+        metadata = result["meta"]
+        self.assertEqual(metadata["quality"], "balanced")
+        self.assertFalse(metadata["context_retry_performed"])
+        self.assertEqual(metadata["context_retry_skipped_reason"], "profile_policy")
+        self.assertEqual(metadata["quality_warning"], "low_confidence")
+
+    def test_balanced_transcription_repairs_short_repetition_once(self) -> None:
+        class Segment:
+            def __init__(self, start: float, text: str, logprob: float) -> None:
+                self.start = start
+                self.end = start + 1
+                self.text = text
+                self.avg_logprob = logprob
+                self.no_speech_prob = 0.05
+                self.compression_ratio = 1.2
+
+        class Info:
+            language = "zh"
+            language_probability = 0.98
+            duration_after_vad = 30.0
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def transcribe(self, _audio_path: str, **options):
+                self.calls.append(options)
+                if len(self.calls) == 1:
+                    return [Segment(float(index), "重复字幕", -1.1) for index in range(4)], Info()
+                return [Segment(0, "第一句", -0.2), Segment(1, "第二句", -0.3)], Info()
+
+        model = FakeModel()
+        with patch.object(main, "whisper_model", return_value=model), patch.object(
+            main, "audio_duration_seconds", return_value=30.0
+        ):
+            result = main.transcribe_audio_payload("audio.wav", "zh", "balanced")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(model.calls), 2)
+        self.assertTrue(model.calls[0]["condition_on_previous_text"])
+        self.assertFalse(model.calls[1]["condition_on_previous_text"])
+        self.assertEqual([entry[2] for entry in result["entries"]], ["第一句", "第二句"])
+        metadata = result["meta"]
+        self.assertTrue(metadata["context_retry_performed"])
+        self.assertTrue(metadata["context_retry_selected"])
+        self.assertEqual(metadata["context_retry_reason"], "repetition")
+
+    def test_long_accurate_transcription_does_not_silently_double_runtime(self) -> None:
+        class Segment:
+            start = 0.0
+            end = 1.0
+            text = "重复字幕"
+            avg_logprob = -1.4
+            no_speech_prob = 0.05
+            compression_ratio = 1.2
+
+        class Info:
+            language = "zh"
+            language_probability = 0.98
+            duration_after_vad = 900.0
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def transcribe(self, *_args, **_options):
+                self.calls += 1
+                return [Segment(), Segment(), Segment()], Info()
+
+        model = FakeModel()
+        with patch.object(main, "whisper_model", return_value=model), patch.object(
+            main,
+            "audio_duration_seconds",
+            return_value=float(main.ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS + 1),
+        ):
+            result = main.transcribe_audio_payload("audio.wav", "zh", "accurate")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(model.calls, 1)
+        metadata = result["meta"]
+        self.assertFalse(metadata["context_retry_performed"])
+        self.assertEqual(metadata["context_retry_skipped_reason"], "duration_limit")
+        self.assertEqual(metadata["quality_warning"], "repetition")
 
     def test_transcription_error_redacts_prompt_and_hotwords(self) -> None:
         class FailingModel:

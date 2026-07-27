@@ -124,6 +124,9 @@ class ResultKeyLockEntry:
     references: int = 0
 
 
+AsrQuality = Literal["fast", "balanced", "accurate"]
+
+
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.5")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -185,6 +188,10 @@ ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8").strip() or "int8"
 ASR_DEVICE = os.getenv("ASR_DEVICE", "cpu").strip() or "cpu"
 ASR_CPU_THREADS = max(1, int(os.getenv("ASR_CPU_THREADS", "3")))
 ASR_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_TIMEOUT_SECONDS", "1800")))
+BALANCED_ASR_TIMEOUT_SECONDS = max(
+    ASR_TIMEOUT_SECONDS,
+    int(os.getenv("ASR_BALANCED_TIMEOUT_SECONDS", "2400")),
+)
 ACCURATE_ASR_MODEL = os.getenv("ASR_ACCURATE_MODEL", DEFAULT_ASR_MODEL).strip() or DEFAULT_ASR_MODEL
 ACCURATE_ASR_COMPUTE_TYPE = (
     os.getenv("ASR_ACCURATE_COMPUTE_TYPE", ASR_COMPUTE_TYPE).strip() or ASR_COMPUTE_TYPE
@@ -199,6 +206,7 @@ ACCURATE_ASR_TIMEOUT_SECONDS = max(
     int(os.getenv("ASR_ACCURATE_TIMEOUT_SECONDS", "3600")),
 )
 ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "3"))))
+ASR_BALANCED_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_BALANCED_BEAM_SIZE", "3"))))
 ACCURATE_ASR_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_ACCURATE_BEAM_SIZE", "5"))))
 ASR_DOWNLOAD_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_DOWNLOAD_TIMEOUT_SECONDS", "300")))
 ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "1800")))
@@ -229,6 +237,10 @@ try:
     )
 except ValueError:
     ASR_RETRY_LOW_CONFIDENCE_RATIO = 0.65
+ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS = max(
+    0,
+    int(os.getenv("ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS", "600")),
+)
 BILI_MAX_DOWNLOAD_BYTES = max(10_000_000, int(os.getenv("BILI_MAX_DOWNLOAD_BYTES", "1000000000")))
 UPLOAD_MAX_BYTES = max(1_000_000, int(os.getenv("UPLOAD_MAX_BYTES", "536870912")))
 PUBLIC_UPLOAD_MAX_BYTES = min(
@@ -293,6 +305,13 @@ try:
 except ValueError:
     ASR_TIMEOUT_PER_AUDIO_SECOND = 0.5
 try:
+    BALANCED_ASR_TIMEOUT_PER_AUDIO_SECOND = max(
+        0.0,
+        float(os.getenv("ASR_BALANCED_TIMEOUT_PER_AUDIO_SECOND", "1.0")),
+    )
+except ValueError:
+    BALANCED_ASR_TIMEOUT_PER_AUDIO_SECOND = 1.0
+try:
     ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND = max(
         0.0,
         float(os.getenv("ASR_ACCURATE_TIMEOUT_PER_AUDIO_SECOND", "1.5")),
@@ -301,6 +320,7 @@ except ValueError:
     ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND = 1.5
 ASR_MAX_TIMEOUT_SECONDS = max(
     ACCURATE_ASR_TIMEOUT_SECONDS,
+    BALANCED_ASR_TIMEOUT_SECONDS,
     int(os.getenv("ASR_MAX_TIMEOUT_SECONDS", "7200")),
 )
 CLOUD_ASR_DEFAULT_MODEL = (
@@ -505,7 +525,7 @@ class ExtractRequest(BaseModel):
     )
     hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
     allow_platform_ai: bool = True
-    quality: Literal["fast", "accurate"] = "accurate"
+    quality: AsrQuality = "balanced"
     asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto"
     cloud_consent: bool = False
     embedded_subtitles: bool = False
@@ -526,7 +546,7 @@ class UploadJobRequest(BaseModel):
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     )
     hotwords: str | None = Field(default=None, max_length=ASR_PROMPT_MAX_CHARS)
-    quality: Literal["fast", "accurate"] = "accurate"
+    quality: AsrQuality = "balanced"
     asr_mode: Literal["auto", "high_accuracy", "economy"] = "auto"
     cloud_consent: bool = False
     embedded_subtitles: bool = False
@@ -1064,8 +1084,10 @@ def asr_audio_filter() -> str:
     return value[:500]
 
 
-def effective_quality(quality: str, embedded_subtitles: bool = False) -> Literal["fast", "accurate"]:
-    return "accurate" if embedded_subtitles or quality == "accurate" else "fast"
+def effective_quality(quality: str, embedded_subtitles: bool = False) -> AsrQuality:
+    if embedded_subtitles or quality == "accurate":
+        return "accurate"
+    return "fast" if quality == "fast" else "balanced"
 
 
 def asr_profile(quality: str) -> dict[str, Any]:
@@ -1089,6 +1111,22 @@ def asr_profile(quality: str) -> dict[str, Any]:
                 True,
             ),
             "timeout_seconds": ACCURATE_ASR_TIMEOUT_SECONDS,
+        }
+    if quality == "balanced":
+        return {
+            "quality": "balanced",
+            "model": DEFAULT_ASR_MODEL,
+            "compute_type": ASR_COMPUTE_TYPE,
+            "device": ASR_DEVICE,
+            "cpu_threads": ASR_CPU_THREADS,
+            "beam_size": ASR_BALANCED_BEAM_SIZE,
+            "vad_filter": env_bool("ASR_BALANCED_VAD_FILTER", True),
+            "vad_parameters": vad_parameters,
+            "condition_on_previous_text": env_bool(
+                "ASR_BALANCED_CONDITION_ON_PREVIOUS_TEXT",
+                True,
+            ),
+            "timeout_seconds": BALANCED_ASR_TIMEOUT_SECONDS,
         }
     payload = {
         "quality": "fast",
@@ -1115,13 +1153,17 @@ def asr_task_timeout(audio_path: Path, quality: str) -> int:
                 duration = source.getnframes() / frame_rate
     except (OSError, EOFError, wave.Error):
         pass
-    per_second = (
-        ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND
-        if profile["quality"] == "accurate"
-        else ASR_TIMEOUT_PER_AUDIO_SECOND
-    )
+    per_second = {
+        "accurate": ACCURATE_ASR_TIMEOUT_PER_AUDIO_SECOND,
+        "balanced": BALANCED_ASR_TIMEOUT_PER_AUDIO_SECOND,
+    }.get(profile["quality"], ASR_TIMEOUT_PER_AUDIO_SECOND)
     dynamic = math.ceil(duration * per_second + 60) if duration > 0 else 0
     return min(ASR_MAX_TIMEOUT_SECONDS, max(int(profile["timeout_seconds"]), dynamic))
+
+
+def asr_progress_message(quality: str) -> str:
+    label = {"accurate": "精确", "balanced": "均衡"}.get(quality, "快速")
+    return f"正在进行{label}语音识别"
 
 
 def safe_upload_filename(value: str) -> tuple[str, str]:
@@ -1610,6 +1652,8 @@ def result_cache_key(req: ExtractRequest, canonical_input: str) -> str:
         "asr_vad_profile_version": ASR_VAD_PROFILE_VERSION,
         "asr_condition_on_previous_text": profile["condition_on_previous_text"],
         "asr_context_retry_enabled": env_bool("ASR_CONTEXT_RETRY_ENABLED", True),
+        "asr_context_retry_policy": "balanced-repetition-accurate-all-v2",
+        "asr_context_retry_max_audio_seconds": ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS,
         "asr_low_logprob_threshold": ASR_LOW_LOGPROB_THRESHOLD,
         "asr_retry_repetition_ratio": ASR_RETRY_REPETITION_RATIO,
         "asr_retry_low_confidence_ratio": ASR_RETRY_LOW_CONFIDENCE_RATIO,
@@ -1655,6 +1699,8 @@ def upload_result_cache_key(req: UploadJobRequest) -> str:
         "asr_vad_profile_version": ASR_VAD_PROFILE_VERSION,
         "asr_condition_on_previous_text": profile["condition_on_previous_text"],
         "asr_context_retry_enabled": env_bool("ASR_CONTEXT_RETRY_ENABLED", True),
+        "asr_context_retry_policy": "balanced-repetition-accurate-all-v2",
+        "asr_context_retry_max_audio_seconds": ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS,
         "asr_low_logprob_threshold": ASR_LOW_LOGPROB_THRESHOLD,
         "asr_retry_repetition_ratio": ASR_RETRY_REPETITION_RATIO,
         "asr_retry_low_confidence_ratio": ASR_RETRY_LOW_CONFIDENCE_RATIO,
@@ -4821,7 +4867,7 @@ def prefer_retry_result(first: dict[str, Any], retry: dict[str, Any]) -> bool:
 def transcribe_audio_payload(
     audio_path: str,
     lang: str | None,
-    quality: str = "accurate",
+    quality: str = "balanced",
     initial_prompt: str | None = None,
     hotwords: str | None = None,
 ) -> dict[str, Any]:
@@ -4857,13 +4903,32 @@ def transcribe_audio_payload(
             retry_reason = "repetition"
         elif low_confidence_ratio >= ASR_RETRY_LOW_CONFIDENCE_RATIO:
             retry_reason = "low_confidence"
+        retry_profile_allowed = bool(
+            profile["quality"] == "accurate"
+            or (profile["quality"] == "balanced" and retry_reason == "repetition")
+        )
+        retry_duration_allowed = bool(
+            duration <= 0
+            or ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS <= 0
+            or duration <= ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS
+        )
+        retry_enabled = env_bool("ASR_CONTEXT_RETRY_ENABLED", True)
         retry_performed = bool(
             entries
             and retry_reason
-            and profile["quality"] == "accurate"
+            and retry_profile_allowed
+            and retry_duration_allowed
             and profile["condition_on_previous_text"]
-            and env_bool("ASR_CONTEXT_RETRY_ENABLED", True)
+            and retry_enabled
         )
+        retry_skipped_reason: str | None = None
+        if entries and retry_reason and profile["condition_on_previous_text"] and not retry_performed:
+            if not retry_enabled:
+                retry_skipped_reason = "disabled"
+            elif not retry_profile_allowed:
+                retry_skipped_reason = "profile_policy"
+            elif not retry_duration_allowed:
+                retry_skipped_reason = "duration_limit"
         retry_selected = False
         if retry_performed:
             retry_options = dict(options)
@@ -4886,6 +4951,7 @@ def transcribe_audio_payload(
                 "context_retry_performed": retry_performed,
                 "context_retry_selected": retry_selected,
                 "context_retry_reason": retry_reason if retry_performed else None,
+                "context_retry_skipped_reason": retry_skipped_reason,
                 "quality_warning": (
                     "repetition"
                     if float(metrics.get("repeated_segment_ratio") or 0.0)
@@ -4948,9 +5014,9 @@ def transcribe_audio_worker(
 
 
 def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: Any) -> None:
-    prewarm_quality = os.getenv("ASR_PREWARM_QUALITY", "accurate").strip().lower()
-    if prewarm_quality not in {"fast", "accurate"}:
-        prewarm_quality = "accurate"
+    prewarm_quality = os.getenv("ASR_PREWARM_QUALITY", "balanced").strip().lower()
+    if prewarm_quality not in {"fast", "balanced", "accurate"}:
+        prewarm_quality = "balanced"
     prewarm_profile = asr_profile(prewarm_quality)
     prewarmed = False
     try:
@@ -5001,7 +5067,7 @@ def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: An
             result = transcribe_audio_payload(
                 str(task.get("audio_path") or ""),
                 task.get("lang"),
-                str(task.get("quality") or "accurate"),
+                str(task.get("quality") or "balanced"),
                 task.get("initial_prompt"),
                 task.get("hotwords"),
             )
@@ -5183,6 +5249,7 @@ def asr_public_diagnostics(meta: dict[str, Any]) -> dict[str, Any]:
         "context_retry_performed",
         "context_retry_selected",
         "context_retry_reason",
+        "context_retry_skipped_reason",
         "quality_warning",
         "initial_prompt_used",
         "hotwords_used",
@@ -5209,7 +5276,7 @@ def asr_quality_user_note(meta: dict[str, Any]) -> str | None:
 def transcribe_audio_once(
     audio_path: Path,
     lang: str | None,
-    quality: str = "accurate",
+    quality: str = "balanced",
     initial_prompt: str | None = None,
     hotwords: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
@@ -5287,7 +5354,7 @@ def transcribe_audio_once(
 def transcribe_audio(
     audio_path: Path,
     lang: str | None,
-    quality: str = "accurate",
+    quality: str = "balanced",
     initial_prompt: str | None = None,
     hotwords: str | None = None,
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
@@ -5898,7 +5965,7 @@ def local_asr_subtitle(req: ExtractRequest, allow_cookie: bool, prior_note: str 
             report_progress(
                 "transcribe",
                 68,
-                "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
+                asr_progress_message(quality),
             )
             initial_prompt, hotwords = asr_context(view.title, view.author, req.hotwords)
             entries, asr_info = transcribe_audio(
@@ -6055,7 +6122,7 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
                     report_progress(
                         "transcribe",
                         68,
-                        "正在进行精确语音识别" if quality == "accurate" else "正在进行快速语音识别",
+                        asr_progress_message(quality),
                     )
                     initial_prompt, hotwords = asr_context(
                         upload_display_title(req.filename),
@@ -6788,7 +6855,7 @@ async def stage_uploaded_video(
     filename: str,
     output_format: Literal["txt", "srt", "json", "markdown", "md", "vtt"],
     lang: str | None,
-    quality: Literal["fast", "accurate"],
+    quality: AsrQuality,
     embedded_subtitles: bool,
     force_refresh: bool,
     hotwords: str | None = None,
@@ -7564,7 +7631,7 @@ async def api_create_upload_job(
         max_length=35,
         pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$",
     ),
-    quality: Literal["fast", "accurate"] = Query("accurate"),
+    quality: AsrQuality = Query("balanced"),
     asr_mode: Literal["auto", "high_accuracy", "economy"] = Query("auto"),
     cloud_consent: bool = Query(False),
     embedded_subtitles: bool = Query(False),

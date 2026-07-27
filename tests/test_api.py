@@ -440,7 +440,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(list(main.ASR_TMP_DIR.glob("asr-upload-*")), [])
         self.assertEqual(main.upload_staging_bytes(), 0)
 
-    def test_upload_endpoint_defaults_to_accurate_chinese(self) -> None:
+    def test_upload_endpoint_defaults_to_balanced_chinese(self) -> None:
         result = {
             "ok": True,
             "format": "txt",
@@ -458,7 +458,7 @@ class ApiIntegrationTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         request = cache.call_args.args[0]
-        self.assertEqual(request.quality, "accurate")
+        self.assertEqual(request.quality, "balanced")
         self.assertEqual(request.lang, "zh")
 
     def test_upload_rejects_unsupported_extension_and_oversized_body(self) -> None:
@@ -881,7 +881,7 @@ class ApiIntegrationTests(unittest.TestCase):
 
 
 class FrontendRecoveryTests(unittest.TestCase):
-    def test_frontend_defaults_to_local_base_chinese_with_platform_subtitles(self) -> None:
+    def test_frontend_defaults_to_local_balanced_chinese_with_platform_subtitles(self) -> None:
         page = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
@@ -891,9 +891,10 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn('id="allow-platform-ai" type="checkbox" role="switch" checked', page)
         self.assertIn('<option value="zh" selected>中文</option>', page)
         self.assertIn('asr_mode: selectedAsrMode()', script)
+        self.assertIn('return "balanced"', script)
         self.assertIn('payload.allow_platform_ai !== false', script)
         self.assertIn('X-ASR-Hotwords', script)
-        self.assertIn("本地基础", page)
+        self.assertIn("本地均衡", page)
         self.assertIn('id="privacy-note"', page)
 
     def test_expired_backend_job_clears_saved_frontend_state(self) -> None:
@@ -939,7 +940,7 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function submitCurrentForm()", script)
         self.assertIn("function changeAccountPassword(", script)
         self.assertIn("guest_media_disabled", script)
-        self.assertIn("/static/app.js?v=20260727-3", page)
+        self.assertIn("/static/app.js?v=20260727-4", page)
         self.assertIn("function syncRailNavigation(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
             "function syncPrecisionOptions", 1

@@ -8,7 +8,7 @@
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
   <link rel="stylesheet" href="/static/app.css?v=20260727-2">
-  <script src="/static/app.js?v=20260727-3" defer></script>
+  <script src="/static/app.js?v=20260727-4" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -381,8 +381,8 @@
                   </svg>
                 </i>
                 <span>
-                  <strong id="asr-auto-title">本地基础</strong>
-                  <small id="asr-auto-detail">默认 · 不使用云端额度</small>
+                  <strong id="asr-auto-title">本地均衡</strong>
+                  <small id="asr-auto-detail">默认 · 兼顾速度与准确率</small>
                 </span>
                 <em>推荐</em>
               </span>
@@ -421,7 +421,7 @@
               <p>只有平台字幕未命中且你明确确认后，才会调用云端。</p>
             </section>
           </div>
-          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时在本站内部识别</p>
+          <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时在本站内部均衡识别</p>
         </fieldset>
 
         <label class="toggle-row embedded-subtitle-row" id="embedded-subtitle-row">

@@ -319,7 +319,7 @@
       operation: selectedOperation(),
       inputMode: selectedInputMode(),
       source: selectedSource(),
-      quality: "accurate",
+      quality: "balanced",
       asrMode: selectedAsrMode(),
       format: elements.format.value,
       lang: elements.lang.value,
@@ -659,7 +659,7 @@
   }
 
   function selectedQuality() {
-    return "accurate";
+    return "balanced";
   }
 
   function selectedAsrMode() {
@@ -929,9 +929,9 @@
       || Boolean(state.capabilities.asr_modes && state.capabilities.asr_modes.auto.available);
     const autoUsesLocal = !state.capabilities || autoBackend === "local";
     const autoRadio = elements.form.querySelector('input[name="asr-mode"][value="auto"]');
-    elements.asrAutoTitle.textContent = autoUsesLocal ? "本地基础" : "自动识别";
+    elements.asrAutoTitle.textContent = autoUsesLocal ? "本地均衡" : "自动识别";
     elements.asrAutoDetail.textContent = autoUsesLocal
-      ? "默认 · 不使用云端额度"
+      ? "默认 · 兼顾速度与准确率"
       : "智能选择可用服务";
     elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
       const unavailable = radio.value === "auto"
@@ -969,7 +969,7 @@
           : currentMode === "high_accuracy"
             ? "平台字幕优先；没有字幕时发送临时音频至千问 ASR"
             : autoUsesLocal
-              ? "先提取平台字幕，没有字幕时在本站内部识别"
+              ? "先提取平台字幕，没有字幕时在本站内部均衡识别"
               : "先提取平台字幕，没有字幕时使用当前可用识别服务";
     elements.privacyNote.textContent = !currentModeReady
       ? "平台字幕提取不受影响；需要语音识别时请稍后重试。"
@@ -1398,7 +1398,7 @@
       title: meta.title || sourceId,
       operation,
       source: payload.source,
-      quality: payload.quality || "accurate",
+      quality: payload.quality || "balanced",
       asrMode: payload.asr_mode || "auto",
       embeddedSubtitles: Boolean(payload.embedded_subtitles),
       format: payload.format || (operation === "audio" ? "mp3" : "mp4"),
