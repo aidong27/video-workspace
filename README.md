@@ -219,7 +219,7 @@ media availability and public limits. Temporary media responses remain
 must not cache or publicly proxy artifact downloads; this keeps owner isolation
 intact and avoids treating a general CDN as a video-delivery service.
 
-The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for both quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model.
+The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for both quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model. Model loading checks the local cache before attempting a network request; once the production cache is seeded, set `ASR_MODEL_DOWNLOAD_ENABLED=false` to fail quickly instead of waiting on an unavailable model host. `ASR_MODEL_IDLE_SECONDS=900` releases the model after 15 idle minutes while retaining the worker process; set it to `0` only when lower cold-start latency matters more than idle memory.
 
 ## Douyin runtime
 

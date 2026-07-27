@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from huggingface_hub.errors import LocalEntryNotFoundError
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
@@ -201,6 +202,7 @@ ASR_FAST_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_FAST_BEAM_SIZE", "3"))))
 ACCURATE_ASR_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_ACCURATE_BEAM_SIZE", "5"))))
 ASR_DOWNLOAD_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_DOWNLOAD_TIMEOUT_SECONDS", "300")))
 ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "1800")))
+ASR_MODEL_IDLE_SECONDS = max(0, int(os.getenv("ASR_MODEL_IDLE_SECONDS", "900")))
 ASR_MAX_AUDIO_SECONDS = max(30, int(os.getenv("ASR_MAX_AUDIO_SECONDS", "3600")))
 ASR_PROMPT_MAX_CHARS = min(1000, max(50, int(os.getenv("ASR_PROMPT_MAX_CHARS", "300"))))
 try:
@@ -4591,6 +4593,11 @@ def clear_whisper_model() -> None:
         _release_whisper_model_locked()
 
 
+def whisper_model_loaded() -> bool:
+    with _ASR_MODEL_LOCK:
+        return _ASR_MODEL_INSTANCE is not None
+
+
 def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: int) -> Any:
     global _ASR_MODEL_KEY, _ASR_MODEL_INSTANCE
     key = (model_name, compute_type, device, cpu_threads)
@@ -4601,13 +4608,28 @@ def whisper_model(model_name: str, compute_type: str, device: str, cpu_threads: 
             _release_whisper_model_locked()
         from faster_whisper import WhisperModel
 
-        instance = WhisperModel(
-            model_name,
-            device=device,
-            compute_type=compute_type,
-            cpu_threads=cpu_threads,
-            download_root=str(ASR_MODEL_DIR),
-        )
+        model_options = {
+            "device": device,
+            "compute_type": compute_type,
+            "cpu_threads": cpu_threads,
+            "download_root": str(ASR_MODEL_DIR),
+        }
+        try:
+            instance = WhisperModel(
+                model_name,
+                **model_options,
+                local_files_only=True,
+            )
+        except LocalEntryNotFoundError as exc:
+            if not env_bool("ASR_MODEL_DOWNLOAD_ENABLED", True):
+                raise RuntimeError(
+                    "ASR model not found in the local cache and model downloads are disabled."
+                ) from exc
+            instance = WhisperModel(
+                model_name,
+                **model_options,
+                local_files_only=False,
+            )
         _ASR_MODEL_INSTANCE = instance
         _ASR_MODEL_KEY = key
         return instance
@@ -4959,7 +4981,20 @@ def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: An
         ready_event.set()
     try:
         while True:
-            task = request_queue.get()
+            try:
+                task = (
+                    request_queue.get(timeout=ASR_MODEL_IDLE_SECONDS)
+                    if ASR_MODEL_IDLE_SECONDS > 0
+                    else request_queue.get()
+                )
+            except Empty:
+                if whisper_model_loaded():
+                    clear_whisper_model()
+                    try:
+                        result_queue.put_nowait({"kind": "idle_unload"})
+                    except Full:
+                        pass
+                continue
             if task is None:
                 return
             task_id = str(task.get("task_id") or "")
@@ -5077,16 +5112,7 @@ def prewarm_asr_worker() -> None:
                 status = result_queue.get(timeout=1.0)
             except Empty:
                 status = None
-            if isinstance(status, dict) and status.get("kind") == "prewarm":
-                ASR_WORKER_WARM = bool(status.get("ok"))
-                model_key = status.get("model_key")
-                if isinstance(model_key, list) and len(model_key) == 4:
-                    ASR_WORKER_MODEL_KEY = (
-                        str(model_key[0]),
-                        str(model_key[1]),
-                        str(model_key[2]),
-                        int(model_key[3]),
-                    )
+            consume_asr_worker_status(status)
     finally:
         ASR_SEMAPHORE.release()
 
@@ -5097,6 +5123,31 @@ def start_asr_prewarm() -> None:
         return
     ASR_PREWARM_THREAD = Thread(target=prewarm_asr_worker, name="asr-prewarm", daemon=True)
     ASR_PREWARM_THREAD.start()
+
+
+def consume_asr_worker_status(status: Any) -> bool:
+    global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
+    if not isinstance(status, dict):
+        return False
+    kind = status.get("kind")
+    if kind == "idle_unload":
+        ASR_WORKER_WARM = False
+        ASR_WORKER_MODEL_KEY = None
+        return True
+    if kind != "prewarm":
+        return False
+    ASR_WORKER_WARM = bool(status.get("ok"))
+    model_key = status.get("model_key")
+    if ASR_WORKER_WARM and isinstance(model_key, list) and len(model_key) == 4:
+        ASR_WORKER_MODEL_KEY = (
+            str(model_key[0]),
+            str(model_key[1]),
+            str(model_key[2]),
+            int(model_key[3]),
+        )
+    else:
+        ASR_WORKER_MODEL_KEY = None
+    return True
 
 
 def parse_transcription_result(result: dict[str, Any]) -> tuple[list[SubtitleEntry], dict[str, Any]]:
@@ -5293,16 +5344,7 @@ def transcribe_audio(
                 result = result_queue.get(timeout=min(1.0, remaining))
             except Empty:
                 continue
-            if isinstance(result, dict) and result.get("kind") == "prewarm":
-                ASR_WORKER_WARM = bool(result.get("ok"))
-                model_key = result.get("model_key")
-                if isinstance(model_key, list) and len(model_key) == 4:
-                    ASR_WORKER_MODEL_KEY = (
-                        str(model_key[0]),
-                        str(model_key[1]),
-                        str(model_key[2]),
-                        int(model_key[3]),
-                    )
+            if consume_asr_worker_status(result):
                 continue
             if not isinstance(result, dict):
                 continue
@@ -7036,7 +7078,7 @@ def startup() -> None:
     if (
         local_asr_enabled()
         and env_bool("ASR_PERSISTENT_WORKER", True)
-        and env_bool("ASR_PREWARM", True)
+        and env_bool("ASR_PREWARM", False)
     ):
         start_asr_prewarm()
 

@@ -1777,6 +1777,7 @@ class AsrWorkerTests(unittest.TestCase):
                 self.model = RuntimeModel()
 
         def factory(name: str, **_kwargs):
+            self.assertTrue(_kwargs["local_files_only"])
             instance = FakeModel(name)
             created.append(instance)
             return instance
@@ -1795,6 +1796,41 @@ class AsrWorkerTests(unittest.TestCase):
         finally:
             main.clear_whisper_model()
         self.assertEqual(created[-1].model.unloads, 1)
+
+    def test_whisper_model_uses_local_cache_before_network_fallback(self) -> None:
+        calls = []
+        loaded_model = object()
+
+        def factory(_name: str, **options):
+            calls.append(options["local_files_only"])
+            if options["local_files_only"]:
+                raise main.LocalEntryNotFoundError("not cached")
+            return loaded_model
+
+        main.clear_whisper_model()
+        try:
+            with patch("faster_whisper.WhisperModel", side_effect=factory), patch.object(
+                main, "env_bool", return_value=True
+            ):
+                result = main.whisper_model("small", "int8", "cpu", 3)
+            self.assertIs(result, loaded_model)
+            self.assertEqual(calls, [True, False])
+        finally:
+            main.clear_whisper_model()
+
+    def test_whisper_model_can_disable_network_download_fallback(self) -> None:
+        main.clear_whisper_model()
+        try:
+            with patch(
+                "faster_whisper.WhisperModel",
+                side_effect=main.LocalEntryNotFoundError("not cached"),
+            ) as factory, patch.object(main, "env_bool", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "model not found"):
+                    main.whisper_model("small", "int8", "cpu", 3)
+            self.assertEqual(factory.call_count, 1)
+            self.assertTrue(factory.call_args.kwargs["local_files_only"])
+        finally:
+            main.clear_whisper_model()
 
     def test_accurate_transcription_uses_context_metrics_and_one_retry(self) -> None:
         class Segment:
@@ -1949,7 +1985,7 @@ class AsrWorkerTests(unittest.TestCase):
                     None,
                 ]
 
-            def get(self):
+            def get(self, timeout=None):
                 return self.items.pop(0)
 
         class FakeResultQueue:
@@ -1985,6 +2021,53 @@ class AsrWorkerTests(unittest.TestCase):
         self.assertEqual(result_queue.items[0]["model_key"], ["small", "int8", "cpu", 3])
         self.assertTrue(result_queue.items[1]["ok"])
         self.assertEqual(result_queue.items[1]["task_id"], "task-1")
+
+    def test_persistent_worker_unloads_model_after_idle_timeout(self) -> None:
+        class FakeRequestQueue:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise main.Empty
+                return None
+
+        class FakeResultQueue:
+            def __init__(self) -> None:
+                self.items = []
+
+            def put(self, value) -> None:
+                self.items.append(value)
+
+            def put_nowait(self, value) -> None:
+                self.items.append(value)
+
+        class FakeEvent:
+            def set(self) -> None:
+                pass
+
+        result_queue = FakeResultQueue()
+        with patch.object(main, "ASR_MODEL_IDLE_SECONDS", 1), patch.object(
+            main, "whisper_model", return_value=object()
+        ), patch.object(main, "whisper_model_loaded", return_value=True), patch.object(
+            main, "clear_whisper_model"
+        ) as clear_model:
+            main.persistent_asr_worker(FakeRequestQueue(), result_queue, FakeEvent())
+
+        self.assertEqual([item["kind"] for item in result_queue.items], ["prewarm", "idle_unload"])
+        self.assertGreaterEqual(clear_model.call_count, 2)
+
+    def test_idle_unload_status_clears_parent_model_state(self) -> None:
+        original = (main.ASR_WORKER_WARM, main.ASR_WORKER_MODEL_KEY)
+        main.ASR_WORKER_WARM = True
+        main.ASR_WORKER_MODEL_KEY = ("small", "int8", "cpu", 3)
+        try:
+            self.assertTrue(main.consume_asr_worker_status({"kind": "idle_unload"}))
+            self.assertFalse(main.ASR_WORKER_WARM)
+            self.assertIsNone(main.ASR_WORKER_MODEL_KEY)
+        finally:
+            main.ASR_WORKER_WARM, main.ASR_WORKER_MODEL_KEY = original
 
     def test_dead_persistent_worker_is_rebuilt_for_next_task(self) -> None:
         class FakeQueue:

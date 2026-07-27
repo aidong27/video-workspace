@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import unittest
 
 from app.guest import GuestMediaRateLimiter, GuestSessionCodec
@@ -19,6 +20,17 @@ class GuestSessionTests(unittest.TestCase):
         payload, signature = token.split(".", 1)
         replacement = "A" if signature[-1] != "A" else "B"
         self.assertIsNone(codec.resolve(f"{payload}.{signature[:-1]}{replacement}", now=1_100))
+
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        canonical_index = alphabet.index(signature[-1])
+        noncanonical_signature = f"{signature[:-1]}{alphabet[canonical_index + 1]}"
+        padding = "=" * (-len(signature) % 4)
+        alias_padding = "=" * (-len(noncanonical_signature) % 4)
+        self.assertEqual(
+            base64.urlsafe_b64decode(signature + padding),
+            base64.urlsafe_b64decode(noncanonical_signature + alias_padding),
+        )
+        self.assertIsNone(codec.resolve(f"{payload}.{noncanonical_signature}", now=1_100))
 
     def test_short_secret_disables_guest_sessions(self) -> None:
         codec = GuestSessionCodec("too-short", ttl_seconds=600)

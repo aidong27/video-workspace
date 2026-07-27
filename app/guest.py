@@ -36,8 +36,13 @@ class GuestSessionCodec:
 
     @staticmethod
     def _decode(value: str) -> bytes:
+        if not value or "=" in value:
+            raise ValueError("invalid base64url value")
         padding = "=" * (-len(value) % 4)
-        return base64.urlsafe_b64decode(value + padding)
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+        if GuestSessionCodec._encode(decoded) != value:
+            raise ValueError("non-canonical base64url value")
+        return decoded
 
     def _signature(self, payload: bytes) -> bytes:
         return hmac.new(self._secret, b"guest-session:" + payload, hashlib.sha256).digest()
