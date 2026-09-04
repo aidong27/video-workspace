@@ -6,16 +6,22 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from fastapi import HTTPException, Request
+
 from app.auth import (
+    AuthUser,
     AuthFailure,
     account_summary,
+    admin_usernames,
     authenticate_user,
     change_password,
     create_session,
     delete_session,
     delete_user_sessions,
     initialize_auth_db,
+    is_admin_user,
     register_user,
+    require_admin_user,
     resolve_session,
     user_count,
 )
@@ -33,6 +39,7 @@ class AuthTests(unittest.TestCase):
                 "AUTH_MAX_USERS": "50",
                 "AUTH_SESSION_TTL_DAYS": "30",
                 "AUTH_MAX_SESSIONS_PER_USER": "8",
+                "ADMIN_USERNAMES": "",
                 "INVITE_CODE_HASH": hashlib.sha256(self.invite_code.encode()).hexdigest(),
             },
             clear=False,
@@ -136,6 +143,56 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(account_summary(user.user_id)["active_sessions"], 2)
         delete_user_sessions(user.user_id)
         self.assertEqual(account_summary(user.user_id)["active_sessions"], 0)
+
+    def test_admin_allowlist_is_explicit_trimmed_and_case_insensitive(self) -> None:
+        os.environ["ADMIN_USERNAMES"] = " Friend_01,ADMIN_TWO, friend_01, ,"
+        self.assertEqual(admin_usernames(), {"friend_01", "admin_two"})
+
+        user = AuthUser(user_id=1, username="fRiEnD_01", created_at=1)
+        self.assertTrue(is_admin_user(user))
+        self.assertFalse(is_admin_user(AuthUser(user_id=2, username="someone_else", created_at=1)))
+
+        os.environ["ADMIN_USERNAMES"] = ""
+        self.assertEqual(admin_usernames(), set())
+        self.assertFalse(is_admin_user(user))
+
+    def test_require_admin_user_preserves_unauthenticated_401(self) -> None:
+        request = Request({"type": "http", "headers": []})
+
+        with self.assertRaises(HTTPException) as failure:
+            require_admin_user(request)
+
+        self.assertEqual(failure.exception.status_code, 401)
+        self.assertEqual(failure.exception.detail["reason"], "authentication_required")
+
+    def test_require_admin_user_returns_user_for_case_insensitive_match(self) -> None:
+        os.environ["ADMIN_USERNAMES"] = "SITE_OWNER"
+        user = AuthUser(user_id=1, username="site_owner", created_at=1)
+        request = Request({"type": "http", "headers": []})
+        request.state.auth_user = user
+
+        self.assertEqual(require_admin_user(request), user)
+
+    def test_admin_denials_are_stable_and_do_not_leak_allowlist(self) -> None:
+        user = AuthUser(user_id=1, username="ordinary_user", created_at=1)
+        request = Request({"type": "http", "headers": []})
+        request.state.auth_user = user
+        failures = []
+
+        for configured_names in ("", "SecretOwner,AnotherAdmin"):
+            os.environ["ADMIN_USERNAMES"] = configured_names
+            with self.assertRaises(HTTPException) as failure:
+                require_admin_user(request)
+            failures.append(failure.exception)
+
+        self.assertEqual(failures[0].status_code, 403)
+        self.assertEqual(failures[0].detail, failures[1].detail)
+        self.assertEqual(
+            failures[0].detail,
+            {"reason": "admin_required", "message": "需要管理员权限。"},
+        )
+        self.assertNotIn("SecretOwner", repr(failures[1].detail))
+        self.assertNotIn("AnotherAdmin", repr(failures[1].detail))
 
 
 if __name__ == "__main__":

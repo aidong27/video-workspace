@@ -27,6 +27,19 @@ class RequestDefaultsTests(unittest.TestCase):
         self.assertEqual(parsed["VmSwap"], 2048)
         self.assertNotIn("Broken", parsed)
 
+    def test_child_process_memory_status_exposes_only_aggregate_memory(self) -> None:
+        process = type("Process", (), {"pid": 4321})()
+        with patch.object(main.sys, "platform", "linux"), patch.object(
+            main.Path,
+            "read_text",
+            return_value="VmRSS: 153600 kB\nVmSwap: 2048 kB\n",
+        ) as read_status:
+            status = main.child_process_memory_status(process)
+
+        self.assertEqual(status, {"rss_mb": 150.0, "swap_mb": 2.0})
+        read_status.assert_called_once_with(encoding="utf-8")
+        self.assertNotIn("pid", status)
+
     def test_subtitle_requests_default_to_platform_first_local_settings(self) -> None:
         request = main.ExtractRequest(input="BV14jFvzbEvj")
 
@@ -229,6 +242,64 @@ class CloudAsrPipelineTests(unittest.TestCase):
             self.assertEqual(store.records, {})
             self.assertEqual(ledger.stats()["daily_seconds"], 5.5)
 
+    def test_cloud_pipeline_counts_empty_transcript_as_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            store = SignedAudioStore(
+                root=root,
+                public_base_url="https://caption.example.test",
+                secret="s" * 32,
+            )
+            ledger = UsageLedger(
+                root / "usage.db",
+                daily_limit_seconds=100,
+                monthly_limit_seconds=1000,
+                user_daily_limit_seconds=60,
+            )
+            provider = MockAsrProvider(
+                Transcript(
+                    provider="aliyun",
+                    model="qwen3-asr-flash-filetrans",
+                    language="zh",
+                    duration_ms=5000,
+                    provider_seconds=5,
+                    segments=[],
+                )
+            )
+            with patch.object(main, "CLOUD_ASR_AUDIO_DELIVERY", "signed_url"), patch.object(
+                main, "CLOUD_SIGNED_AUDIO_STORE", store
+            ), patch.object(main, "CLOUD_USAGE_LEDGER", ledger), patch.object(
+                main, "ensure_cloud_asr_ready"
+            ), patch.object(
+                main,
+                "prepare_audio_for_cloud",
+                return_value=(
+                    audio,
+                    {
+                        "duration": 5,
+                        "size": 5,
+                        "format_name": "mp3",
+                        "codec_name": "mp3",
+                        "channels": 1,
+                        "sample_rate": 16000,
+                    },
+                ),
+            ), patch.object(
+                main, "cloud_provider_for_mode", return_value=provider
+            ), self.assertRaises(main.ExtractionFailure) as raised:
+                main.transcribe_media_with_cloud(
+                    audio,
+                    root,
+                    language="zh",
+                    mode="high_accuracy",
+                )
+
+            self.assertEqual(raised.exception.reason, "asr_empty")
+            self.assertEqual(ledger.stats()["daily_seconds"], 5)
+            self.assertEqual(ledger.failure_stats()["by_code"], {"asr_empty": 1})
+
     def test_cloud_pipeline_rejects_before_provider_when_quota_is_insufficient(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -379,6 +450,10 @@ class CloudAsrPipelineTests(unittest.TestCase):
             self.assertEqual(raised.exception.reason, "asr_temp_upload_failed")
             self.assertEqual(failure_ledger.stats()["reserved_seconds"], 0)
             self.assertEqual(failure_ledger.stats()["daily_seconds"], 0)
+            self.assertEqual(
+                failure_ledger.failure_stats()["by_code"],
+                {"asr_temp_upload_failed": 1},
+            )
 
     def test_upload_requests_use_the_same_quality_and_language_defaults(self) -> None:
         request = main.UploadJobRequest(
@@ -2082,6 +2157,63 @@ class AsrWorkerTests(unittest.TestCase):
                 main.ASR_WORKER_WARM,
             ) = original
 
+    def test_prewarm_stop_after_readiness_prevents_worker_restart(self) -> None:
+        class FakeSemaphore:
+            def __init__(self) -> None:
+                self.released = False
+
+            def acquire(self, **_kwargs) -> bool:
+                return True
+
+            def release(self) -> None:
+                self.released = True
+
+        stop_event = Event()
+        semaphore = FakeSemaphore()
+
+        def stop_during_readiness() -> None:
+            stop_event.set()
+
+        with patch.object(main, "ASR_SEMAPHORE", semaphore), patch.object(
+            main, "ensure_asr_ready", side_effect=stop_during_readiness
+        ), patch.object(main, "ensure_persistent_asr_worker_locked") as start_worker, patch.object(
+            main, "schedule_asr_worker_idle_exit_locked"
+        ) as schedule_idle:
+            main.prewarm_asr_worker(stop_event)
+
+        start_worker.assert_not_called()
+        schedule_idle.assert_not_called()
+        self.assertTrue(semaphore.released)
+
+    def test_prewarm_tolerates_queue_closed_during_shutdown(self) -> None:
+        class FakeSemaphore:
+            def acquire(self, **_kwargs) -> bool:
+                return True
+
+            def release(self) -> None:
+                pass
+
+        class FakeEvent:
+            def wait(self, _timeout: float) -> bool:
+                return True
+
+        class ClosedQueue:
+            def get(self, timeout: float):
+                raise ValueError("Queue is closed")
+
+        original = (main.ASR_WORKER_READY_EVENT, main.ASR_WORKER_RESULT_QUEUE)
+        main.ASR_WORKER_READY_EVENT = FakeEvent()
+        main.ASR_WORKER_RESULT_QUEUE = ClosedQueue()
+        try:
+            with patch.object(main, "ASR_SEMAPHORE", FakeSemaphore()), patch.object(
+                main, "ensure_asr_ready"
+            ), patch.object(main, "ensure_persistent_asr_worker_locked"), patch.object(
+                main, "schedule_asr_worker_idle_exit_locked"
+            ):
+                main.prewarm_asr_worker(Event())
+        finally:
+            main.ASR_WORKER_READY_EVENT, main.ASR_WORKER_RESULT_QUEUE = original
+
     def test_long_audio_gets_dynamic_timeout_budget(self) -> None:
         class FakeWave:
             def __enter__(self):
@@ -2176,6 +2308,8 @@ class AsrWorkerTests(unittest.TestCase):
 
         result_queue = FakeResultQueue()
         with patch.object(main, "ASR_MODEL_IDLE_SECONDS", 1), patch.object(
+            main, "ASR_WORKER_EXIT_ON_IDLE", False
+        ), patch.object(
             main, "whisper_model", return_value=object()
         ), patch.object(main, "whisper_model_loaded", return_value=True), patch.object(
             main, "clear_whisper_model"
@@ -2184,6 +2318,174 @@ class AsrWorkerTests(unittest.TestCase):
 
         self.assertEqual([item["kind"] for item in result_queue.items], ["prewarm", "idle_unload"])
         self.assertGreaterEqual(clear_model.call_count, 2)
+
+    def test_parent_idle_timer_stops_entire_worker_after_deadline(self) -> None:
+        class FakeProcess:
+            def is_alive(self) -> bool:
+                return True
+
+        class FakeTimer:
+            instances = []
+
+            def __init__(self, interval, callback) -> None:
+                self.interval = interval
+                self.callback = callback
+                self.daemon = False
+                self.started = False
+                self.cancelled = False
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.started = True
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        original = (
+            main.ASR_WORKER_PROCESS,
+            main.ASR_WORKER_IDLE_TIMER,
+            main.ASR_WORKER_IDLE_DEADLINE,
+        )
+        main.ASR_WORKER_PROCESS = FakeProcess()
+        main.ASR_WORKER_IDLE_TIMER = None
+        main.ASR_WORKER_IDLE_DEADLINE = None
+        try:
+            with patch.object(main, "ASR_WORKER_EXIT_ON_IDLE", True), patch.object(
+                main, "ASR_MODEL_IDLE_SECONDS", 1
+            ), patch.object(main, "Timer", FakeTimer), patch.object(
+                main.time, "monotonic", side_effect=[100.0, 101.1]
+            ), patch.object(main, "stop_asr_worker_locked") as stop_worker:
+                with main.ASR_WORKER_LOCK:
+                    main.schedule_asr_worker_idle_exit_locked()
+                timer = FakeTimer.instances[-1]
+                self.assertTrue(timer.started)
+                self.assertTrue(timer.daemon)
+                self.assertEqual(timer.interval, 1.0)
+                timer.callback()
+
+            stop_worker.assert_called_once_with()
+        finally:
+            if main.ASR_WORKER_IDLE_TIMER is not None:
+                main.ASR_WORKER_IDLE_TIMER.cancel()
+            (
+                main.ASR_WORKER_PROCESS,
+                main.ASR_WORKER_IDLE_TIMER,
+                main.ASR_WORKER_IDLE_DEADLINE,
+            ) = original
+
+    def test_active_task_replaces_existing_idle_timer(self) -> None:
+        class FakeProcess:
+            def is_alive(self) -> bool:
+                return True
+
+        class ExistingTimer:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        class FakeTimer:
+            def __init__(self, interval, callback) -> None:
+                self.interval = interval
+                self.callback = callback
+                self.daemon = False
+                self.started = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def cancel(self) -> None:
+                pass
+
+        original = (
+            main.ASR_WORKER_PROCESS,
+            main.ASR_WORKER_IDLE_TIMER,
+            main.ASR_WORKER_IDLE_DEADLINE,
+        )
+        existing = ExistingTimer()
+        main.ASR_WORKER_PROCESS = FakeProcess()
+        main.ASR_WORKER_IDLE_TIMER = existing
+        main.ASR_WORKER_IDLE_DEADLINE = 50.0
+        try:
+            with patch.object(main, "ASR_WORKER_EXIT_ON_IDLE", True), patch.object(
+                main, "ASR_MODEL_IDLE_SECONDS", 900
+            ), patch.object(main, "Timer", FakeTimer), patch.object(
+                main.time, "monotonic", return_value=100.0
+            ):
+                with main.asr_worker_task_lock():
+                    self.assertTrue(existing.cancelled)
+                    self.assertIsNone(main.ASR_WORKER_IDLE_TIMER)
+
+            self.assertIsInstance(main.ASR_WORKER_IDLE_TIMER, FakeTimer)
+            self.assertTrue(main.ASR_WORKER_IDLE_TIMER.started)
+        finally:
+            if main.ASR_WORKER_IDLE_TIMER is not None:
+                main.ASR_WORKER_IDLE_TIMER.cancel()
+            (
+                main.ASR_WORKER_PROCESS,
+                main.ASR_WORKER_IDLE_TIMER,
+                main.ASR_WORKER_IDLE_DEADLINE,
+            ) = original
+
+    def test_cancelled_idle_timer_callback_cannot_replace_new_schedule(self) -> None:
+        class FakeProcess:
+            def is_alive(self) -> bool:
+                return True
+
+        class FakeTimer:
+            instances = []
+
+            def __init__(self, interval, callback) -> None:
+                self.interval = interval
+                self.callback = callback
+                self.daemon = False
+                self.cancelled = False
+                self.instances.append(self)
+
+            def start(self) -> None:
+                pass
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        original = (
+            main.ASR_WORKER_PROCESS,
+            main.ASR_WORKER_IDLE_TIMER,
+            main.ASR_WORKER_IDLE_DEADLINE,
+            main.ASR_WORKER_IDLE_GENERATION,
+        )
+        main.ASR_WORKER_PROCESS = FakeProcess()
+        main.ASR_WORKER_IDLE_TIMER = None
+        main.ASR_WORKER_IDLE_DEADLINE = None
+        try:
+            with patch.object(main, "ASR_WORKER_EXIT_ON_IDLE", True), patch.object(
+                main, "ASR_MODEL_IDLE_SECONDS", 900
+            ), patch.object(main, "Timer", FakeTimer), patch.object(
+                main.time, "monotonic", side_effect=[100.0, 101.0]
+            ), patch.object(main, "stop_asr_worker_locked") as stop_worker:
+                with main.ASR_WORKER_LOCK:
+                    main.schedule_asr_worker_idle_exit_locked()
+                    stale_timer = FakeTimer.instances[-1]
+                    main.schedule_asr_worker_idle_exit_locked()
+                    current_timer = FakeTimer.instances[-1]
+                    current_deadline = main.ASR_WORKER_IDLE_DEADLINE
+
+                self.assertTrue(stale_timer.cancelled)
+                stale_timer.callback()
+
+            stop_worker.assert_not_called()
+            self.assertIs(main.ASR_WORKER_IDLE_TIMER, current_timer)
+            self.assertEqual(main.ASR_WORKER_IDLE_DEADLINE, current_deadline)
+        finally:
+            if main.ASR_WORKER_IDLE_TIMER is not None:
+                main.ASR_WORKER_IDLE_TIMER.cancel()
+            (
+                main.ASR_WORKER_PROCESS,
+                main.ASR_WORKER_IDLE_TIMER,
+                main.ASR_WORKER_IDLE_DEADLINE,
+                main.ASR_WORKER_IDLE_GENERATION,
+            ) = original
 
     def test_idle_unload_status_clears_parent_model_state(self) -> None:
         original = (main.ASR_WORKER_WARM, main.ASR_WORKER_MODEL_KEY)

@@ -211,6 +211,10 @@ Uploads, media downloads, ASR normalization, and OCR preparation check both the 
 
 Run exactly one Uvicorn application worker. The heavy-work semaphore and signed-audio registry are process-local; multiple Uvicorn workers would bypass the global concurrency limit and invalidate task-local signed audio state.
 
+The administrator UI regression checks use Node.js's built-in test runner:
+`node --test tests/admin_ui.test.cjs`. Node.js is only needed for development
+checks, not for the production application.
+
 Public `GET /api/health` returns only `{"status":"ok"}`. Signed-in clients use `GET /api/client-config` for a deliberately small capability document containing user-facing availability and upload constraints; neither endpoint returns queue totals, process or disk metrics, model names, provider usage, paths, API keys, workspace IDs, Cookie values, users, or environment variables. Reading either endpoint never invokes a provider or initializes a local model.
 
 Unauthenticated clients use `GET /api/public-config`, which exposes only guest
@@ -219,7 +223,7 @@ media availability and public limits. Temporary media responses remain
 must not cache or publicly proxy artifact downloads; this keeps owner isolation
 intact and avoids treating a general CDN as a video-delivery service.
 
-The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for all quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model. The default `balanced` profile uses beam 3 with VAD and cross-window context; `accurate` keeps beam 5 for explicit API callers and OCR fallback. Automatic second-pass correction is limited by `ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS` so a difficult long video does not silently double its processing time. Model loading checks the local cache before attempting a network request; once the production cache is seeded, set `ASR_MODEL_DOWNLOAD_ENABLED=false` to fail quickly instead of waiting on an unavailable model host. `ASR_MODEL_IDLE_SECONDS=900` releases the model after 15 idle minutes while retaining the worker process; set it to `0` only when lower cold-start latency matters more than idle memory.
+The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for all quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model. The default `balanced` profile uses beam 3 with VAD and cross-window context; `accurate` keeps beam 5 for explicit API callers and OCR fallback. Automatic second-pass correction is limited by `ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS` so a difficult long video does not silently double its processing time. Model loading checks the local cache before attempting a network request; once the production cache is seeded, set `ASR_MODEL_DOWNLOAD_ENABLED=false` to fail quickly instead of waiting on an unavailable model host. With `ASR_WORKER_EXIT_ON_IDLE=true`, `ASR_MODEL_IDLE_SECONDS=900` exits the entire ASR child after 15 idle minutes and the next task rebuilds it automatically. Set the idle value to `0` to keep it resident, or set the exit flag to `false` to restore the older model-unload-only behavior.
 
 ## Douyin runtime
 
@@ -261,11 +265,17 @@ AUTH_SESSION_TTL_DAYS=30
 AUTH_MAX_USERS=50
 AUTH_MAX_SESSIONS_PER_USER=8
 AUTH_COOKIE_SECURE=true
+ADMIN_USERNAMES=site_owner
 INVITE_CODE_HASH=SHA256_HEX_ONLY
 ```
 
 For an internet-facing deployment, add edge rate limits to login and registration,
 set `AUTH_COOKIE_SECURE=true`, and terminate TLS at a maintained reverse proxy.
+`ADMIN_USERNAMES` is an explicit comma-separated username allowlist. Only those
+signed-in accounts can open `/admin` or read `/api/admin/diagnostics`; leaving it
+empty disables administrator access. The diagnostic response is aggregate-only,
+`no-store`, and omits secrets, source URLs, media content, transcript text, and
+local paths.
 Keep hostnames, certificates, cloud configuration, and operational reports in a
 separate private deployment repository.
 

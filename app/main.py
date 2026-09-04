@@ -24,7 +24,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
-from threading import BoundedSemaphore, Lock, Thread, local
+from threading import BoundedSemaphore, Event, Lock, Thread, Timer, local
 import time
 import urllib.parse
 import wave
@@ -70,11 +70,13 @@ from app.auth import (
     invite_configured,
     max_sessions_per_user,
     register_user,
+    require_admin_user,
     require_auth_user,
     resolve_session,
     authenticate_user,
     session_ttl_seconds,
     set_session_cookie,
+    user_count,
 )
 from app.guest import (
     GUEST_COOKIE_NAME,
@@ -128,7 +130,7 @@ AsrQuality = Literal["fast", "balanced", "accurate"]
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.5")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.6")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -211,6 +213,12 @@ ACCURATE_ASR_BEAM_SIZE = min(10, max(1, int(os.getenv("ASR_ACCURATE_BEAM_SIZE", 
 ASR_DOWNLOAD_TIMEOUT_SECONDS = max(30, int(os.getenv("ASR_DOWNLOAD_TIMEOUT_SECONDS", "300")))
 ASR_QUEUE_WAIT_SECONDS = max(30, int(os.getenv("ASR_QUEUE_WAIT_SECONDS", "1800")))
 ASR_MODEL_IDLE_SECONDS = max(0, int(os.getenv("ASR_MODEL_IDLE_SECONDS", "900")))
+ASR_WORKER_EXIT_ON_IDLE = os.getenv("ASR_WORKER_EXIT_ON_IDLE", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 ASR_MAX_AUDIO_SECONDS = max(30, int(os.getenv("ASR_MAX_AUDIO_SECONDS", "3600")))
 ASR_PROMPT_MAX_CHARS = min(1000, max(50, int(os.getenv("ASR_PROMPT_MAX_CHARS", "300"))))
 try:
@@ -415,6 +423,10 @@ ASR_WORKER_WARM = False
 ASR_WORKER_START_COUNT = 0
 ASR_WORKER_MODEL_KEY: tuple[str, str, str, int] | None = None
 ASR_PREWARM_THREAD: Thread | None = None
+ASR_PREWARM_STOP_EVENT: Event | None = None
+ASR_WORKER_IDLE_TIMER: Timer | None = None
+ASR_WORKER_IDLE_DEADLINE: float | None = None
+ASR_WORKER_IDLE_GENERATION = 0
 _ASR_MODEL_KEY: tuple[str, str, str, int] | None = None
 _ASR_MODEL_INSTANCE: Any = None
 _ASR_MODEL_LOCK = Lock()
@@ -1040,6 +1052,24 @@ def cloud_usage_stats() -> dict[str, Any]:
             "total_limit_seconds": CLOUD_ASR_TOTAL_HARD_LIMIT_SECONDS,
             "by_model_seconds": {},
         }
+
+
+def cloud_failure_stats() -> dict[str, Any]:
+    empty = {
+        "window_days": 30,
+        "total": 0,
+        "by_provider": {},
+        "by_model": {},
+        "by_code": {},
+        "by_outcome": {},
+    }
+    if CLOUD_USAGE_LEDGER is None:
+        return empty
+    try:
+        return CLOUD_USAGE_LEDGER.failure_stats(window_days=30)
+    except Exception as exc:
+        LOGGER.error("cloud ASR failure status failed error_type=%s", type(exc).__name__)
+        return {**empty, "available": False}
 
 
 def sanitize_asr_context(value: str | None) -> str | None:
@@ -4764,6 +4794,25 @@ def runtime_memory_status() -> dict[str, float | None]:
     }
 
 
+def child_process_memory_status(process: Any) -> dict[str, float | None]:
+    try:
+        pid = int(getattr(process, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    values: dict[str, int] = {}
+    if sys.platform.startswith("linux") and pid > 0:
+        try:
+            values = parse_linux_memory_kib(
+                Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+            )
+        except OSError:
+            pass
+    return {
+        "rss_mb": round(values["VmRSS"] / 1024, 1) if "VmRSS" in values else None,
+        "swap_mb": round(values["VmSwap"] / 1024, 1) if "VmSwap" in values else None,
+    }
+
+
 def segment_metric(segment: Any, name: str) -> float | None:
     try:
         value = float(getattr(segment, name))
@@ -5050,7 +5099,7 @@ def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: An
             try:
                 task = (
                     request_queue.get(timeout=ASR_MODEL_IDLE_SECONDS)
-                    if ASR_MODEL_IDLE_SECONDS > 0
+                    if ASR_MODEL_IDLE_SECONDS > 0 and not ASR_WORKER_EXIT_ON_IDLE
                     else request_queue.get()
                 )
             except Empty:
@@ -5084,8 +5133,69 @@ def asr_worker_alive() -> bool:
         return False
 
 
+def cancel_asr_worker_idle_timer_locked() -> None:
+    global ASR_WORKER_IDLE_TIMER, ASR_WORKER_IDLE_DEADLINE, ASR_WORKER_IDLE_GENERATION
+    timer = ASR_WORKER_IDLE_TIMER
+    ASR_WORKER_IDLE_TIMER = None
+    ASR_WORKER_IDLE_DEADLINE = None
+    ASR_WORKER_IDLE_GENERATION += 1
+    if timer is not None:
+        timer.cancel()
+
+
+def reap_idle_asr_worker(generation: int | None = None) -> None:
+    global ASR_WORKER_IDLE_TIMER, ASR_WORKER_IDLE_DEADLINE
+    with ASR_WORKER_LOCK:
+        if generation is not None and generation != ASR_WORKER_IDLE_GENERATION:
+            return
+        ASR_WORKER_IDLE_TIMER = None
+        deadline = ASR_WORKER_IDLE_DEADLINE
+        ASR_WORKER_IDLE_DEADLINE = None
+        if (
+            not ASR_WORKER_EXIT_ON_IDLE
+            or ASR_MODEL_IDLE_SECONDS <= 0
+            or deadline is None
+        ):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            schedule_asr_worker_idle_exit_locked(delay_seconds=remaining)
+            return
+        if asr_worker_alive():
+            stop_asr_worker_locked()
+
+
+def schedule_asr_worker_idle_exit_locked(*, delay_seconds: float | None = None) -> None:
+    global ASR_WORKER_IDLE_TIMER, ASR_WORKER_IDLE_DEADLINE
+    cancel_asr_worker_idle_timer_locked()
+    if (
+        not ASR_WORKER_EXIT_ON_IDLE
+        or ASR_MODEL_IDLE_SECONDS <= 0
+        or not asr_worker_alive()
+    ):
+        return
+    delay = max(0.01, float(delay_seconds or ASR_MODEL_IDLE_SECONDS))
+    ASR_WORKER_IDLE_DEADLINE = time.monotonic() + delay
+    generation = ASR_WORKER_IDLE_GENERATION
+    timer = Timer(delay, lambda: reap_idle_asr_worker(generation))
+    timer.daemon = True
+    ASR_WORKER_IDLE_TIMER = timer
+    timer.start()
+
+
+@contextmanager
+def asr_worker_task_lock():
+    with ASR_WORKER_LOCK:
+        cancel_asr_worker_idle_timer_locked()
+        try:
+            yield
+        finally:
+            schedule_asr_worker_idle_exit_locked()
+
+
 def stop_asr_worker_locked(graceful: bool = True) -> None:
     global ASR_WORKER_PROCESS, ASR_WORKER_REQUEST_QUEUE, ASR_WORKER_RESULT_QUEUE, ASR_WORKER_READY_EVENT, ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
+    cancel_asr_worker_idle_timer_locked()
     process = ASR_WORKER_PROCESS
     request_queue = ASR_WORKER_REQUEST_QUEUE
     if ASR_WORKER_READY_EVENT is not None:
@@ -5149,46 +5259,87 @@ def ensure_persistent_asr_worker_locked() -> None:
         ) from exc
 
 
-def prewarm_asr_worker() -> None:
+def prewarm_asr_worker(stop_event: Event | None = None) -> None:
     global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
-    acquired = ASR_SEMAPHORE.acquire(timeout=ASR_QUEUE_WAIT_SECONDS)
+    own_stop_event = stop_event or Event()
+    acquire_deadline = time.monotonic() + ASR_QUEUE_WAIT_SECONDS
+    acquired = False
+    while not own_stop_event.is_set():
+        remaining = acquire_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        acquired = ASR_SEMAPHORE.acquire(timeout=min(0.5, remaining))
+        if acquired:
+            break
     if not acquired:
         return
     try:
+        if own_stop_event.is_set():
+            return
         try:
             ensure_asr_ready()
         except ExtractionFailure as exc:
             LOGGER.warning("ASR prewarm skipped: %s", public_reason(exc.reason))
             return
         with ASR_WORKER_LOCK:
+            if own_stop_event.is_set():
+                return
             ensure_persistent_asr_worker_locked()
             ready_event = ASR_WORKER_READY_EVENT
             result_queue = ASR_WORKER_RESULT_QUEUE
         ready = False
         if ready_event is not None:
             deadline = time.monotonic() + ASR_DOWNLOAD_TIMEOUT_SECONDS
-            while time.monotonic() < deadline:
+            while not own_stop_event.is_set() and time.monotonic() < deadline:
                 if ready_event.wait(min(1.0, max(0.1, deadline - time.monotonic()))):
-                    ready = True
+                    ready = not own_stop_event.is_set()
                     break
                 if not asr_worker_alive():
                     break
-        if ready and result_queue is not None:
+        if ready and not own_stop_event.is_set() and result_queue is not None:
             try:
                 status = result_queue.get(timeout=1.0)
-            except Empty:
+            except (Empty, OSError, ValueError):
                 status = None
-            consume_asr_worker_status(status)
+            if not own_stop_event.is_set():
+                consume_asr_worker_status(status)
+        with ASR_WORKER_LOCK:
+            if not own_stop_event.is_set():
+                schedule_asr_worker_idle_exit_locked()
     finally:
         ASR_SEMAPHORE.release()
 
 
 def start_asr_prewarm() -> None:
-    global ASR_PREWARM_THREAD
+    global ASR_PREWARM_THREAD, ASR_PREWARM_STOP_EVENT
     if ASR_PREWARM_THREAD is not None and ASR_PREWARM_THREAD.is_alive():
         return
-    ASR_PREWARM_THREAD = Thread(target=prewarm_asr_worker, name="asr-prewarm", daemon=True)
+    ASR_PREWARM_STOP_EVENT = Event()
+    ASR_PREWARM_THREAD = Thread(
+        target=prewarm_asr_worker,
+        args=(ASR_PREWARM_STOP_EVENT,),
+        name="asr-prewarm",
+        daemon=True,
+    )
     ASR_PREWARM_THREAD.start()
+
+
+def stop_asr_prewarm() -> Thread | None:
+    global ASR_PREWARM_THREAD, ASR_PREWARM_STOP_EVENT
+    thread = ASR_PREWARM_THREAD
+    stop_event = ASR_PREWARM_STOP_EVENT
+    if stop_event is not None:
+        stop_event.set()
+    return thread
+
+
+def finish_asr_prewarm_shutdown(thread: Thread | None) -> None:
+    global ASR_PREWARM_THREAD, ASR_PREWARM_STOP_EVENT
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+    if ASR_PREWARM_THREAD is thread and (thread is None or not thread.is_alive()):
+        ASR_PREWARM_THREAD = None
+        ASR_PREWARM_STOP_EVENT = None
 
 
 def consume_asr_worker_status(status: Any) -> bool:
@@ -5370,7 +5521,7 @@ def transcribe_audio(
             hotwords,
         )
 
-    with ASR_WORKER_LOCK:
+    with asr_worker_task_lock():
         worker_reused = asr_worker_alive()
         ensure_persistent_asr_worker_locked()
         process = ASR_WORKER_PROCESS
@@ -5631,6 +5782,36 @@ def cloud_provider_failure(exc: AsrProviderError) -> ExtractionFailure:
     )
 
 
+def release_cloud_reservation_with_failure(
+    reservation_id: str,
+    *,
+    model: str,
+    error_code: str,
+    outcome: str,
+) -> None:
+    assert CLOUD_USAGE_LEDGER is not None
+    try:
+        CLOUD_USAGE_LEDGER.record_failure(
+            provider="aliyun",
+            model=model,
+            error_code=error_code,
+            outcome=outcome,
+            reservation_id=reservation_id,
+        )
+    except Exception as exc:
+        LOGGER.error(
+            "cloud ASR failure telemetry write failed error_type=%s",
+            type(exc).__name__,
+        )
+        try:
+            CLOUD_USAGE_LEDGER.release(reservation_id)
+        except Exception as release_exc:
+            LOGGER.error(
+                "cloud ASR reservation release failed error_type=%s",
+                type(release_exc).__name__,
+            )
+
+
 def transcribe_media_with_cloud(
     media_path: Path,
     tmp_dir: Path,
@@ -5707,10 +5888,20 @@ def transcribe_media_with_cloud(
                         actual_seconds=estimated_seconds,
                         estimated_cost_cny=estimated_seconds * cloud_model_price(model),
                         outcome="provider_failed",
-                        metadata={"provider": "aliyun", "model": model, "fallback": index > 0},
+                        metadata={
+                            "provider": "aliyun",
+                            "model": model,
+                            "fallback": index > 0,
+                            "error_code": exc.code,
+                        },
                     )
                 else:
-                    CLOUD_USAGE_LEDGER.release(reservation.reservation_id)
+                    release_cloud_reservation_with_failure(
+                        reservation.reservation_id,
+                        model=model,
+                        error_code=exc.code,
+                        outcome="provider_failed",
+                    )
                 failures.append(exc.code)
                 can_fallback = (
                     index + 1 < len(modes)
@@ -5733,10 +5924,20 @@ def transcribe_media_with_cloud(
                         actual_seconds=estimated_seconds,
                         estimated_cost_cny=estimated_seconds * cloud_model_price(model),
                         outcome="provider_internal_error",
-                        metadata={"provider": "aliyun", "model": model, "fallback": index > 0},
+                        metadata={
+                            "provider": "aliyun",
+                            "model": model,
+                            "fallback": index > 0,
+                            "error_code": "internal_error",
+                        },
                     )
                 else:
-                    CLOUD_USAGE_LEDGER.release(reservation.reservation_id)
+                    release_cloud_reservation_with_failure(
+                        reservation.reservation_id,
+                        model=model,
+                        error_code="internal_error",
+                        outcome="provider_internal_error",
+                    )
                 raise
             actual_seconds = float(
                 transcript.provider_seconds
@@ -5753,6 +5954,18 @@ def transcribe_media_with_cloud(
             )
             entries, transcript_info = transcript_entries(transcript)
             if not entries:
+                try:
+                    CLOUD_USAGE_LEDGER.record_failure(
+                        provider=transcript.provider,
+                        model=model,
+                        error_code="asr_empty",
+                        outcome="provider_empty",
+                    )
+                except Exception as exc:
+                    LOGGER.error(
+                        "cloud ASR empty-result telemetry write failed error_type=%s",
+                        type(exc).__name__,
+                    )
                 raise ExtractionFailure(
                     404,
                     "Cloud ASR completed but returned no text.",
@@ -7153,7 +7366,9 @@ def startup() -> None:
 @app.on_event("shutdown")
 def shutdown() -> None:
     JOB_MANAGER.stop()
+    prewarm_thread = stop_asr_prewarm()
     stop_asr_worker()
+    finish_asr_prewarm_shutdown(prewarm_thread)
     close_cloud_providers()
     if CLOUD_SIGNED_AUDIO_STORE is not None:
         CLOUD_SIGNED_AUDIO_STORE.cleanup()
@@ -7168,11 +7383,112 @@ def cloud_asr_ready() -> bool:
     )
 
 
+def admin_diagnostics_payload() -> dict[str, Any]:
+    try:
+        disk = disk_space_status(ASR_TMP_DIR)
+        disk_payload: dict[str, Any] = {
+            "available": disk.available,
+            "total_bytes": disk.total_bytes,
+            "free_bytes": disk.free_bytes,
+            "free_ratio": round(disk.free_ratio, 4),
+            "minimum_free_bytes": disk.minimum_free_bytes,
+        }
+    except OSError:
+        disk_payload = {"available": False, "status": "unavailable"}
+
+    worker_state_locked = ASR_WORKER_LOCK.acquire(blocking=False)
+    try:
+        idle_deadline = ASR_WORKER_IDLE_DEADLINE if worker_state_locked else None
+        idle_remaining = (
+            max(0, math.ceil(idle_deadline - time.monotonic()))
+            if idle_deadline is not None
+            else None
+        )
+        worker_process = ASR_WORKER_PROCESS
+        asr_worker = {
+            "snapshot_consistent": worker_state_locked,
+            "persistent_enabled": env_bool("ASR_PERSISTENT_WORKER", True),
+            "exit_on_idle": ASR_WORKER_EXIT_ON_IDLE,
+            "idle_seconds": ASR_MODEL_IDLE_SECONDS,
+            "idle_exit_in_seconds": idle_remaining,
+            "alive": asr_worker_alive(),
+            "warm": ASR_WORKER_WARM,
+            "start_count": ASR_WORKER_START_COUNT,
+            **child_process_memory_status(worker_process),
+        }
+    finally:
+        if worker_state_locked:
+            ASR_WORKER_LOCK.release()
+
+    with UPLOAD_RESERVATION_LOCK:
+        upload_reserved_bytes = sum(UPLOAD_RESERVATIONS.values())
+        upload_reservations = len(UPLOAD_RESERVATIONS)
+    with MEDIA_RESERVATION_LOCK:
+        media_reserved_bytes = sum(MEDIA_RESERVATIONS.values())
+        media_reservations = len(MEDIA_RESERVATIONS)
+
+    douyin = douyin_adapter_status()
+    return {
+        "status": "ok",
+        "generated_at": int(time.time()),
+        "service": {
+            "version": SERVICE_VERSION,
+            "active_users": user_count(),
+        },
+        "queue": JOB_MANAGER.stats(),
+        "asr_worker": asr_worker,
+        "memory": runtime_memory_status(),
+        "disk": disk_payload,
+        "temporary_storage": {
+            "upload_reservations": upload_reservations,
+            "upload_reserved_bytes": upload_reserved_bytes,
+            "media_reservations": media_reservations,
+            "media_reserved_bytes": media_reserved_bytes,
+        },
+        "cloud_asr": {
+            "enabled": cloud_asr_enabled(),
+            "ready": cloud_asr_ready(),
+            "paid_allowed": env_bool("ASR_ALLOW_PAID", False),
+            "usage": cloud_usage_stats(),
+            "failures": cloud_failure_stats(),
+        },
+        "platforms": {
+            "bilibili": {"enabled": True},
+            "douyin": {
+                key: bool(douyin.get(key))
+                for key in (
+                    "enabled",
+                    "api_adapter_ready",
+                    "playwright_ready",
+                    "chromium_ready",
+                    "cookie_cached",
+                )
+            },
+        },
+        "tools": {
+            "ffmpeg": bool(shutil.which("ffmpeg")),
+            "ffprobe": bool(shutil.which("ffprobe")),
+        },
+    }
+
+
 @app.get("/api/health")
 def health() -> JSONResponse:
     return JSONResponse(
         {"status": "ok"},
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/admin/diagnostics")
+def api_admin_diagnostics(request: Request) -> JSONResponse:
+    require_admin_user(request)
+    return JSONResponse(
+        admin_diagnostics_payload(),
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
     )
 
 
@@ -7478,6 +7794,18 @@ def login_page() -> FileResponse:
 @app.get("/register", response_class=FileResponse)
 def register_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "auth.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/admin", response_class=FileResponse)
+def admin_page(request: Request) -> FileResponse:
+    require_admin_user(request)
+    return FileResponse(
+        STATIC_DIR / "admin.html",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+    )
 
 
 @app.get("/api/login/qrcode")

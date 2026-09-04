@@ -65,6 +65,14 @@ def max_sessions_per_user() -> int:
     return _env_int("AUTH_MAX_SESSIONS_PER_USER", 8, 1)
 
 
+def admin_usernames() -> frozenset[str]:
+    return frozenset(
+        username.strip().casefold()
+        for username in os.getenv("ADMIN_USERNAMES", "").split(",")
+        if username.strip()
+    )
+
+
 def invite_configured() -> bool:
     value = os.getenv("INVITE_CODE_HASH", "").strip().lower()
     return bool(re.fullmatch(r"[0-9a-f]{64}", value))
@@ -338,6 +346,20 @@ def require_auth_user(request: Request) -> AuthUser:
         raise HTTPException(
             status_code=401,
             detail={"reason": "authentication_required", "message": "请先登录。"},
+        )
+    return user
+
+
+def is_admin_user(user: AuthUser | None) -> bool:
+    return user is not None and user.username.casefold() in admin_usernames()
+
+
+def require_admin_user(request: Request) -> AuthUser:
+    user = require_auth_user(request)
+    if not is_admin_user(user):
+        raise HTTPException(
+            status_code=403,
+            detail={"reason": "admin_required", "message": "需要管理员权限。"},
         )
     return user
 

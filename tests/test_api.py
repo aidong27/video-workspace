@@ -286,6 +286,100 @@ class ApiIntegrationTests(unittest.TestCase):
         unauthenticated = self.client.get("/api/client-config")
         self.assertEqual(unauthenticated.status_code, 401)
 
+    def test_admin_diagnostics_requires_allowlisted_account_and_stays_redacted(self) -> None:
+        denied = self.client.get("/api/admin/diagnostics")
+        denied_page = self.client.get("/admin")
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["detail"]["reason"], "admin_required")
+        self.assertEqual(denied_page.status_code, 403)
+
+        disk = main.DiskSpaceStatus(
+            total_bytes=10_000,
+            free_bytes=7_500,
+            free_ratio=0.75,
+            minimum_free_bytes=1_000,
+            required_bytes=0,
+            available=True,
+        )
+        adapter = {
+            "enabled": True,
+            "api_adapter_ready": True,
+            "playwright_ready": True,
+            "chromium_ready": True,
+            "cookie_cached": False,
+            "cookie_path": "/private/cookie.json",
+        }
+        usage = {
+            "daily_seconds": 12,
+            "monthly_seconds": 34,
+            "total_seconds": 56,
+            "reserved_seconds": 0,
+            "daily_limit_seconds": 100,
+            "monthly_limit_seconds": 1000,
+            "user_daily_limit_seconds": 50,
+            "total_limit_seconds": 2000,
+            "by_model_seconds": {"safe-model": 56},
+        }
+        failures = {
+            "window_days": 30,
+            "total": 1,
+            "by_provider": {"aliyun": 1},
+            "by_model": {"safe-model": 1},
+            "by_code": {"asr_rate_limited": 1},
+            "by_outcome": {"provider_failed": 1},
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_USERNAMES": "INTEGRATION",
+                "DASHSCOPE_API_KEY": "private-api-key-value",
+                "DASHSCOPE_WORKSPACE_ID": "private-workspace-value",
+            },
+        ), patch.object(main, "disk_space_status", return_value=disk), patch.object(
+            main,
+            "runtime_memory_status",
+            return_value={
+                "process_rss_mb": 120.0,
+                "process_swap_mb": 0.0,
+                "system_available_mb": 2048.0,
+                "swap_total_mb": 2048.0,
+                "swap_used_mb": 10.0,
+            },
+        ), patch.object(main, "cloud_usage_stats", return_value=usage), patch.object(
+            main, "cloud_failure_stats", return_value=failures
+        ), patch.object(main, "cloud_asr_ready", return_value=True), patch.object(
+            main, "douyin_adapter_status", return_value=adapter
+        ):
+            allowed = self.client.get("/api/admin/diagnostics")
+            allowed_page = self.client.get("/admin")
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.headers["cache-control"], "private, no-store")
+        self.assertEqual(allowed.headers["x-robots-tag"], "noindex, nofollow")
+        payload = allowed.json()
+        self.assertEqual(payload["queue"]["worker_count"], main.JOB_MANAGER.worker_count)
+        self.assertEqual(payload["cloud_asr"]["failures"]["total"], 1)
+        self.assertEqual(payload["disk"]["free_bytes"], 7_500)
+        self.assertNotIn("cookie_path", payload["platforms"]["douyin"])
+        encoded = json.dumps(payload)
+        self.assertNotIn("private-api-key-value", encoded)
+        self.assertNotIn("private-workspace-value", encoded)
+        self.assertNotIn("/private/", encoded)
+        self.assertEqual(allowed_page.status_code, 200)
+        self.assertEqual(allowed_page.headers["x-robots-tag"], "noindex, nofollow")
+
+        self.client.cookies.clear()
+        unauthenticated = self.client.get("/api/admin/diagnostics")
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(unauthenticated.json()["detail"]["reason"], "authentication_required")
+
+    def test_admin_diagnostics_does_not_wait_for_active_asr_task_lock(self) -> None:
+        with patch.dict(os.environ, {"ADMIN_USERNAMES": "integration"}), main.ASR_WORKER_LOCK:
+            response = self.client.get("/api/admin/diagnostics")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["asr_worker"]["snapshot_consistent"])
+
     def test_account_can_change_password_and_logout_all_sessions(self) -> None:
         wrong = self.client.post(
             "/api/auth/change-password",
@@ -881,6 +975,18 @@ class ApiIntegrationTests(unittest.TestCase):
 
 
 class FrontendRecoveryTests(unittest.TestCase):
+    def test_admin_frontend_uses_safe_rendering_and_unix_seconds(self) -> None:
+        page = (main.STATIC_DIR / "admin.html").read_text(encoding="utf-8")
+        script = (main.STATIC_DIR / "admin.js").read_text(encoding="utf-8")
+
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertNotIn("innerHTML", script)
+        self.assertNotRegex(page, r"\sstyle=")
+        self.assertNotRegex(page, r"<script(?![^>]+\bsrc=)")
+        self.assertIn("data.generated_at * 1000", script)
+        self.assertIn('const negativeWhenTrue = key === "paid_allowed"', script)
+
     def test_frontend_defaults_to_local_balanced_chinese_with_platform_subtitles(self) -> None:
         page = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")

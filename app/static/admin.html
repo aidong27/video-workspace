@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f4f7f6">
+  <meta name="robots" content="noindex, nofollow">
+  <title>管理诊断 - 字幕工作台</title>
+  <link rel="stylesheet" href="/static/admin.css">
+  <script src="/static/admin.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="返回字幕工作台">
+      <span class="brand-mark" aria-hidden="true">CC</span>
+      <span class="brand-copy">
+        <strong>字幕工作台</strong>
+        <span>管理诊断</span>
+      </span>
+    </a>
+    <div class="topbar-actions">
+      <span class="readonly-badge">只读</span>
+      <a class="quiet-link" href="/">返回工作台</a>
+      <button class="refresh-button" id="refresh-button" type="button">
+        <span class="refresh-icon" aria-hidden="true">↻</span>
+        <span id="refresh-label">刷新</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section class="page-heading" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">System overview</p>
+        <h1 id="page-title">运行诊断</h1>
+        <p class="page-copy">查看服务、任务队列和基础资源的当前只读快照。</p>
+      </div>
+      <div class="freshness" id="freshness" role="status" aria-live="polite">
+        <span class="freshness-dot" aria-hidden="true"></span>
+        <span id="freshness-text">正在获取数据</span>
+        <time id="last-updated">尚未更新</time>
+      </div>
+    </section>
+
+    <section class="error-panel" id="error-panel" role="alert" hidden>
+      <div>
+        <p class="error-kicker">无法显示诊断</p>
+        <h2 id="error-title">数据加载失败</h2>
+        <p id="error-message">请稍后重试。</p>
+      </div>
+      <div class="error-actions">
+        <a class="error-link" id="error-login" href="/login" hidden>重新登录</a>
+        <button class="error-retry" id="error-retry" type="button">重试</button>
+      </div>
+    </section>
+
+    <section class="metric-grid" aria-label="关键运行指标">
+      <article class="metric-card">
+        <div class="metric-heading">
+          <span>服务状态</span>
+          <span class="status-pill neutral" id="service-pill">读取中</span>
+        </div>
+        <strong class="metric-value" id="service-value">—</strong>
+        <span class="metric-detail" id="service-detail">等待服务器响应</span>
+      </article>
+      <article class="metric-card">
+        <div class="metric-heading">
+          <span>任务队列</span>
+          <span class="status-pill neutral" id="queue-pill">读取中</span>
+        </div>
+        <strong class="metric-value" id="queue-value">—</strong>
+        <span class="metric-detail" id="queue-detail">等待服务器响应</span>
+        <progress id="queue-progress" max="1" value="0" aria-label="队列占用"></progress>
+      </article>
+      <article class="metric-card">
+        <div class="metric-heading">
+          <span>系统可用内存</span>
+          <span class="status-pill neutral" id="memory-pill">读取中</span>
+        </div>
+        <strong class="metric-value" id="memory-value">—</strong>
+        <span class="metric-detail" id="memory-detail">等待服务器响应</span>
+      </article>
+      <article class="metric-card">
+        <div class="metric-heading">
+          <span>磁盘可用空间</span>
+          <span class="status-pill neutral" id="disk-pill">读取中</span>
+        </div>
+        <strong class="metric-value" id="disk-value">—</strong>
+        <span class="metric-detail" id="disk-detail">等待服务器响应</span>
+        <progress id="disk-progress" max="1" value="0" aria-label="磁盘可用比例"></progress>
+      </article>
+    </section>
+
+    <section class="diagnostic-grid" aria-label="详细诊断">
+      <article class="diagnostic-card">
+        <header><div><p>Runtime</p><h2>服务</h2></div><span class="section-state" id="service-state">—</span></header>
+        <dl class="detail-list" id="service-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Workload</p><h2>队列</h2></div><span class="section-state" id="queue-state">—</span></header>
+        <dl class="detail-list" id="queue-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Transcription</p><h2>ASR Worker</h2></div><span class="section-state" id="asr-state">—</span></header>
+        <dl class="detail-list" id="asr-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Resources</p><h2>内存</h2></div><span class="section-state" id="memory-state">—</span></header>
+        <dl class="detail-list" id="memory-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Storage</p><h2>磁盘与临时存储</h2></div><span class="section-state" id="disk-state">—</span></header>
+        <dl class="detail-list" id="disk-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Provider</p><h2>云端 ASR</h2></div><span class="section-state" id="cloud-state">—</span></header>
+        <dl class="detail-list" id="cloud-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card diagnostic-card-wide">
+        <header><div><p>Recent window</p><h2>失败摘要</h2></div><span class="section-state" id="failure-state">—</span></header>
+        <dl class="detail-list detail-list-columns" id="failure-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Adapters</p><h2>平台</h2></div><span class="section-state" id="platform-state">—</span></header>
+        <dl class="detail-list" id="platform-details" aria-busy="true"></dl>
+      </article>
+      <article class="diagnostic-card">
+        <header><div><p>Dependencies</p><h2>工具</h2></div><span class="section-state" id="tools-state">—</span></header>
+        <dl class="detail-list" id="tools-details" aria-busy="true"></dl>
+      </article>
+    </section>
+
+    <noscript>
+      <section class="noscript-note">此页面需要 JavaScript 才能读取诊断接口。</section>
+    </noscript>
+  </main>
+
+  <footer class="page-footer">
+    <span>管理诊断仅展示运行状态，不提供配置修改功能。</span>
+    <span>数据不会自动写入浏览器存储。</span>
+  </footer>
+</body>
+</html>

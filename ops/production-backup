@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+APP_DIR=/opt/bili-subtitle-tool
+BACKUP_ROOT=/opt/bili-subtitle-tool/backups
+SERVICE_NAME=bili-subtitle-tool.service
+
+if [[ ${EUID} -ne 0 ]]; then
+    echo "error: run this backup as root" >&2
+    exit 1
+fi
+
+for command_name in python3 sha256sum tar systemctl; do
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+        echo "error: required command is missing: ${command_name}" >&2
+        exit 1
+    fi
+done
+
+if [[ ! -d ${APP_DIR} || -L ${APP_DIR} ]]; then
+    echo "error: expected application directory is unavailable" >&2
+    exit 1
+fi
+
+if [[ ! -f ${APP_DIR}/.env || -L ${APP_DIR}/.env ]]; then
+    echo "error: application environment file is missing or unsafe" >&2
+    exit 1
+fi
+
+resolve_env_path() {
+    local setting_name=$1
+    local default_path=$2
+    python3 - "${APP_DIR}/.env" "${APP_DIR}" "${setting_name}" "${default_path}" <<'PY'
+from pathlib import Path
+import ast
+import re
+import sys
+
+env_path = Path(sys.argv[1])
+app_dir = Path(sys.argv[2])
+setting_name = sys.argv[3]
+value = sys.argv[4]
+name_pattern = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line = line[7:].lstrip()
+    name, separator, raw_value = line.partition("=")
+    name = name.strip()
+    if not separator or name_pattern.fullmatch(name) is None or name != setting_name:
+        continue
+    raw_value = raw_value.strip()
+    if raw_value.startswith(("'", '"')):
+        try:
+            parsed = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError) as exc:
+            raise SystemExit(f"invalid quoted value for {setting_name}") from exc
+        if not isinstance(parsed, str):
+            raise SystemExit(f"invalid path value for {setting_name}")
+        value = parsed
+    else:
+        value = re.sub(r"\s+#.*\Z", "", raw_value).strip()
+
+if not value or "\x00" in value:
+    raise SystemExit(f"invalid path value for {setting_name}")
+candidate = Path(value)
+if not candidate.is_absolute():
+    candidate = app_dir / candidate
+sys.stdout.write(str(candidate.resolve(strict=False)))
+PY
+}
+
+asr_cache_path=$(resolve_env_path ASR_CACHE_DIR "${APP_DIR}/var/cache")
+auth_db_path=$(resolve_env_path AUTH_DB_PATH "${APP_DIR}/var/auth/auth.db")
+usage_db_path=$(resolve_env_path ASR_USAGE_DB_PATH "${asr_cache_path}/cloud-usage.db")
+job_db_path=$(resolve_env_path JOB_STATE_DB_PATH "${asr_cache_path}/jobs.db")
+
+for database_path in "${auth_db_path}" "${usage_db_path}" "${job_db_path}"; do
+    if [[ ! -f ${database_path} || -L ${database_path} ]]; then
+        echo "error: a configured SQLite database is missing or unsafe" >&2
+        exit 1
+    fi
+done
+
+if ! service_state=$(systemctl show --property=ActiveState --value "${SERVICE_NAME}" 2>/dev/null); then
+    echo "error: cannot verify ${SERVICE_NAME} state" >&2
+    exit 1
+fi
+if [[ ${service_state} != inactive ]]; then
+    echo "error: ${SERVICE_NAME} must have ActiveState=inactive after its queue is drained" >&2
+    exit 1
+fi
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+target=${BACKUP_ROOT}/pre-upgrade-${timestamp}
+if [[ -e ${target} ]]; then
+    echo "error: backup target already exists" >&2
+    exit 1
+fi
+
+install -d -m 0700 "${BACKUP_ROOT}"
+python3 - \
+    "${APP_DIR}" \
+    "${BACKUP_ROOT}" \
+    "${auth_db_path}" \
+    "${usage_db_path}" \
+    "${job_db_path}" <<'PY'
+from pathlib import Path
+import os
+import shutil
+import sys
+
+app_dir = Path(sys.argv[1]).resolve(strict=True)
+backup_root = Path(sys.argv[2]).resolve(strict=True)
+database_paths = {Path(value).resolve(strict=True) for value in sys.argv[3:]}
+excluded_top_level = {".git", ".venv", "backups", "venv"}
+estimated_bytes = (app_dir / ".env").stat().st_size
+
+
+def tree_size(root: Path, *, excluded: set[str] | None = None) -> int:
+    total = 0
+    for current_root, directory_names, file_names in os.walk(root, followlinks=False):
+        current = Path(current_root)
+        if current == root and excluded:
+            directory_names[:] = [name for name in directory_names if name not in excluded]
+        for file_name in file_names:
+            try:
+                total += (current / file_name).lstat().st_size
+            except OSError as exc:
+                raise SystemExit("unable to estimate backup source size") from exc
+    return total
+
+
+for current_root, directory_names, file_names in os.walk(app_dir, followlinks=False):
+    current = Path(current_root)
+    if current == app_dir:
+        directory_names[:] = [
+            name for name in directory_names if name not in excluded_top_level
+        ]
+        file_names = [name for name in file_names if name != ".env"]
+    for file_name in file_names:
+        try:
+            estimated_bytes += (current / file_name).lstat().st_size
+        except OSError as exc:
+            raise SystemExit("unable to estimate backup source size") from exc
+
+for host_root in (Path("/etc/nginx"), Path("/etc/cloudflared"), Path("/etc/letsencrypt")):
+    if host_root.exists():
+        estimated_bytes += tree_size(host_root)
+
+free_bytes = shutil.disk_usage(backup_root).free
+margin_bytes = max(1024**3, estimated_bytes // 4)
+database_bytes = sum(path.stat().st_size for path in database_paths)
+required_bytes = estimated_bytes + database_bytes + margin_bytes
+if free_bytes < required_bytes:
+    raise SystemExit(
+        "insufficient backup space: "
+        f"required_bytes={required_bytes} free_bytes={free_bytes}"
+    )
+PY
+
+install -d -m 0700 "${target}" "${target}/databases" "${target}/host-config"
+
+tar \
+    --directory "${APP_DIR}" \
+    --exclude='./.git' \
+    --exclude='./.venv' \
+    --exclude='./.env' \
+    --exclude='./backups' \
+    --exclude='./venv' \
+    --create --gzip --file "${target}/application-files.tar.gz" \
+    .
+
+install -m 0600 "${APP_DIR}/.env" "${target}/application.env"
+
+if command -v git >/dev/null 2>&1 && git -C "${APP_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "${APP_DIR}" rev-parse HEAD >"${target}/application-commit.txt"
+    git -C "${APP_DIR}" status --porcelain=v1 >"${target}/application-status.txt"
+fi
+
+require_host_file() {
+    local source_path=$1
+    local output_name=$2
+    if [[ ! -f ${source_path} || -L ${source_path} ]]; then
+        echo "error: required host configuration is missing or unsafe: ${output_name}" >&2
+        exit 1
+    fi
+    install -m 0600 "${source_path}" "${target}/host-config/${output_name}"
+}
+
+archive_host_directory() {
+    local source_path=$1
+    local output_name=$2
+    if [[ ! -d ${source_path} || -L ${source_path} ]]; then
+        echo "error: required host configuration directory is missing or unsafe: ${output_name}" >&2
+        exit 1
+    fi
+    tar --directory "${source_path}" --create --gzip \
+        --file "${target}/host-config/${output_name}" .
+    chmod 0600 "${target}/host-config/${output_name}"
+}
+
+require_host_file /etc/systemd/system/bili-subtitle-tool.service bili-subtitle-tool.service
+archive_host_directory /etc/nginx nginx-config.tar.gz
+archive_host_directory /etc/cloudflared cloudflared-config.tar.gz
+
+cert_service=/etc/systemd/system/video-caption-cert-renew.service
+cert_timer=/etc/systemd/system/video-caption-cert-renew.timer
+if [[ -e ${cert_service} || -e ${cert_timer} || -d /etc/letsencrypt ]]; then
+    require_host_file "${cert_service}" video-caption-cert-renew.service
+    require_host_file "${cert_timer}" video-caption-cert-renew.timer
+    archive_host_directory /etc/letsencrypt letsencrypt-config.tar.gz
+fi
+
+backup_sqlite() {
+    local source_path=$1
+    local output_name=$2
+    if [[ ! -f ${source_path} || -L ${source_path} ]]; then
+        echo "error: required SQLite database is missing: ${output_name}" >&2
+        exit 1
+    fi
+    python3 - "${source_path}" "${target}/databases/${output_name}" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+from urllib.parse import quote
+
+source_path = Path(sys.argv[1]).resolve(strict=True)
+target_path = Path(sys.argv[2])
+source_uri = f"file:{quote(str(source_path))}?mode=ro"
+with sqlite3.connect(source_uri, uri=True, timeout=30) as source:
+    with sqlite3.connect(target_path, timeout=30) as destination:
+        source.backup(destination)
+        result = destination.execute("PRAGMA quick_check").fetchall()
+if result != [("ok",)]:
+    raise SystemExit(f"SQLite quick_check failed for {target_path.name}")
+target_path.chmod(0o600)
+PY
+}
+
+backup_sqlite "${auth_db_path}" auth.db
+backup_sqlite "${usage_db_path}" cloud-usage.db
+backup_sqlite "${job_db_path}" jobs.db
+
+{
+    printf 'auth.db\t%s\n' "${auth_db_path}"
+    printf 'cloud-usage.db\t%s\n' "${usage_db_path}"
+    printf 'jobs.db\t%s\n' "${job_db_path}"
+} >"${target}/database-source-paths.txt"
+chmod 0600 "${target}/database-source-paths.txt"
+
+(
+    cd "${target}"
+    find . -type f ! -name SHA256SUMS -print0 \
+        | sort -z \
+        | xargs -0 sha256sum >SHA256SUMS
+    sha256sum --check --quiet SHA256SUMS
+)
+
+touch "${target}/BACKUP_COMPLETE"
+chmod 0600 "${target}/BACKUP_COMPLETE" "${target}/SHA256SUMS"
+echo "backup_complete=${target}"
