@@ -1756,8 +1756,16 @@ def result_cache_path(key: str) -> Path:
 
 def cache_updated_since(key: str, timestamp: float) -> bool:
     try:
-        return result_cache_path(key).stat().st_mtime >= timestamp
-    except OSError:
+        payload = json.loads(result_cache_path(key).read_text(encoding="utf-8"))
+        created_at = payload.get("created_at") if isinstance(payload, dict) else None
+        # Reads touch mtime for LRU eviction; only a completed write is a refresh.
+        return (
+            isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and math.isfinite(created_at)
+            and created_at >= timestamp
+        )
+    except (OSError, ValueError, OverflowError):
         return False
 
 
@@ -1839,7 +1847,7 @@ def save_cached_result(key: str, entries: list[SubtitleEntry], metadata: dict[st
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     payload = {
         "version": RESULT_CACHE_VERSION,
-        "created_at": int(time.time()),
+        "created_at": time.time(),
         "entries": [{"start": entry.start, "end": entry.end, "text": entry.text} for entry in entries],
         "metadata": metadata,
     }

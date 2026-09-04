@@ -552,6 +552,43 @@ class ResultCacheTests(unittest.TestCase):
         self.assertEqual(loaded_metadata["title"], "测试")
         self.assertGreaterEqual(age, 0)
 
+    def test_cache_read_does_not_count_as_new_recognition(self) -> None:
+        key = "a" * 64
+        main.save_cached_result(key, [main.SubtitleEntry(0, 1, "cached")], {})
+        request_started = time.time()
+        self.assertIsNotNone(main.load_cached_result(key))
+        self.assertFalse(main.cache_updated_since(key, request_started))
+
+    def test_cache_creation_timestamp_preserves_subsecond_precision(self) -> None:
+        key = "a" * 64
+        with patch.object(main.time, "time", return_value=1000.75):
+            main.save_cached_result(key, [main.SubtitleEntry(0, 1, "cached")], {})
+        self.assertTrue(main.cache_updated_since(key, 1000.5))
+        self.assertFalse(main.cache_updated_since(key, 1000.8))
+
+    def test_invalid_cache_creation_timestamp_is_not_a_refresh(self) -> None:
+        key = "a" * 64
+        for payload in ([], {}, {"created_at": None}, {"created_at": True},
+                        {"created_at": "invalid"}, {"created_at": float("inf")},
+                        {"created_at": 10**400}):
+            with self.subTest(payload=payload):
+                main.result_cache_path(key).write_text(json.dumps(payload), encoding="utf-8")
+                self.assertFalse(main.cache_updated_since(key, 0))
+
+    def test_force_refresh_replaces_existing_result(self) -> None:
+        canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
+        request = main.ExtractRequest(input=canonical, force_refresh=True)
+        main.save_cached_result(main.result_cache_key(request, canonical),
+                                [main.SubtitleEntry(0, 1, "old")], {"title": "test"})
+        with patch.object(main, "normalize_input", return_value=canonical), patch.object(
+            main, "extract_subtitle_uncached",
+            return_value=([main.SubtitleEntry(0, 1, "new")], {"title": "test"}),
+        ) as extract:
+            entries, metadata = main.extract_subtitle_data(request)
+        extract.assert_called_once()
+        self.assertEqual(entries[0].text, "new")
+        self.assertFalse(metadata["cache_hit"])
+
     def test_second_format_uses_cached_raw_entries(self) -> None:
         entries = [main.SubtitleEntry(0, 1, "第一句"), main.SubtitleEntry(1, 2, "第二句")]
         metadata = {"title": "视频", "source": "asr_local", "attempts": []}
@@ -740,6 +777,30 @@ class UploadExtractionTests(unittest.TestCase):
         renamed = first.model_copy(update={"filename": "different-topic.mp4"})
         self.assertEqual(main.upload_result_cache_key(first), main.upload_result_cache_key(second))
         self.assertNotEqual(main.upload_result_cache_key(first), main.upload_result_cache_key(renamed))
+
+    def test_force_refresh_upload_recomputes_then_reuses_other_format(self) -> None:
+        request = self.staged_request().model_copy(update={"force_refresh": True})
+        key = main.upload_result_cache_key(request)
+        main.save_cached_result(key, [main.SubtitleEntry(0, 1, "old")], {"title": "test"})
+        with patch.object(main, "local_asr_enabled", return_value=True), patch.object(
+            main, "ensure_asr_ready"
+        ), patch.object(
+            main, "probe_uploaded_media", return_value={"duration": 2, "format_name": "mp4"}
+        ), patch.object(
+            main, "normalize_audio_for_asr", side_effect=lambda path, *_args, **_kwargs: path
+        ), patch.object(
+            main, "transcribe_audio",
+            return_value=([main.SubtitleEntry(0, 1, "new")], {"detected_language": "zh"}),
+        ) as transcribe:
+            entries, metadata = main.extract_uploaded_subtitle_data(request)
+            cached_entries, cached_metadata = main.extract_uploaded_subtitle_data(
+                request.model_copy(update={"force_refresh": False, "format": "json"})
+            )
+        transcribe.assert_called_once()
+        self.assertEqual(entries[0].text, "new")
+        self.assertEqual(cached_entries[0].text, "new")
+        self.assertFalse(metadata["cache_hit"])
+        self.assertTrue(cached_metadata["cache_hit"])
 
     def test_long_upload_filename_preserves_supported_extension(self) -> None:
         filename, extension = main.safe_upload_filename(f"{'x' * 240}.MP4")
