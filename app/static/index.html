@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f7f8fa">
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260727-2">
-  <script src="/static/app.js?v=20260727-4" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260905-1">
+  <script src="/static/app.js?v=20260905-1" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -196,8 +196,7 @@
 
       <footer class="rail-footer">
         <span class="rail-status-dot" aria-hidden="true"></span>
-        <span>隐私优先处理</span>
-        <strong>已连接</strong>
+        <span>临时媒体自动清理</span>
       </footer>
     </aside>
 
@@ -279,7 +278,7 @@
                       <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"></path>
                     </svg>
                   </i>
-                  <span><strong>视频链接</strong><small>B站或抖音</small></span>
+                  <span><strong>视频链接</strong></span>
                   <svg class="icon source-choice-check" viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M20 6 9 17l-5-5"></path>
                   </svg>
@@ -294,7 +293,7 @@
                       <path d="m17 8-5-5-5 5M12 3v12"></path>
                     </svg>
                   </i>
-                  <span><strong>上传文件</strong><small>本地视频</small></span>
+                  <span><strong>上传文件</strong></span>
                   <svg class="icon source-choice-check" viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M20 6 9 17l-5-5"></path>
                   </svg>
@@ -305,17 +304,16 @@
 
           <div class="source-panel" id="link-input-panel">
             <div class="source-panel-heading">
-              <label class="field-label" for="video-input">粘贴视频链接</label>
+              <label class="field-label" for="video-input">视频链接</label>
               <span>B站 · 抖音 · BV 号</span>
             </div>
             <div class="input-combo">
-              <textarea id="video-input" name="input" rows="2" maxlength="512" required autocomplete="off" spellcheck="false" placeholder="https://www.bilibili.com/video/..."></textarea>
-              <button class="input-action" id="paste-input" type="button">
+              <textarea id="video-input" name="input" rows="3" maxlength="512" required autocomplete="off" spellcheck="false" aria-describedby="input-error" placeholder="粘贴视频链接或 BV 号"></textarea>
+              <button class="input-action" id="paste-input" type="button" title="从剪贴板粘贴" aria-label="从剪贴板粘贴">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
                   <rect width="14" height="14" x="8" y="8" rx="2"></rect>
                   <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
                 </svg>
-                粘贴
               </button>
             </div>
             <div class="input-feedback">
@@ -355,15 +353,15 @@
           <div class="segmented-control">
             <label>
               <input type="radio" name="source" value="auto" checked>
-              <span>智能</span>
+              <span>自动优先</span>
             </label>
             <label>
               <input type="radio" name="source" value="official">
-              <span>平台</span>
+              <span>仅平台字幕</span>
             </label>
             <label>
               <input type="radio" name="source" value="asr">
-              <span>语音</span>
+              <span>语音识别</span>
             </label>
           </div>
         </fieldset>
@@ -384,11 +382,11 @@
                   <strong id="asr-auto-title">本地均衡</strong>
                   <small id="asr-auto-detail">默认 · 兼顾速度与准确率</small>
                 </span>
-                <em>推荐</em>
+                <em>基础服务</em>
               </span>
             </label>
-            <section class="cloud-mode-zone" id="cloud-mode-zone">
-              <header>
+            <details class="cloud-mode-zone" id="cloud-mode-zone">
+              <summary>
                 <span>
                   <i class="cloud-zone-icon" aria-hidden="true">
                     <svg class="icon" viewBox="0 0 24 24">
@@ -396,12 +394,12 @@
                     </svg>
                   </i>
                   <span>
-                    <strong>云端增强</strong>
+                    <strong id="cloud-selection-label">云端增强</strong>
                     <small>会消耗站点的阿里云额度</small>
                   </span>
                 </span>
-                <em>计费服务</em>
-              </header>
+                <em>计费</em>
+              </summary>
               <div class="cloud-quality-options">
                 <label class="quality-option">
                   <input type="radio" name="asr-mode" value="high_accuracy">
@@ -418,8 +416,8 @@
                   </span>
                 </label>
               </div>
-              <p>只有平台字幕未命中且你明确确认后，才会调用云端。</p>
-            </section>
+              <p id="cloud-routing-note">提交前需确认使用站点额度。</p>
+            </details>
           </div>
           <p class="mode-caption" id="quality-caption">先提取平台字幕，没有字幕时在本站内部均衡识别</p>
         </fieldset>
@@ -527,12 +525,12 @@
           <h2 id="result-title">等待新任务</h2>
         </div>
         <div class="result-actions" id="result-actions" hidden>
-          <button class="toolbar-button" id="retry-accurate" type="button" title="使用精确模式重新识别" hidden>
+          <button class="toolbar-button" id="retry-accurate" type="button" title="云端重新识别，需要确认额度消耗" hidden>
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path>
               <path d="M3 3v5h5"></path>
             </svg>
-            <span>精确重试</span>
+            <span>云端重试</span>
           </button>
           <button class="toolbar-button" id="copy-result" type="button" title="复制全部字幕">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -552,7 +550,7 @@
       </header>
 
       <div class="result-content">
-        <div class="status-panel" id="status-panel" aria-live="polite">
+        <div class="status-panel" id="status-panel" aria-live="polite" hidden>
           <div class="status-mark" id="status-mark" aria-hidden="true">
             <svg class="icon status-idle-icon" viewBox="0 0 24 24">
               <path d="M12 3v18M3 12h18"></path>
@@ -568,7 +566,7 @@
             <span class="status-elapsed" id="status-elapsed"></span>
           </div>
           <button class="cancel-button" id="cancel-job" type="button" hidden>取消排队</button>
-          <div class="progress-track" id="progress-track" hidden><span id="progress-value"></span></div>
+          <div class="progress-track" id="progress-track" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100" hidden><span id="progress-value"></span></div>
           <ol class="stage-track" id="stage-track" aria-label="处理阶段" hidden>
             <li data-stage="prepare"><i></i><span>准备</span></li>
             <li data-stage="fetch"><i></i><span>获取</span></li>
@@ -579,20 +577,15 @@
 
         <div class="metadata-strip" id="metadata-strip" hidden></div>
         <div class="notice" id="result-notice" hidden></div>
+        <button class="secondary-button result-retry" id="retry-task" type="button" hidden>返回任务设置</button>
 
-        <div class="idle-output" id="idle-output" aria-hidden="true">
-          <header>
-            <span>字幕预览</span>
-            <span>TXT</span>
-          </header>
-          <div class="idle-lines">
-            <i></i>
-            <i></i>
-            <i></i>
-            <i></i>
-            <i></i>
-            <i></i>
+        <div class="idle-output" id="idle-output">
+          <div class="empty-document" aria-hidden="true">
+            <span id="idle-format">TXT</span>
+            <div class="idle-lines"><i></i><i></i><i></i><i></i></div>
           </div>
+          <h3 id="idle-title">尚无字幕</h3>
+          <p id="idle-detail">等待提交任务</p>
         </div>
 
         <div class="output-shell" id="output-shell" hidden>
@@ -687,10 +680,10 @@
           </span>
           <span>
             <strong id="cloud-confirm-model">千问 ASR · 高精度</strong>
-            <small>平台已有字幕仍会优先使用，不会重复计费。</small>
+            <small id="cloud-confirm-route">平台已有字幕仍会优先使用。</small>
           </span>
         </div>
-        <p>没有可用平台字幕时，临时音频会发送至阿里云百炼，并消耗站点账户额度。任务完成后会清理本站临时文件。</p>
+        <p>调用云端时，临时音频会发送至阿里云百炼，并消耗站点账户额度。任务完成后会清理本站临时文件。</p>
         <label class="cloud-confirm-check">
           <input id="cloud-confirm-check" type="checkbox">
           <span>我确认本次任务可以使用云端额度</span>

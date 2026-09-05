@@ -78,6 +78,9 @@
     cancelPasswordDialog: $("cancel-password-dialog"),
     submitPassword: $("submit-password"),
     cloudModeZone: $("cloud-mode-zone"),
+    cloudSelectionLabel: $("cloud-selection-label"),
+    cloudRoutingNote: $("cloud-routing-note"),
+    cloudConfirmRoute: $("cloud-confirm-route"),
     cloudConfirmDialog: $("cloud-confirm-dialog"),
     cloudConfirmModel: $("cloud-confirm-model"),
     cloudConfirmCheck: $("cloud-confirm-check"),
@@ -108,6 +111,10 @@
     metadataStrip: $("metadata-strip"),
     notice: $("result-notice"),
     idleOutput: $("idle-output"),
+    idleFormat: $("idle-format"),
+    idleTitle: $("idle-title"),
+    idleDetail: $("idle-detail"),
+    retryTask: $("retry-task"),
     outputShell: $("output-shell"),
     output: $("output"),
     outputFormat: $("output-format-label"),
@@ -162,7 +169,8 @@
     preferencesLoaded: false,
     pageLookupTimer: null,
     biliBaseUrl: "",
-    pendingCloudAction: null
+    pendingCloudAction: null,
+    dialogReturnFocus: null
   };
 
   const sourceLabels = {
@@ -475,6 +483,7 @@
 
   function setPasswordDialog(open) {
     const visible = Boolean(open);
+    if (visible && elements.passwordDialog.hidden) state.dialogReturnFocus = elements.accountTrigger;
     elements.passwordDialog.hidden = !visible;
     document.body.classList.toggle(
       "dialog-open",
@@ -484,12 +493,18 @@
       setAccountMenu(false);
       elements.passwordError.textContent = "";
       elements.passwordForm.reset();
-      requestAnimationFrame(() => elements.currentPassword.focus());
+      requestAnimationFrame(() => { if (!elements.passwordDialog.hidden) elements.currentPassword.focus(); });
+    } else {
+      restoreDialogFocus();
     }
   }
 
   function setCloudConfirmDialog(open, resetMode) {
     const visible = Boolean(open);
+    if (visible && elements.cloudConfirmDialog.hidden) {
+      state.dialogReturnFocus = document.activeElement && document.activeElement.tagName === "BUTTON"
+        ? document.activeElement : elements.extractButton;
+    }
     elements.cloudConfirmDialog.hidden = !visible;
     document.body.classList.toggle(
       "dialog-open",
@@ -504,6 +519,7 @@
         syncPrecisionOptions();
         savePreferences();
       }
+      restoreDialogFocus();
       return;
     }
     setAccountMenu(false);
@@ -512,7 +528,10 @@
     elements.cloudConfirmModel.textContent = selectedAsrMode() === "economy"
       ? "Paraformer · 经济模式"
       : "千问 ASR · 高精度";
-    requestAnimationFrame(() => elements.cloudConfirmCheck.focus());
+    elements.cloudConfirmRoute.textContent = selectedInputMode() === "upload" || selectedSource() === "asr"
+      ? "本次将使用云端识别，可能消耗计费额度。"
+      : "优先使用平台字幕；仅在没有可用字幕时调用云端。";
+    requestAnimationFrame(() => { if (!elements.cloudConfirmDialog.hidden) elements.cloudConfirmCheck.focus(); });
   }
 
   function requestCloudConfirmation(action) {
@@ -537,7 +556,14 @@
     elements.cloudConfirmCheck.checked = false;
     elements.submitCloudConfirm.disabled = true;
     document.body.classList.toggle("dialog-open", !elements.passwordDialog.hidden);
+    restoreDialogFocus();
     action();
+  }
+
+  function restoreDialogFocus() {
+    const target = state.dialogReturnFocus;
+    state.dialogReturnFocus = null;
+    if (target && target.isConnected && !target.disabled) target.focus();
   }
 
   async function loadAccount() {
@@ -761,6 +787,8 @@
   }
 
   function updateStageTrack(stage, progress, status) {
+    const media = state.currentPayload && state.currentPayload.kind === "media";
+    elements.stageTrack.querySelector('[data-stage="recognize"] span').textContent = media ? "转换" : "识别";
     const stageGroups = {
       starting: "prepare",
       validating: "prepare",
@@ -841,6 +869,7 @@
       operation = "video";
     }
     const mediaMode = operation !== "subtitle";
+    document.body.dataset.operation = operation;
     const linkRadio = elements.form.querySelector('input[name="input-mode"][value="link"]');
     const uploadRadio = elements.form.querySelector('input[name="input-mode"][value="upload"]');
     if (mediaMode && uploadRadio.checked) linkRadio.checked = true;
@@ -862,6 +891,12 @@
     );
     elements.cookieRow.hidden = state.guest || uploadMode || !cookieReady;
     elements.input.required = !uploadMode;
+    elements.input.disabled = state.busy;
+    elements.paste.disabled = state.busy;
+    elements.clearInput.disabled = state.busy;
+    elements.format.disabled = state.busy;
+    elements.lang.disabled = state.busy;
+    elements.forceRefresh.disabled = state.busy;
     elements.clearInput.title = uploadMode ? "清除视频" : "清空输入";
     uploadRadio.disabled = state.busy || state.guest || mediaMode || !uploadsEnabled;
     linkRadio.disabled = state.busy;
@@ -876,6 +911,35 @@
     elements.forceRefreshHint.textContent = mediaMode ? "不复用已有的视频解析信息" : "重新下载并处理视频";
     syncPrecisionOptions();
     updateSubmitLabel();
+    syncEmptyState();
+  }
+
+  function syncEmptyState() {
+    if (state.current || state.busy || ["error", "cancelled"].includes(elements.resultPane.dataset.state)) return;
+    const operation = selectedOperation();
+    const label = operation === "video" ? "视频" : operation === "audio" ? "音频" : "字幕";
+    elements.idleTitle.textContent = `尚无${label}`;
+    elements.idleFormat.textContent = operation === "video" ? "MP4" : operation === "audio" ? "MP3" : elements.format.value.toUpperCase();
+    elements.idleDetail.textContent = "等待提交任务";
+    elements.resultTitle.textContent = `${label}结果`;
+  }
+
+  function resetResult() {
+    state.current = null;
+    state.currentPayload = null;
+    elements.resultPane.dataset.state = "idle";
+    elements.resultActions.hidden = true;
+    elements.statusPanel.hidden = true;
+    elements.outputShell.hidden = true;
+    elements.mediaResult.hidden = true;
+    elements.metadataStrip.hidden = true;
+    elements.notice.hidden = true;
+    elements.retryTask.hidden = true;
+    elements.output.textContent = "";
+    elements.resultKicker.textContent = "任务结果";
+    elements.idleOutput.hidden = false;
+    elements.idleOutput.classList.remove("processing");
+    syncEmptyState();
   }
 
   function setInputMode(value) {
@@ -912,7 +976,9 @@
     if (embedded) {
       setSelectedSource("auto");
     }
-    elements.qualityFieldGroup.hidden = !subtitleMode;
+    const officialOnly = subtitleMode && selectedInputMode() === "link" && selectedSource() === "official";
+    if (officialOnly) setSelectedAsrMode("auto");
+    elements.qualityFieldGroup.hidden = !subtitleMode || officialOnly;
     elements.embeddedSubtitleRow.hidden = !subtitleMode;
     const localReady = isLocalAsrReady();
     const cloudReady = Boolean(
@@ -955,6 +1021,16 @@
     elements.hotwords.disabled = state.busy || !subtitleMode;
     elements.hotwordsRow.hidden = !subtitleMode;
     const currentMode = selectedAsrMode();
+    const cloudSelected = currentMode === "high_accuracy" || currentMode === "economy";
+    elements.cloudSelectionLabel.textContent = currentMode === "high_accuracy"
+      ? "千问 ASR · 已选择" : currentMode === "economy" ? "Paraformer · 已选择" : "云端增强";
+    if (elements.cloudModeZone.dataset.selectedMode !== currentMode) {
+      elements.cloudModeZone.open = cloudSelected;
+      elements.cloudModeZone.dataset.selectedMode = currentMode;
+    }
+    elements.cloudRoutingNote.textContent = cloudReady
+      ? "按音频时长消耗站点额度，提交前需确认。"
+      : "云端服务暂不可用，基础识别仍可单独使用。";
     elements.cloudModeZone.classList.toggle(
       "selected",
       currentMode === "high_accuracy" || currentMode === "economy"
@@ -971,6 +1047,11 @@
             : autoUsesLocal
               ? "先提取平台字幕，没有字幕时在本站内部均衡识别"
               : "先提取平台字幕，没有字幕时使用当前可用识别服务";
+    if (currentModeReady && !embedded && (selectedInputMode() === "upload" || selectedSource() === "asr")) {
+      elements.qualityCaption.textContent = cloudSelected
+        ? "直接使用所选云端模型识别音轨"
+        : autoUsesLocal ? "使用本地模型识别音轨" : "使用当前可用服务识别音轨";
+    }
     elements.privacyNote.textContent = !currentModeReady
       ? "平台字幕提取不受影响；需要语音识别时请稍后重试。"
       : currentMode === "auto" && localReady
@@ -1171,12 +1252,19 @@
   }
 
   function showStatus(kind, title, detail, progress, mark) {
+    elements.resultPane.dataset.state = kind || "idle";
+    elements.retryTask.hidden = kind !== "error";
     elements.statusPanel.hidden = false;
     elements.statusPanel.className = `status-panel ${kind || ""}`.trim();
     elements.statusTitle.textContent = title;
     elements.statusDetail.textContent = detail;
     elements.statusMark.querySelector("span").textContent = mark || (kind === "error" ? "!" : "CC");
     const numericProgress = Number(progress);
+    if (Number.isFinite(numericProgress)) {
+      elements.progressTrack.setAttribute("aria-valuenow", String(Math.min(100, Math.max(0, numericProgress))));
+    } else {
+      elements.progressTrack.removeAttribute("aria-valuenow");
+    }
     elements.progressTrack.hidden = !Number.isFinite(numericProgress);
     elements.progressValue.style.width = Number.isFinite(numericProgress)
       ? `${Math.min(100, Math.max(2, numericProgress))}%`
@@ -1193,6 +1281,10 @@
       "processing",
       ["queued", "processing"].includes(kind)
     );
+    if (["queued", "processing"].includes(kind)) {
+      elements.idleTitle.textContent = kind === "queued" ? "等待处理" : "正在生成结果";
+      elements.idleDetail.textContent = "任务会在后台继续";
+    }
     elements.metadataStrip.hidden = true;
     elements.notice.hidden = true;
   }
@@ -1307,6 +1399,8 @@
   }
 
   function renderResult(data, payload) {
+    elements.resultPane.dataset.state = "complete";
+    elements.retryTask.hidden = true;
     if (data.kind === "media" || data.download_url) {
       renderMediaResult(data, payload);
       return;
@@ -1475,6 +1569,7 @@
     if (!job || !job.status) return;
     state.resuming = false;
     if (job.status === "queued") {
+      elements.resultTitle.textContent = "任务排队中";
       const ahead = Math.max(0, Number(job.queue_position || 1) - 1);
       elements.queueBadge.textContent = ahead ? `前方 ${ahead} 个任务` : "即将开始";
       elements.queueBadge.hidden = false;
@@ -1488,6 +1583,9 @@
     elements.cancelJob.textContent = "取消排队";
     elements.cancelJob.hidden = true;
     if (job.status === "running") {
+      elements.resultTitle.textContent = state.currentPayload && state.currentPayload.kind === "media"
+        ? state.currentPayload.media_type === "audio" ? "正在提取音频" : "正在提取视频"
+        : "正在提取字幕";
       const detail = stageDetails[job.stage] || "正在处理当前任务";
       showStatus("processing", job.message || "正在处理视频", detail, job.progress || 8, "…");
       updateStageTrack(job.stage, job.progress || 8, "running");
@@ -1508,8 +1606,11 @@
       clearActiveJob();
       state.jobId = null;
       state.current = null;
+      elements.resultTitle.textContent = "任务已取消";
       clearUnavailableUploadSelection();
-      showStatus("idle", "任务已取消", "可以修改设置后重新提交", NaN, "CC");
+      showStatus("cancelled", "任务已取消", "可以修改设置后重新提交", NaN, "CC");
+      elements.idleTitle.textContent = "任务已取消";
+      elements.idleDetail.textContent = "可以修改设置后重新提交";
       setBusy(false);
       loadHealth();
       return;
@@ -2007,6 +2108,7 @@
     elements.input.classList.remove("invalid");
     elements.forceRefresh.checked = false;
     setUploadFile(null);
+    resetResult();
     hidePageSelector();
     updatePlatformDetect();
     setMobileView("compose");
@@ -2020,7 +2122,10 @@
     });
   });
   elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
-    radio.addEventListener("change", savePreferences);
+    radio.addEventListener("change", () => {
+      syncPrecisionOptions();
+      savePreferences();
+    });
   });
   elements.embeddedSubtitles.addEventListener("change", () => {
     if (elements.embeddedSubtitles.checked) {
@@ -2077,8 +2182,15 @@
   elements.copyResult.addEventListener("click", copyResult);
   elements.downloadResult.addEventListener("click", downloadResult);
   elements.retryAccurate.addEventListener("click", retryAccurate);
+  elements.retryTask.addEventListener("click", () => {
+    setMobileView("compose");
+    elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
+    if (selectedInputMode() === "link") elements.input.focus();
+    else elements.videoFile.focus();
+  });
   elements.cancelJob.addEventListener("click", cancelCurrentJob);
   elements.format.addEventListener("change", () => {
+    syncEmptyState();
     savePreferences();
     if (selectedOperation() === "subtitle" && selectedInputMode() === "link" && !state.busy && state.current && state.current.input === elements.input.value.trim()) {
       if (["high_accuracy", "economy"].includes(selectedAsrMode())) {
@@ -2143,6 +2255,20 @@
     }
   });
   document.addEventListener("keydown", (event) => {
+    const dialog = !elements.cloudConfirmDialog.hidden ? elements.cloudConfirmDialog
+      : !elements.passwordDialog.hidden ? elements.passwordDialog : null;
+    if (event.key === "Tab" && dialog) {
+      const controls = Array.from(dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]'))
+        .filter((element) => element.getClientRects().length > 0);
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (first && (!dialog.contains(document.activeElement)
+        || event.shiftKey && document.activeElement === first
+        || !event.shiftKey && document.activeElement === last)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    }
     if (event.key !== "Escape") return;
     setHealthPopover(false);
     setAccountMenu(false);

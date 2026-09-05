@@ -36,6 +36,7 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+node_modules/
 
 # Editors and operating systems
 .DS_Store

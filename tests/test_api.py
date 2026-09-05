@@ -1046,7 +1046,7 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function submitCurrentForm()", script)
         self.assertIn("function changeAccountPassword(", script)
         self.assertIn("guest_media_disabled", script)
-        self.assertIn("/static/app.js?v=20260727-4", page)
+        self.assertIn("/static/app.js?v=20260905-1", page)
         self.assertIn("function syncRailNavigation(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
             "function syncPrecisionOptions", 1

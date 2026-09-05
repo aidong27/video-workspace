@@ -215,6 +215,14 @@ The administrator UI regression checks use Node.js's built-in test runner:
 `node --test tests/admin_ui.test.cjs`. Node.js is only needed for development
 checks, not for the production application.
 
+Workspace browser regressions use Playwright as a development-only dependency:
+`npm install --no-save --package-lock=false playwright`, then
+`npx playwright install chromium webkit`. Run
+`node --test tests/workspace_ui.test.cjs` and
+`UI_BROWSER=webkit node --test tests/workspace_ui.test.cjs`.
+All platform and recognition requests are mocked; these tests do not download
+videos or invoke paid APIs. Set `UI_SCREENSHOT_DIR` to retain review screenshots.
+
 Public `GET /api/health` returns only `{"status":"ok"}`. Signed-in clients use `GET /api/client-config` for a deliberately small capability document containing user-facing availability and upload constraints; neither endpoint returns queue totals, process or disk metrics, model names, provider usage, paths, API keys, workspace IDs, Cookie values, users, or environment variables. Reading either endpoint never invokes a provider or initializes a local model.
 
 Unauthenticated clients use `GET /api/public-config`, which exposes only guest
