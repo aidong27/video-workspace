@@ -2928,6 +2928,26 @@ def probe_uploaded_media(path: Path, require_audio: bool = True) -> dict[str, An
     }
 
 
+def normalized_pcm_duration(path: Path) -> float | None:
+    try:
+        with wave.open(str(path), "rb") as source:
+            pcm_format = (
+                source.getnchannels(), source.getsampwidth(),
+                source.getframerate(), source.getcomptype(),
+            )
+            if pcm_format != (1, 2, 16000, "NONE"):
+                return None
+            frames = source.getnframes()
+            if frames <= 0:
+                return None
+            source.setpos(frames - 1)
+            if len(source.readframes(1)) != 2:
+                return None
+            return frames / 16000
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
 def normalize_audio_for_asr(
     input_path: Path,
     tmp_dir: Path,
@@ -2935,6 +2955,26 @@ def normalize_audio_for_asr(
     timeout_seconds: float | None = None,
 ) -> Path:
     normalized_path = tmp_dir / f"{stem}.asr.wav"
+    audio_filter = asr_audio_filter()
+    pcm_duration = normalized_pcm_duration(input_path)
+    if pcm_duration is not None and pcm_duration > ASR_MAX_AUDIO_SECONDS:
+        raise ExtractionFailure(413, "音频时长超过本地识别上限。", "asr_duration_too_long")
+    if pcm_duration is not None and not audio_filter:
+        if input_path.resolve() == normalized_path.resolve():
+            return input_path
+        ensure_disk_space(tmp_dir)
+        normalized_path.unlink(missing_ok=True)
+        try:
+            # Keep a separate name: download callers may remove their source file.
+            try:
+                os.link(input_path, normalized_path)
+            except OSError:
+                ensure_disk_space(tmp_dir, input_path.stat().st_size)
+                shutil.copyfile(input_path, normalized_path)
+            return normalized_path
+        except BaseException:
+            normalized_path.unlink(missing_ok=True)
+            raise
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ExtractionFailure(503, "Local ASR requires ffmpeg.", "ffmpeg_missing")
@@ -2950,10 +2990,18 @@ def normalize_audio_for_asr(
         "-loglevel",
         "error",
         "-nostdin",
+        "-threads",
+        str(min(2, ASR_CPU_THREADS)),
+        "-filter_threads",
+        "1",
         "-protocol_whitelist",
         LOCAL_MEDIA_PROTOCOL_WHITELIST,
         "-i",
         str(input_path),
+        "-map",
+        "0:a:0",
+        "-t",
+        str(ASR_MAX_AUDIO_SECONDS + 1),
         "-vn",
         "-ac",
         "1",
@@ -2962,7 +3010,6 @@ def normalize_audio_for_asr(
         "-sample_fmt",
         "s16",
     ]
-    audio_filter = asr_audio_filter()
     if audio_filter:
         command.extend(["-af", audio_filter])
     command.append(str(normalized_path))
@@ -2982,6 +3029,9 @@ def normalize_audio_for_asr(
         normalized_path.unlink(missing_ok=True)
         LOGGER.warning("ffmpeg audio normalization failed: %s", redact_sensitive(proc.stderr))
         raise ExtractionFailure(502, "ffmpeg 音轨转换失败。", "audio_extract_failed")
+    if (normalized_pcm_duration(normalized_path) or 0) > ASR_MAX_AUDIO_SECONDS:
+        normalized_path.unlink(missing_ok=True)
+        raise ExtractionFailure(413, "音频时长超过本地识别上限。", "asr_duration_too_long")
     return normalized_path
 
 
@@ -4748,6 +4798,22 @@ def audio_duration_seconds(audio_path: str) -> float:
         return 0.0
 
 
+def digital_silence(audio_path: Path) -> bool:
+    if normalized_pcm_duration(audio_path) is None:
+        return False
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            remaining = source.getnframes() * 2
+            while remaining > 0:
+                chunk = source.readframes(min(32768, remaining // 2))
+                if not chunk or chunk.strip(b"\0"):
+                    return False
+                remaining -= len(chunk)
+            return True
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
 def peak_rss_mb() -> float | None:
     try:
         value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
@@ -4852,29 +4918,50 @@ def run_whisper_transcription(
     audio_path: str,
     options: dict[str, Any],
     audio_duration: float,
+    *,
+    retry_deadline: float | None = None,
 ) -> tuple[list[tuple[float, float, str]], Any, dict[str, Any]]:
     started = time.monotonic()
+    last_progress = float("-inf")
     segments, info = model.transcribe(audio_path, **options)
     entries: list[tuple[float, float, str]] = []
     avg_logprobs: list[float] = []
     no_speech_probs: list[float] = []
     compression_ratios: list[float] = []
     texts: list[str] = []
-    for segment in segments:
-        text = str(segment.text or "").strip()
-        if not text:
-            continue
-        entries.append((float(segment.start), float(segment.end), text))
-        texts.append(text)
-        avg_logprob = segment_metric(segment, "avg_logprob")
-        no_speech_prob = segment_metric(segment, "no_speech_prob")
-        compression_ratio = segment_metric(segment, "compression_ratio")
-        if avg_logprob is not None:
-            avg_logprobs.append(avg_logprob)
-        if no_speech_prob is not None:
-            no_speech_probs.append(no_speech_prob)
-        if compression_ratio is not None:
-            compression_ratios.append(compression_ratio)
+    try:
+        for segment in segments:
+            now = time.monotonic()
+            if retry_deadline is not None and now >= retry_deadline:
+                raise TimeoutError("ASR quality retry budget exhausted")
+            if audio_duration > 0 and now - last_progress >= 1.0:
+                completed = min(audio_duration, max(0.0, float(segment.end)))
+                if math.isfinite(completed):
+                    start, span = (90, 4) if retry_deadline is not None else (68, 22)
+                    label = "正在校对" if retry_deadline is not None else "正在识别"
+                    report_progress(
+                        "transcribe", start + int(span * completed / audio_duration),
+                        f"{label}音频 {int(completed)} / {math.ceil(audio_duration)} 秒",
+                    )
+                    last_progress = now
+            text = str(segment.text or "").strip()
+            if not text:
+                continue
+            entries.append((float(segment.start), float(segment.end), text))
+            texts.append(text)
+            avg_logprob = segment_metric(segment, "avg_logprob")
+            no_speech_prob = segment_metric(segment, "no_speech_prob")
+            compression_ratio = segment_metric(segment, "compression_ratio")
+            if avg_logprob is not None:
+                avg_logprobs.append(avg_logprob)
+            if no_speech_prob is not None:
+                no_speech_probs.append(no_speech_prob)
+            if compression_ratio is not None:
+                compression_ratios.append(compression_ratio)
+    finally:
+        close = getattr(segments, "close", None)
+        if callable(close):
+            close()
     elapsed = max(0.0, time.monotonic() - started)
     low_confidence = sum(value < ASR_LOW_LOGPROB_THRESHOLD for value in avg_logprobs)
     duration_after_vad = getattr(info, "duration_after_vad", None)
@@ -4927,7 +5014,11 @@ def transcribe_audio_payload(
     quality: str = "balanced",
     initial_prompt: str | None = None,
     hotwords: str | None = None,
+    *,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
+    if deadline is None:
+        deadline = time.monotonic() + asr_task_timeout(Path(audio_path), quality)
     cleaned_prompt = sanitize_asr_context(initial_prompt)
     cleaned_hotwords = sanitize_asr_context(hotwords)
     try:
@@ -4970,6 +5061,7 @@ def transcribe_audio_payload(
             or duration <= ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS
         )
         retry_enabled = env_bool("ASR_CONTEXT_RETRY_ENABLED", True)
+        retry_budget_allowed = deadline - time.monotonic() > max(30.0, initial_seconds * 1.25)
         retry_performed = bool(
             entries
             and retry_reason
@@ -4977,6 +5069,7 @@ def transcribe_audio_payload(
             and retry_duration_allowed
             and profile["condition_on_previous_text"]
             and retry_enabled
+            and retry_budget_allowed
         )
         retry_skipped_reason: str | None = None
         if entries and retry_reason and profile["condition_on_previous_text"] and not retry_performed:
@@ -4986,20 +5079,26 @@ def transcribe_audio_payload(
                 retry_skipped_reason = "profile_policy"
             elif not retry_duration_allowed:
                 retry_skipped_reason = "duration_limit"
+            elif not retry_budget_allowed:
+                retry_skipped_reason = "time_budget"
         retry_selected = False
+        retry_failure: str | None = None
         if retry_performed:
             retry_options = dict(options)
             retry_options["condition_on_previous_text"] = False
-            retry_entries, retry_info, retry_metrics = run_whisper_transcription(
-                model,
-                audio_path,
-                retry_options,
-                duration,
-            )
-            total_seconds = initial_seconds + float(retry_metrics.get("transcribe_seconds") or 0.0)
-            if retry_entries and prefer_retry_result(metrics, retry_metrics):
-                entries, info, metrics = retry_entries, retry_info, retry_metrics
-                retry_selected = True
+            retry_started = time.monotonic()
+            try:
+                retry_entries, retry_info, retry_metrics = run_whisper_transcription(
+                    model, audio_path, retry_options, duration, retry_deadline=deadline - 5,
+                )
+                if retry_entries and prefer_retry_result(metrics, retry_metrics):
+                    entries, info, metrics = retry_entries, retry_info, retry_metrics
+                    retry_selected = True
+            except Exception as exc:
+                # The optional quality pass must not discard a successful first pass.
+                retry_failure = "time_budget" if isinstance(exc, TimeoutError) else "retry_failed"
+                LOGGER.warning("ASR quality retry stopped error_type=%s", type(exc).__name__)
+            total_seconds = initial_seconds + max(0.0, time.monotonic() - retry_started)
             metrics["transcribe_seconds"] = round(total_seconds, 3)
             metrics["realtime_factor"] = round(total_seconds / duration, 4) if duration > 0 else None
         metrics.update(
@@ -5009,6 +5108,7 @@ def transcribe_audio_payload(
                 "context_retry_selected": retry_selected,
                 "context_retry_reason": retry_reason if retry_performed else None,
                 "context_retry_skipped_reason": retry_skipped_reason,
+                "context_retry_failure": retry_failure,
                 "quality_warning": (
                     "repetition"
                     if float(metrics.get("repeated_segment_ratio") or 0.0)
@@ -5066,8 +5166,38 @@ def transcribe_audio_worker(
     initial_prompt: str | None,
     hotwords: str | None,
     result_queue: Any,
+    deadline: float | None = None,
 ) -> None:
-    result_queue.put(transcribe_audio_payload(audio_path, lang, quality, initial_prompt, hotwords))
+    def progress_callback(stage: str, progress: int, message: str) -> None:
+        publish_asr_progress(result_queue, None, stage, progress, message)
+
+    with extraction_progress(progress_callback):
+        result = transcribe_audio_payload(
+            audio_path, lang, quality, initial_prompt, hotwords, deadline=deadline,
+        )
+    result_queue.put(result)
+
+
+def publish_asr_progress(queue: Any, task_id: str | None, stage: str, progress: int, message: str) -> None:
+    put = getattr(queue, "put_nowait", None)
+    if not callable(put):
+        return
+    try:
+        put({"kind": "progress", "task_id": task_id, "stage": stage, "progress": progress, "message": message})
+    except (Full, OSError, ValueError):
+        pass
+
+
+def consume_asr_progress(result: Any) -> bool:
+    if not isinstance(result, dict) or result.get("kind") != "progress":
+        return False
+    try:
+        progress = min(94, max(68, int(result["progress"])))
+        message = str(result["message"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return True
+    report_progress("transcribe", progress, message)
+    return True
 
 
 def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: Any) -> None:
@@ -5121,13 +5251,15 @@ def persistent_asr_worker(request_queue: Any, result_queue: Any, ready_event: An
             if task is None:
                 return
             task_id = str(task.get("task_id") or "")
-            result = transcribe_audio_payload(
-                str(task.get("audio_path") or ""),
-                task.get("lang"),
-                str(task.get("quality") or "balanced"),
-                task.get("initial_prompt"),
-                task.get("hotwords"),
-            )
+            def progress_callback(stage: str, progress: int, message: str) -> None:
+                publish_asr_progress(result_queue, task_id, stage, progress, message)
+
+            with extraction_progress(progress_callback):
+                result = transcribe_audio_payload(
+                    str(task.get("audio_path") or ""), task.get("lang"),
+                    str(task.get("quality") or "balanced"),
+                    task.get("initial_prompt"), task.get("hotwords"), deadline=task.get("deadline"),
+                )
             result["task_id"] = task_id
             result_queue.put(result)
     finally:
@@ -5409,6 +5541,7 @@ def asr_public_diagnostics(meta: dict[str, Any]) -> dict[str, Any]:
         "context_retry_selected",
         "context_retry_reason",
         "context_retry_skipped_reason",
+        "context_retry_failure",
         "quality_warning",
         "initial_prompt_used",
         "hotwords_used",
@@ -5441,6 +5574,7 @@ def transcribe_audio_once(
 ) -> tuple[list[SubtitleEntry], dict[str, Any]]:
     profile = asr_profile(quality)
     timeout_seconds = asr_task_timeout(audio_path, profile["quality"])
+    deadline = time.monotonic() + timeout_seconds
     result_queue: Any = None
     process: Any = None
     try:
@@ -5456,6 +5590,7 @@ def transcribe_audio_once(
                     initial_prompt,
                     hotwords,
                     result_queue,
+                    deadline,
                 ),
             )
             process.start()
@@ -5466,7 +5601,6 @@ def transcribe_audio_once(
                 "asr_worker_crashed",
                 retryable=True,
             ) from exc
-        deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -5477,6 +5611,8 @@ def transcribe_audio_once(
                 )
             try:
                 result = result_queue.get(timeout=min(1.0, remaining))
+                if consume_asr_progress(result):
+                    continue
                 break
             except Empty:
                 if not process.is_alive():
@@ -5520,6 +5656,11 @@ def transcribe_audio(
     global ASR_WORKER_WARM, ASR_WORKER_MODEL_KEY
     profile = asr_profile(quality)
     timeout_seconds = asr_task_timeout(audio_path, profile["quality"])
+    duration = normalized_pcm_duration(audio_path)
+    if duration is not None and duration > ASR_MAX_AUDIO_SECONDS:
+        raise ExtractionFailure(413, "音频时长超过本地识别上限。", "asr_duration_too_long")
+    if digital_silence(audio_path):
+        return [], {"digital_silence": True, "asr_attempt_count": 0, "audio_duration_seconds": duration}
     if not env_bool("ASR_PERSISTENT_WORKER", True):
         return transcribe_audio_once(
             audio_path,
@@ -5537,17 +5678,23 @@ def transcribe_audio(
         result_queue = ASR_WORKER_RESULT_QUEUE
         reused = ASR_WORKER_WARM or worker_reused
         task_id = f"{os.getpid()}-{time.time_ns()}"
-        request_queue.put(
-            {
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            request_queue.put({
                 "task_id": task_id,
                 "audio_path": str(audio_path),
                 "lang": lang,
                 "quality": profile["quality"],
                 "initial_prompt": sanitize_asr_context(initial_prompt),
                 "hotwords": sanitize_asr_context(hotwords),
-            }
-        )
-        deadline = time.monotonic() + timeout_seconds
+                "deadline": deadline,
+            }, timeout=min(5.0, timeout_seconds))
+        except (Full, OSError, ValueError) as exc:
+            stop_asr_worker_locked(graceful=False)
+            raise ExtractionFailure(
+                503, "本地识别进程未响应，已重置，请重试。",
+                "asr_worker_crashed", retryable=True,
+            ) from exc
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -5575,6 +5722,8 @@ def transcribe_audio(
             if not isinstance(result, dict):
                 continue
             if result.get("task_id") != task_id:
+                continue
+            if consume_asr_progress(result):
                 continue
             entries, meta = parse_transcription_result(result)
             ASR_WORKER_WARM = True

@@ -233,6 +233,16 @@ intact and avoids treating a general CDN as a video-delivery service.
 
 The local faster-whisper and OCR implementation is the default baseline. On a 4C/4G host, keep `ASR_CONCURRENCY_LIMIT=1`, use the same `small`/int8 model key for all quality profiles, and leave `ASR_PREWARM=false` so the idle web service does not preload the model. The default `balanced` profile uses beam 3 with VAD and cross-window context; `accurate` keeps beam 5 for explicit API callers and OCR fallback. Automatic second-pass correction is limited by `ASR_CONTEXT_RETRY_MAX_AUDIO_SECONDS` so a difficult long video does not silently double its processing time. Model loading checks the local cache before attempting a network request; once the production cache is seeded, set `ASR_MODEL_DOWNLOAD_ENABLED=false` to fail quickly instead of waiting on an unavailable model host. With `ASR_WORKER_EXIT_ON_IDLE=true`, `ASR_MODEL_IDLE_SECONDS=900` exits the entire ASR child after 15 idle minutes and the next task rebuilds it automatically. Set the idle value to `0` to keep it resident, or set the exit flag to `false` to restore the older model-unload-only behavior.
 
+Local ASR avoids re-encoding validated mono 16 kHz PCM WAV input when no audio
+filter is configured. It rejects overlong decoded audio and skips model startup
+only for exact digital silence, not quiet speech. Conversion uses bounded decoder
+and filter threads. Recognition progress comes from processed segment timestamps
+and is throttled to at most one update per second; progress delivery cannot block
+inference. Optional quality correction starts only with enough remaining task
+time and retains the first result if the second pass raises an error. The parent
+process still enforces the hard timeout; an OOM kill cannot recover an in-memory
+partial result. Existing result caches remain compatible with these changes.
+
 ## Douyin runtime
 
 ```env
