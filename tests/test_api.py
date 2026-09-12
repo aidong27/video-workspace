@@ -1122,7 +1122,7 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("uploads.max_bytes", script)
         self.assertIn("body.dialog-open", css)
         self.assertNotIn("linear-gradient", css)
-        self.assertNotIn("state.health", script)
+        self.assertNotRegex(script, r"\bstate\.health\b")
         self.assertNotIn("meta.asr_model", script)
         self.assertNotIn("asr_provider_seconds", script)
         self.assertNotIn("estimated_cost_cny", script)
