@@ -4,11 +4,36 @@ import signal
 import subprocess
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from app import processes
 
 
 class ManagedProcessTests(unittest.TestCase):
+    def test_interruption_reaps_child_and_closes_both_pipes(self) -> None:
+        process = Mock(stdout=BytesIO(b"out"), stderr=BytesIO(b"err"), returncode=None)
+        process.poll.return_value = None
+        process.wait.side_effect = [KeyboardInterrupt, -15]
+        with patch.object(processes.subprocess, "Popen", return_value=process), self.assertRaises(KeyboardInterrupt):
+            processes.run_managed_process(["ffmpeg"], timeout=1)
+        process.terminate.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_capture_start_failure_still_reaps_child(self) -> None:
+        process = Mock(stdout=BytesIO(b""), stderr=BytesIO(b""), returncode=None)
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        with patch.object(processes.subprocess, "Popen", return_value=process), patch.object(
+            processes.LimitedStreamCapture, "start", side_effect=RuntimeError("thread limit")
+        ), self.assertRaises(RuntimeError):
+            processes.run_managed_process(["ffmpeg"], timeout=1)
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once()
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
     @unittest.skipUnless(hasattr(os, "getpgid") and hasattr(os, "killpg"), "POSIX process groups required")
     def test_child_group_cleanup_detects_group_before_start_message_arrives(self) -> None:
         class FakeProcess:

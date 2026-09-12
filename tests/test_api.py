@@ -153,6 +153,63 @@ class ApiIntegrationTests(unittest.TestCase):
         retired = self.client.get("/api/download?input=BV14jFvzbEvj")
         self.assertEqual(retired.status_code, 410)
 
+    def test_completed_result_exports_without_queue_cache_or_recognition(self) -> None:
+        entries = [main.SubtitleEntry(3600, 3601.25, "第一段测试。")]
+        meta = {
+            "title": "测试视频", "source": "asr_local", "asr_model": "hidden-model",
+            "raw_entries": [{"start": 3600, "end": 3602, "text": "原始结果。"}],
+        }
+        result = main.subtitle_result_payload(entries, meta, "txt")
+        with patch.object(main, "cached_extraction_payload", return_value=result):
+            submitted = self.client.post("/api/jobs", json={"input": "BV14jFvzbEvj"})
+        job_id = submitted.json()["id"]
+        self.assertNotIn("_entries", submitted.json()["result"])
+        with patch.object(main, "extract_subtitle_data") as extract, patch.object(
+            main.JOB_MANAGER, "submit"
+        ) as submit, patch.object(main, "load_cached_result") as cache:
+            for fmt in ("txt", "srt", "vtt", "json", "markdown", "md"):
+                with self.subTest(format=fmt):
+                    response = self.client.get(f"/api/jobs/{job_id}/result", params={"format": fmt})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers["cache-control"], "private, no-store")
+                    data = response.json()
+                    self.assertIn("第一段测试。", data["content"])
+                    self.assertIn("原始结果。", data["raw_content"])
+                    self.assertNotIn("hidden-model", response.text)
+                    self.assertNotIn("_entries", data)
+                    if fmt == "srt":
+                        self.assertIn("01:00:00,000 --> 01:00:01,250", data["content"])
+                    if fmt == "json":
+                        self.assertNotIn("asr_model", json.loads(data["content"])["metadata"])
+            extract.assert_not_called()
+            submit.assert_not_called()
+            cache.assert_not_called()
+        # The same completed record survives a restart without needing the source file.
+        restored = main.JobManager(lambda request, update: request, state_path=main.JOB_MANAGER.state_path)
+        restored.start()
+        try:
+            self.assertEqual(restored.get(job_id)["result"]["_entries"][0]["text"], "第一段测试。")
+        finally:
+            restored.stop()
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}/result?format=exe").status_code, 422)
+        self.client.post("/api/auth/register", json={
+            "username": "another-user", "password": "strong-pass", "invite_code": "integration-invite",
+        })
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}/result").status_code, 404)
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}/result").status_code, 401)
+
+    def test_old_result_does_not_silently_start_another_recognition(self) -> None:
+        with patch.object(main, "cached_extraction_payload", return_value={
+            "ok": True, "format": "txt", "content": "legacy result", "metadata": {},
+        }):
+            job_id = self.client.post("/api/jobs", json={"input": "BV14jFvzbEvj"}).json()["id"]
+        with patch.object(main, "extract_subtitle_data") as extract:
+            response = self.client.get(f"/api/jobs/{job_id}/result?format=srt")
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.json()["detail"]["code"], "result_unavailable")
+        extract.assert_not_called()
+
     def test_completed_job_strips_runtime_metadata_from_browser_response(self) -> None:
         internal_metadata = {
             "platform": "bilibili",
@@ -1046,7 +1103,8 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function submitCurrentForm()", script)
         self.assertIn("function changeAccountPassword(", script)
         self.assertIn("guest_media_disabled", script)
-        self.assertIn("/static/app.js?v=20260905-1", page)
+        self.assertIn("/static/app.js?v=20260912-1", page)
+        self.assertIn('id="result-format"', page)
         self.assertIn("function syncRailNavigation(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
             "function syncPrecisionOptions", 1

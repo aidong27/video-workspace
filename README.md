@@ -13,6 +13,10 @@ A self-hosted FastAPI workspace for extracting subtitles, video, and audio from 
 - Direct media: Bilibili video up to 1080p, Douyin video, or MP3 audio. Binary results use owner-scoped temporary artifacts instead of JSON payloads and are deleted when the job expires.
 - Guest media: optional signed guest sessions can expose only direct video/audio extraction without opening subtitle, upload, Cookie, or cloud-ASR access. Guest outputs use lower limits and a shorter retention window.
 - Successful results are cached as normalized entries, so TXT, SRT, VTT, Markdown, and JSON conversions do not repeat transcription.
+- Completed jobs can export another format directly from their owned result via
+  `GET /api/jobs/{job_id}/result?format=srt`, without another queue submission or
+  cloud call. Temporary browser disconnections retain the job and use bounded
+  reconnect attempts. See [reliability upgrade notes](docs/reliability-upgrade.md).
 - Work runs through a bounded queue so platform subtitles can finish while another job uses ASR. ASR and OCR share one heavy-work slot; cloud submissions, Chromium, downloads, and temporary media remain bounded for 4C/4G operation.
 - Job state is stored in a small local SQLite database. Queued link jobs can resume after an unclean restart; any job that was already running returns an explicit interruption error so a cloud task is never submitted twice after a crash.
 - Cache hits bypass the worker queue and are rendered in the requested format immediately. The web UI remembers an active job per account and reconnects after a refresh or short network interruption.

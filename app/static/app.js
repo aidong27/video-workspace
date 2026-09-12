@@ -118,6 +118,7 @@
     outputShell: $("output-shell"),
     output: $("output"),
     outputFormat: $("output-format-label"),
+    resultFormat: $("result-format"),
     outputStats: $("output-stats-label"),
     resultSearch: $("result-search"),
     searchCount: $("search-count"),
@@ -147,6 +148,10 @@
     startedAt: 0,
     elapsedTimer: null,
     pollTimer: null,
+    pollController: null,
+    pollFailures: 0,
+    pollPaused: false,
+    searchTimer: null,
     toastTimer: null,
     loginPollTimer: null,
     uploadXhr: null,
@@ -160,6 +165,7 @@
     user: null,
     guest: false,
     capabilities: null,
+    healthLoading: false,
     history: [],
     uploadMaxBytes: 512 * 1024 * 1024,
     uploadExtensions: [],
@@ -168,6 +174,7 @@
     mobileView: "compose",
     preferencesLoaded: false,
     pageLookupTimer: null,
+    pageLookupVersion: 0,
     biliBaseUrl: "",
     pendingCloudAction: null,
     dialogReturnFocus: null
@@ -1133,6 +1140,7 @@
   }
 
   function schedulePageLookup() {
+    state.pageLookupVersion += 1;
     if (state.pageLookupTimer) clearTimeout(state.pageLookupTimer);
     if (detectPlatform(elements.input.value.trim()) !== "bilibili") {
       hidePageSelector();
@@ -1143,6 +1151,7 @@
 
   async function loadBilibiliPages() {
     state.pageLookupTimer = null;
+    const version = ++state.pageLookupVersion;
     const input = elements.input.value.trim();
     if (detectPlatform(input) !== "bilibili") {
       hidePageSelector();
@@ -1157,7 +1166,8 @@
         cache: "no-store"
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok || elements.input.value.trim() !== input || !Array.isArray(data.pages)) {
+      if (version !== state.pageLookupVersion || elements.input.value.trim() !== input) return;
+      if (!response.ok || !Array.isArray(data.pages)) {
         hidePageSelector();
         return;
       }
@@ -1176,7 +1186,7 @@
       state.biliBaseUrl = data.base_url || "";
       elements.pageSelectorRow.hidden = false;
     } catch (_) {
-      hidePageSelector();
+      if (version === state.pageLookupVersion && elements.input.value.trim() === input) hidePageSelector();
     }
   }
 
@@ -1225,6 +1235,10 @@
   function stopPolling() {
     if (state.pollTimer) clearTimeout(state.pollTimer);
     state.pollTimer = null;
+    if (state.pollController) state.pollController.abort();
+    state.pollController = null;
+    state.pollFailures = 0;
+    state.pollPaused = false;
   }
 
   function setBusy(busy, startedAt) {
@@ -1254,6 +1268,7 @@
   function showStatus(kind, title, detail, progress, mark) {
     elements.resultPane.dataset.state = kind || "idle";
     elements.retryTask.hidden = kind !== "error";
+    elements.retryTask.textContent = "返回任务设置";
     elements.statusPanel.hidden = false;
     elements.statusPanel.className = `status-panel ${kind || ""}`.trim();
     elements.statusTitle.textContent = title;
@@ -1276,7 +1291,7 @@
     }
     elements.outputShell.hidden = true;
     elements.mediaResult.hidden = true;
-    elements.idleOutput.hidden = kind === "error";
+    elements.idleOutput.hidden = ["error", "reconnecting"].includes(kind);
     elements.idleOutput.classList.toggle(
       "processing",
       ["queued", "processing"].includes(kind)
@@ -1302,7 +1317,9 @@
     const code = detail && typeof detail === "object" ? detail.code : "";
     if (code && errorMessages[code]) return errorMessages[code];
     if (reason && errorMessages[reason]) return errorMessages[reason];
-    if (status === 401) return "访问凭据已失效，请重新登录。";
+    if (status === 401) return state.guest
+      ? "访客会话已失效，请刷新页面后重新提取。"
+      : "访问凭据已失效，请重新登录。";
     if (status === 413) return "视频或音频文件超过当前大小限制。";
     if (status === 415) return "暂不支持这种视频格式。";
     if (status === 429) return "请求过于频繁或任务队列已满，请稍后再试。";
@@ -1398,7 +1415,8 @@
     return Number(meta.repeated_segment_ratio || 0) >= 0.1;
   }
 
-  function renderResult(data, payload) {
+  function renderResult(data, payload, jobId) {
+    payload = payload || {};
     elements.resultPane.dataset.state = "complete";
     elements.retryTask.hidden = true;
     if (data.kind === "media" || data.download_url) {
@@ -1407,6 +1425,7 @@
     }
     state.current = {
       kind: "subtitle",
+      resultJobId: jobId || null,
       content: data.content || "",
       rawContent: data.raw_content || "",
       showingRaw: false,
@@ -1431,6 +1450,11 @@
     renderOutputContent();
     applyWrapPreference();
     elements.outputFormat.textContent = state.current.format.toUpperCase();
+    elements.resultFormat.value = state.current.format === "md" ? "markdown" : state.current.format;
+    elements.resultFormat.disabled = !state.current.resultJobId;
+    elements.downloadResult.disabled = false;
+    elements.toggleRaw.disabled = false;
+    elements.outputShell.removeAttribute("aria-busy");
     updateOutputStats();
     elements.toggleRaw.hidden = !state.current.rawContent;
     elements.toggleRaw.setAttribute("aria-pressed", "false");
@@ -1595,7 +1619,7 @@
       stopPolling();
       clearActiveJob();
       state.jobId = null;
-      renderResult(job.result || {}, state.currentPayload);
+      renderResult(job.result || {}, state.currentPayload, job.id);
       clearUnavailableUploadSelection();
       setBusy(false);
       loadHealth();
@@ -1620,21 +1644,124 @@
     }
   }
 
+  function validJobSnapshot(job) {
+    return job && typeof job.id === "string" && job.id.length > 0 && job.id.length <= 128
+      && ["queued", "running", "completed", "failed", "cancelled"].includes(job.status)
+      && (job.status !== "completed" || job.result && typeof job.result === "object"
+        && (typeof job.result.content === "string" || typeof job.result.download_url === "string"));
+  }
+
+  function transientStatus(status) {
+    return status === 408 || status === 429 || status >= 500;
+  }
+
+  function notePollingFailure() {
+    state.pollFailures += 1;
+    state.pollPaused = state.pollFailures >= 6;
+    saveActiveJob();
+    elements.cancelJob.hidden = true;
+    elements.queueBadge.hidden = true;
+    showStatus("reconnecting", "连接暂时中断", state.pollPaused
+      ? "暂时无法读取进度，任务编号已保留。恢复连接后可继续查询。"
+      : "正在重新连接，任务编号已保留，不会重复提交。", NaN, "!");
+    elements.retryTask.textContent = "重新连接";
+    elements.retryTask.hidden = !state.pollPaused;
+  }
+
   async function pollJob() {
-    if (!state.jobId || !state.busy) return;
+    if (!state.jobId || !state.busy || state.pollController || state.pollPaused) return;
+    if (state.pollTimer) clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+    const jobId = state.jobId;
+    const controller = new AbortController();
+    state.pollController = controller;
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    let retryDelay = 0;
     try {
-      const response = await apiFetch(`/api/jobs/${encodeURIComponent(state.jobId)}`, { cache: "no-store" });
+      const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+        cache: "no-store", signal: controller.signal
+      });
       const data = await response.json().catch(() => ({}));
+      if (state.pollController !== controller || state.jobId !== jobId) return;
       if (!response.ok) {
-        if (response.status === 401) return;
-        finishWithError(data, response.status);
-        return;
+        if (!transientStatus(response.status)) {
+          finishWithError(data, response.status);
+          return;
+        }
+        const retryAfter = response.headers.get("Retry-After");
+        const seconds = Number(retryAfter);
+        retryDelay = Math.min(60000, Math.max(0, Number.isFinite(seconds)
+          ? seconds * 1000 : Date.parse(retryAfter) - Date.now())) || 0;
+        throw new Error("retryable_job_response");
       }
+      if (!validJobSnapshot(data) || data.id !== jobId) throw new Error("invalid_job_response");
+      state.pollFailures = 0;
+      saveActiveJob();
       handleJob(data);
     } catch (_) {
-      elements.statusDetail.textContent = "网络连接短暂中断，正在继续查询任务";
+      if (state.pollController === controller && state.jobId === jobId) notePollingFailure();
+    } finally {
+      clearTimeout(timeout);
+      if (state.pollController === controller) state.pollController = null;
+      if (state.jobId === jobId && state.busy && !state.pollPaused) {
+        const delay = state.pollFailures ? Math.min(30000, 1000 * 2 ** state.pollFailures)
+          : document.hidden ? 8000 : 1800;
+        state.pollTimer = setTimeout(pollJob, Math.max(delay, retryDelay));
+      }
     }
-    if (state.jobId && state.busy) state.pollTimer = setTimeout(pollJob, 1800);
+  }
+
+  function reconnectJob() {
+    if (!state.jobId || !state.busy || state.pollController) return;
+    state.pollPaused = false;
+    state.pollFailures = 0;
+    elements.retryTask.hidden = true;
+    elements.statusDetail.textContent = "正在重新读取任务进度";
+    pollJob();
+  }
+
+  async function changeResultFormat() {
+    const current = state.current;
+    if (!current || current.kind !== "subtitle" || !current.resultJobId || state.busy) return;
+    const format = elements.resultFormat.value;
+    if (format === current.format) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    elements.resultFormat.disabled = true;
+    elements.downloadResult.disabled = true;
+    elements.toggleRaw.disabled = true;
+    elements.outputShell.setAttribute("aria-busy", "true");
+    try {
+      const response = await apiFetch(`/api/jobs/${encodeURIComponent(current.resultJobId)}/result?format=${encodeURIComponent(format)}`, {
+        cache: "no-store", signal: controller.signal
+      });
+      const data = await response.json().catch(() => ({}));
+      if (state.current !== current) return;
+      if (!response.ok || typeof data.content !== "string") {
+        showToast(response.ok ? "格式转换暂时不可用，已保留当前结果。" : friendlyError(data, response.status), true);
+        return;
+      }
+      Object.assign(current, {
+        content: data.content, rawContent: data.raw_content || "", format: data.format,
+        filename: data.filename, contentType: data.content_type
+      });
+      if (!current.rawContent) current.showingRaw = false;
+      elements.outputFormat.textContent = current.format.toUpperCase();
+      elements.resultSearch.value = "";
+      renderOutputContent();
+      updateOutputStats();
+    } catch (_) {
+      if (state.current === current) showToast("无法连接服务，已保留当前结果。", true);
+    } finally {
+      clearTimeout(timeout);
+      if (state.current === current) {
+        elements.resultFormat.value = current.format === "md" ? "markdown" : current.format;
+        elements.resultFormat.disabled = false;
+        elements.downloadResult.disabled = false;
+        elements.toggleRaw.disabled = false;
+        elements.outputShell.removeAttribute("aria-busy");
+      }
+    }
   }
 
   function submissionKey(payload) {
@@ -1669,11 +1796,14 @@
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        state.submissionKey = null;
-        state.submissionSignature = null;
+        if (!transientStatus(response.status)) {
+          state.submissionKey = null;
+          state.submissionSignature = null;
+        }
         finishWithError(data, response.status);
         return;
       }
+      if (!validJobSnapshot(data)) throw new Error("invalid_job_response");
       stopPolling();
       state.jobId = data.id;
       state.submissionKey = null;
@@ -1761,9 +1891,15 @@
         return;
       }
       if (xhr.status < 200 || xhr.status >= 300) {
-        state.submissionKey = null;
-        state.submissionSignature = null;
+        if (!transientStatus(xhr.status)) {
+          state.submissionKey = null;
+          state.submissionSignature = null;
+        }
         finishWithError(data, xhr.status);
+        return;
+      }
+      if (!validJobSnapshot(data)) {
+        finishWithError({ message: "未收到有效任务编号，请重试。" }, 0);
         return;
       }
       stopPolling();
@@ -1922,15 +2058,19 @@
   }
 
   async function loadHealth() {
+    if (state.healthLoading) return;
+    state.healthLoading = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
     try {
-      const healthResponse = await fetch("/api/health", { cache: "no-store" });
+      const healthResponse = await fetch("/api/health", { cache: "no-store", signal: controller.signal });
       if (!healthResponse.ok) throw new Error(String(healthResponse.status));
       const health = await healthResponse.json();
       if (health.status !== "ok") throw new Error("unhealthy");
       const configEndpoint = state.user ? "/api/client-config" : "/api/public-config";
       const configResponse = state.user
-        ? await apiFetch(configEndpoint, { cache: "no-store" })
-        : await fetch(configEndpoint, { cache: "no-store" });
+        ? await apiFetch(configEndpoint, { cache: "no-store", signal: controller.signal })
+        : await fetch(configEndpoint, { cache: "no-store", signal: controller.signal });
       if (!configResponse.ok) throw new Error(String(configResponse.status));
       state.capabilities = await configResponse.json();
       const features = state.capabilities.features || {};
@@ -1983,10 +2123,10 @@
         ? state.capabilities.guest_media || {}
         : state.capabilities.media || {};
       state.mediaEnabled = media.enabled !== false && (!isGuest || features.guest_media === true);
-      if (!state.mediaEnabled && !isGuest && selectedOperation() !== "subtitle") {
+      if (!state.busy && !state.mediaEnabled && !isGuest && selectedOperation() !== "subtitle") {
         setSelectedOperation("subtitle");
       }
-      if (!uploadsEnabled && selectedInputMode() === "upload") setInputMode("link");
+      if (!state.busy && !uploadsEnabled && selectedInputMode() === "upload") setInputMode("link");
       else syncInputMode();
       elements.loginSection.hidden = isGuest || !features.bilibili_qr_login;
     } catch (_) {
@@ -1999,9 +2139,11 @@
       elements.bilibiliChip.classList.add("unavailable");
       elements.douyinChip.classList.add("unavailable");
       elements.uploadChip.classList.add("unavailable");
-      state.mediaEnabled = false;
-      if (!state.guest && selectedOperation() !== "subtitle") setSelectedOperation("subtitle");
+      if (!state.capabilities) state.mediaEnabled = false;
       syncInputMode();
+    } finally {
+      clearTimeout(timeout);
+      state.healthLoading = false;
     }
   }
 
@@ -2183,6 +2325,10 @@
   elements.downloadResult.addEventListener("click", downloadResult);
   elements.retryAccurate.addEventListener("click", retryAccurate);
   elements.retryTask.addEventListener("click", () => {
+    if (state.pollPaused && state.jobId) {
+      reconnectJob();
+      return;
+    }
     setMobileView("compose");
     elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
     if (selectedInputMode() === "link") elements.input.focus();
@@ -2192,17 +2338,8 @@
   elements.format.addEventListener("change", () => {
     syncEmptyState();
     savePreferences();
-    if (selectedOperation() === "subtitle" && selectedInputMode() === "link" && !state.busy && state.current && state.current.input === elements.input.value.trim()) {
-      if (["high_accuracy", "economy"].includes(selectedAsrMode())) {
-        requestCloudConfirmation(() => runExtraction({
-          force_refresh: false,
-          cloud_consent: true
-        }));
-      } else {
-        runExtraction({ force_refresh: false });
-      }
-    }
   });
+  elements.resultFormat.addEventListener("change", changeResultFormat);
   elements.lang.addEventListener("change", savePreferences);
   elements.allowPlatformAi.addEventListener("change", savePreferences);
   elements.useCookie.addEventListener("change", () => {
@@ -2214,7 +2351,10 @@
     elements.input.value = `${state.biliBaseUrl}?p=${encodeURIComponent(elements.pageSelect.value)}`;
     updatePlatformDetect();
   });
-  elements.resultSearch.addEventListener("input", renderOutputContent);
+  elements.resultSearch.addEventListener("input", () => {
+    clearTimeout(state.searchTimer);
+    state.searchTimer = setTimeout(renderOutputContent, 120);
+  });
   elements.toggleRaw.addEventListener("click", toggleRawVersion);
   elements.toggleWrap.addEventListener("click", () => {
     state.wrapOutput = !state.wrapOutput;
@@ -2282,6 +2422,10 @@
   });
   elements.loginStart.addEventListener("click", startLogin);
   elements.logoutAccount.addEventListener("click", logoutAccount);
+  window.addEventListener("online", reconnectJob);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && !state.pollPaused) reconnectJob();
+  });
 
   async function initializeApp() {
     renderHistory();

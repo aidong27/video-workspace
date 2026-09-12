@@ -49,6 +49,7 @@ async function workspace(t, options = {}) {
   await page.route("**/api/**", async route => {
     const req = route.request();
     const endpoint = new URL(req.url()).pathname;
+    if (options.route && await options.route(route, endpoint)) return;
     let status = 200, body = {};
     if (endpoint === "/api/auth/me") {
       status = options.guest ? 401 : 200;
@@ -62,7 +63,7 @@ async function workspace(t, options = {}) {
     else if (req.method() === "DELETE" && endpoint.startsWith("/api/jobs/")) body = { id: "fixture-job", status: "cancelled" };
     else if (req.method() === "POST") {
       const payload = req.postDataJSON();
-      submissions.push({ endpoint, payload });
+      submissions.push({ endpoint, payload, idempotencyKey: req.headers()["idempotency-key"] });
       if (options.failure) { status = 503; body = { detail: { reason: "download_failed" } }; }
       else if (options.waiting) body = { id: "fixture-job", status: "queued", progress: 3, queue_position: 2 };
       else if (options.running) body = { id: "fixture-job", status: "running", stage: "media_convert", progress: 58, message: "正在转换" };
@@ -83,6 +84,7 @@ async function workspace(t, options = {}) {
     localStorage.setItem("caption-active-job-v1:7", JSON.stringify({ jobId: "old-job", savedAt: Date.now(),
       startedAt: Date.now(), payload: { kind: "media", media_type: "video", input: "BV14jFvzbEvj" } }));
   });
+  if (options.beforeLoad) await options.beforeLoad(page);
   await page.goto(base);
   await page.locator("body.app-ready").waitFor();
   return { page, submissions };
@@ -176,12 +178,204 @@ test("completed result is readable and new task clears the old output", async t 
   await page.locator("#extract-button").click();
   await page.locator("#output-shell").waitFor({ state: "visible" });
   await page.locator("#result-search").fill("字幕");
+  await page.waitForFunction(() => document.querySelector("#search-count").textContent === "2 处");
   assert.match(await page.locator("#search-count").textContent(), /2 处/);
   await screenshot(page, "completed-desktop");
   await page.locator("#rail-new-task").click();
   assert.equal(await page.locator("#output-shell").isVisible(), false);
   assert.equal(await page.locator("#output").textContent(), "");
   assert.equal(await page.locator("#idle-title").textContent(), "尚无字幕");
+});
+
+test("result formats convert without a second submission, including the raw version", async t => {
+  const formats = [];
+  const { page, submissions } = await workspace(t, { route: async (route, endpoint) => {
+    if (!endpoint.endsWith("/result")) return false;
+    const format = new URL(route.request().url()).searchParams.get("format");
+    formats.push(format);
+    await route.fulfill({ json: { format, filename: `fixture.${format}`, content_type: "text/plain",
+      content: "1\n00:00:00,000 --> 00:00:01,000\n整理字幕", raw_content: "原始字幕" } });
+    return true;
+  } });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  await page.locator("#format-select").selectOption("json");
+  assert.equal(submissions.length, 1);
+  await page.locator("#result-format").selectOption("srt");
+  await page.waitForFunction(() => document.querySelector("#output").textContent.includes("00:00:01,000"));
+  await page.locator("#toggle-raw").click();
+  assert.equal(await page.locator("#output").textContent(), "原始字幕");
+  assert.equal(submissions.length, 1);
+  assert.deepEqual(formats, ["srt"]);
+  await screenshot(page, "result-format-desktop");
+  await page.setViewportSize({ width: 320, height: 844 });
+  await page.locator("#mobile-tab-result").click();
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  const tools = await page.locator(".output-tools").evaluate(element => {
+    const parent = element.getBoundingClientRect();
+    return [...element.children].filter(child => !child.hidden).map(child => {
+      const rect = child.getBoundingClientRect();
+      return { inside: rect.left >= parent.left && rect.right <= parent.right + 1, height: rect.height };
+    });
+  });
+  assert.ok(tools.every(tool => tool.inside && tool.height <= 35));
+  await screenshot(page, "result-format-mobile");
+});
+
+test("expired export retains the existing result and never resubmits", async t => {
+  const { page, submissions } = await workspace(t, { route: async (route, endpoint) => {
+    if (!endpoint.endsWith("/result")) return false;
+    await route.fulfill({ status: 410, json: { detail: { message: "该结果已过期" } } });
+    return true;
+  } });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  const original = await page.locator("#output").textContent();
+  await page.locator("#result-format").selectOption("json");
+  await page.waitForFunction(() => document.querySelector("#result-format").value === "txt");
+  assert.equal(await page.locator("#output").textContent(), original);
+  assert.equal(await page.locator("#download-result").isEnabled(), true);
+  assert.equal(submissions.length, 1);
+});
+
+test("temporary polling failure keeps the job and recovers without another POST", async t => {
+  let polls = 0;
+  const { page, submissions } = await workspace(t, { waiting: true, route: async (route, endpoint) => {
+    if (!endpoint.startsWith("/api/jobs/") || route.request().method() !== "GET") return false;
+    polls += 1;
+    await route.fulfill(polls === 1 ? { status: 503, body: "temporarily unavailable" }
+      : { json: { id: "fixture-job", status: "completed", result: { content: "恢复成功", format: "txt" } } });
+    return true;
+  } });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.waitForFunction(() => document.querySelector("#status-title").textContent === "连接暂时中断");
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("caption-active-job-v1:7")).jobId), "fixture-job");
+  assert.equal(await page.locator("#extract-button").isDisabled(), true);
+  await screenshot(page, "reconnecting-desktop");
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#output").textContent(), "恢复成功");
+  assert.equal(submissions.length, 1);
+  assert.equal(polls, 2);
+  assert.equal(await page.evaluate(() => localStorage.getItem("caption-active-job-v1:7")), null);
+});
+
+test("refresh restores a running job without creating a new one", async t => {
+  const { page, submissions } = await workspace(t, { waiting: true });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.waitForFunction(() => localStorage.getItem("caption-active-job-v1:7"));
+  await page.reload();
+  await page.locator("body.app-ready").waitFor();
+  await page.waitForFunction(() => document.querySelector("#progress-track").getAttribute("aria-valuenow") === "58");
+  assert.equal(submissions.length, 1);
+  assert.equal(await page.locator("#video-input").inputValue(), "BV14jFvzbEvj");
+  assert.equal(await page.locator("#extract-button").isDisabled(), true);
+});
+
+test("an uncertain submission keeps its idempotency key for a manual retry", async t => {
+  const keys = [];
+  const { page } = await workspace(t, { route: async (route, endpoint) => {
+    if (endpoint !== "/api/jobs" || route.request().method() !== "POST") return false;
+    keys.push(route.request().headers()["idempotency-key"]);
+    if (keys.length !== 1) return false;
+    await route.fulfill({ status: 502, body: "gateway error" });
+    return true;
+  } });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.locator("#retry-task").waitFor({ state: "visible" });
+  await page.locator("#extract-button").click();
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  assert.equal(keys.length, 2);
+  assert.ok(keys[0]);
+  assert.equal(keys[0], keys[1]);
+});
+
+test("a temporary health failure does not change the active media operation", async t => {
+  let checks = 0;
+  const { page } = await workspace(t, { running: true, beforeLoad: page => page.clock.install(),
+    route: async (route, endpoint) => {
+      if (endpoint !== "/api/health" || ++checks === 1) return false;
+      await route.fulfill({ status: 503, json: {} });
+      return true;
+    }
+  });
+  await page.locator("#rail-audio").click();
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.clock.fastForward(31000);
+  await page.waitForFunction(() => document.querySelector("#service-label").textContent === "服务异常");
+  assert.equal(await page.locator('input[name="operation"][value="audio"]').isChecked(), true);
+  assert.equal(await page.locator("#extract-button").isDisabled(), true);
+});
+
+test("repeated invalid polling responses pause and manual reconnect only performs GET", async t => {
+  let polls = 0, recovered = false;
+  const { page, submissions } = await workspace(t, { waiting: true,
+    beforeLoad: page => page.clock.install(),
+    route: async (route, endpoint) => {
+      if (!endpoint.startsWith("/api/jobs/") || route.request().method() !== "GET") return false;
+      polls += 1;
+      await route.fulfill({ json: recovered
+        ? { id: "fixture-job", status: "completed", result: { content: "重连完成", format: "txt" } }
+        : {} });
+      return true;
+    }
+  });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  for (let index = 0; index < 6; index += 1) {
+    const response = page.waitForResponse(resp => new URL(resp.url()).pathname === "/api/jobs/fixture-job");
+    await page.clock.fastForward(31000);
+    await response;
+    await page.waitForFunction(() => document.querySelector("#status-title").textContent === "连接暂时中断");
+  }
+  await page.locator("#retry-task").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#retry-task").textContent(), "重新连接");
+  assert.equal(polls, 6);
+  await page.clock.fastForward(120000);
+  assert.equal(polls, 6);
+  recovered = true;
+  await page.locator("#retry-task").click();
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#output").textContent(), "重连完成");
+  assert.equal(submissions.length, 1);
+});
+
+test("guest session expiry ends polling and clears the saved job", async t => {
+  const { page } = await workspace(t, { guest: true, waiting: true, route: async (route, endpoint) => {
+    if (!endpoint.startsWith("/api/jobs/")) return false;
+    await route.fulfill({ status: 401, json: {} });
+    return true;
+  } });
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.locator("#retry-task").waitFor({ state: "visible" });
+  assert.match(await page.locator("#status-detail").textContent(), /访客会话已失效/);
+  assert.equal(await page.locator("#extract-button").isEnabled(), true);
+  assert.equal(await page.evaluate(() => Object.keys(localStorage).some(key => key.startsWith("caption-active-job-"))), false);
+});
+
+test("an older part lookup cannot erase the current video's parts", async t => {
+  let firstRoute;
+  const { page } = await workspace(t, { route: async (route, endpoint) => {
+    if (endpoint === "/api/bilibili/pages" && new URL(route.request().url()).searchParams.get("input") === "BV1xx411c7mD") {
+      firstRoute = route;
+      return true;
+    }
+    return false;
+  } });
+  await page.locator("#video-input").fill("BV1xx411c7mD");
+  await page.waitForRequest(req => req.url().includes("/api/bilibili/pages"));
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#page-selector-row").waitFor({ state: "visible" });
+  await firstRoute.fulfill({ json: { pages: [], base_url: "", current_page: 1 } });
+  await page.waitForLoadState("networkidle");
+  assert.equal(await page.locator("#page-selector-row").isVisible(), true);
+  assert.equal(await page.locator("#page-select option").count(), 2);
 });
 
 test("mobile failure returns to editable input without auto retrying", async t => {

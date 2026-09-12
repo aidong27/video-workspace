@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
-from queue import Empty, Queue
 import sqlite3
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import uuid
 
 from fastapi import HTTPException
+
+from .database import sqlite_connection
 
 
 JobProcessor = Callable[[dict[str, Any], Callable[[str, int, str], None]], dict[str, Any]]
@@ -81,12 +84,10 @@ class JobManager:
         self.worker_count = max(1, worker_count)
         self.discarder = discarder
         self.state_path = state_path
-        # Capacity is enforced against live queued records under self.lock. An
-        # unbounded transport queue prevents cancelled IDs from causing false
-        # queue-full responses before workers have consumed those stale IDs.
-        self.queue: Queue[str] = Queue()
+        self.queue: deque[str] = deque()
         self.records: dict[str, JobRecord] = {}
         self.lock = Lock()
+        self.available = Condition(self.lock)
         self.stop_event = Event()
         self.workers: list[Thread] = []
         self._restored = False
@@ -107,13 +108,10 @@ class JobManager:
                 worker.start()
 
     def stop(self, timeout: float = 3.0) -> None:
-        self.stop_event.set()
-        workers = list(self.workers)
-        deadline = time.monotonic() + timeout
-        for worker in workers:
-            if worker.is_alive():
-                worker.join(max(0.0, deadline - time.monotonic()))
         with self.lock:
+            self.stop_event.set()
+            self.available.notify_all()
+            workers = list(self.workers)
             abandoned = []
             for item in self.records.values():
                 if item.status != "queued":
@@ -126,8 +124,13 @@ class JobManager:
                 item.done_event.set()
                 self._persist_locked(item)
                 abandoned.append(dict(item.request))
+            self.queue.clear()
         for request in abandoned:
             self._discard(request)
+        deadline = time.monotonic() + timeout
+        for worker in workers:
+            if worker.is_alive():
+                worker.join(max(0.0, deadline - time.monotonic()))
 
     def submit(
         self,
@@ -161,10 +164,11 @@ class JobManager:
                 raise JobQueueFull
             self.records[record.job_id] = record
             self._persist_locked(record)
-        self.queue.put_nowait(record.job_id)
-        payload = self.get(record.job_id, owner_id=owner_id)
-        payload["reused"] = False
-        return payload
+            self.queue.append(record.job_id)
+            self.available.notify()
+            payload = self._public_locked(record)
+            payload["reused"] = False
+            return payload
 
     def submit_completed(
         self,
@@ -251,6 +255,7 @@ class JobManager:
             if record is None or (owner_id is not None and record.owner_id != owner_id):
                 raise JobNotFound
             if record.status == "queued":
+                self.queue.remove(job_id)
                 record.status = "cancelled"
                 record.stage = "cancelled"
                 record.progress = 0
@@ -327,12 +332,7 @@ class JobManager:
             LOGGER.error("caption job resource cleanup failed error_type=%s", type(exc).__name__)
 
     def _public_locked(self, record: JobRecord) -> dict[str, Any]:
-        queued_ids = [
-            item.job_id
-            for item in sorted(self.records.values(), key=lambda item: item.created_at)
-            if item.status == "queued"
-        ]
-        position = queued_ids.index(record.job_id) + 1 if record.job_id in queued_ids else 0
+        position = self.queue.index(record.job_id) + 1 if record.job_id in self.queue else 0
         payload: dict[str, Any] = {
             "id": record.job_id,
             "status": record.status,
@@ -384,15 +384,14 @@ class JobManager:
             self._persist_locked(record)
 
     def _run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                job_id = self.queue.get(timeout=0.5)
-            except Empty:
-                continue
-            with self.lock:
+        while True:
+            with self.available:
+                self.available.wait_for(lambda: self.queue or self.stop_event.is_set())
+                if self.stop_event.is_set():
+                    return
+                job_id = self.queue.popleft()
                 record = self.records.get(job_id)
-                if record is None or record.status == "cancelled":
-                    self.queue.task_done()
+                if record is None or record.status != "queued":
                     continue
                 record.status = "running"
                 record.stage = "starting"
@@ -445,10 +444,9 @@ class JobManager:
                         record.updated_at = time.time()
                         record.done_event.set()
                         self._persist_locked(record)
-            finally:
-                self.queue.task_done()
 
-    def _connect_state(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect_state(self) -> Iterator[sqlite3.Connection]:
         if self.state_path is None:
             raise RuntimeError("job state persistence is disabled")
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -456,23 +454,21 @@ class JobManager:
             os.chmod(self.state_path.parent, 0o700)
         except OSError:
             pass
-        connection = sqlite3.connect(self.state_path, timeout=10)
-        connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY,
-                updated_at REAL NOT NULL,
-                payload_json TEXT NOT NULL
+        with sqlite_connection(self.state_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    updated_at REAL NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        connection.commit()
-        try:
-            os.chmod(self.state_path, 0o600)
-        except OSError:
-            pass
-        return connection
+            try:
+                os.chmod(self.state_path, 0o600)
+            except OSError:
+                pass
+            yield connection
 
     def _persist_locked(self, record: JobRecord) -> None:
         if self.state_path is None:
@@ -600,4 +596,4 @@ class JobManager:
         for job_id in invalid_ids:
             self._delete_persisted_locked(job_id)
         for job_id in reversed(restored_queue):
-            self.queue.put_nowait(job_id)
+            self.queue.append(job_id)

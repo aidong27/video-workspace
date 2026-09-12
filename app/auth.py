@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import os
@@ -8,9 +9,11 @@ import re
 import secrets
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import HTTPException, Request, Response
+
+from .database import sqlite_connection
 
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
@@ -78,14 +81,14 @@ def invite_configured() -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{64}", value))
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     path = auth_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 10000")
-    return connection
+    with sqlite_connection(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        yield connection
 
 
 def initialize_auth_db() -> None:

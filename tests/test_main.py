@@ -470,6 +470,34 @@ class CloudAsrPipelineTests(unittest.TestCase):
 
 
 class ResultCacheTests(unittest.TestCase):
+    def test_non_utf8_cache_is_removed_and_recomputed(self) -> None:
+        canonical = "https://www.bilibili.com/video/BV14jFvzbEvj"
+        request = main.ExtractRequest(input=canonical)
+        path = main.result_cache_path(main.result_cache_key(request, canonical))
+        path.write_bytes(b"\xff\xfe\x00")
+        with patch.object(main, "extract_subtitle_uncached", return_value=(
+            [main.SubtitleEntry(0, 1, "恢复结果")], {"title": "test"}
+        )) as extract:
+            entries, _ = main.extract_subtitle_data(request)
+        extract.assert_called_once()
+        self.assertEqual(entries[0].text, "恢复结果")
+        self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
+
+    def test_cache_cleanup_removes_invalid_encoding(self) -> None:
+        path = main.result_cache_path("b" * 64)
+        path.write_bytes(b"\xff\x80")
+        self.assertEqual(main.cleanup_result_cache(), 1)
+        self.assertFalse(path.exists())
+
+    def test_non_finite_cache_times_are_not_used_for_partial_result(self) -> None:
+        for invalid in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=invalid):
+                key = "a" * 64
+                main.save_cached_result(key, [main.SubtitleEntry(0, 1, "valid"),
+                                             main.SubtitleEntry(invalid, 2, "invalid")], {})
+                self.assertIsNone(main.load_cached_result(key))
+                self.assertFalse(main.result_cache_path(key).exists())
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.original_dir = main.RESULT_CACHE_DIR

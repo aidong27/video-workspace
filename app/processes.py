@@ -44,7 +44,8 @@ class LimitedStreamCapture:
             return
 
     def finish(self, timeout: float = 2.0) -> None:
-        self._thread.join(timeout)
+        if self._thread.ident is not None:
+            self._thread.join(timeout)
         if self._thread.is_alive() and self.stream is not None:
             try:
                 self.stream.close()
@@ -214,14 +215,19 @@ def run_managed_process(
         cwd=cwd,
         env=dict(env) if env is not None else None,
     )
-    stdout_capture = LimitedStreamCapture(process.stdout, output_limit).start()
-    stderr_capture = LimitedStreamCapture(process.stderr, output_limit).start()
+    stdout_capture = LimitedStreamCapture(process.stdout, output_limit)
+    stderr_capture = LimitedStreamCapture(process.stderr, output_limit)
     timed_out = False
     try:
+        stdout_capture.start()
+        stderr_capture.start()
         process.wait(timeout=max(0.1, timeout))
     except subprocess.TimeoutExpired:
         timed_out = True
         terminate_process(process)
+    except BaseException:
+        terminate_process(process)
+        raise
     finally:
         stdout_capture.finish()
         stderr_capture.finish()

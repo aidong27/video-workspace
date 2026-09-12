@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -10,7 +11,9 @@ import re
 import secrets
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Iterator
+
+from ..database import sqlite_connection
 
 
 _FAILURE_LABEL_LIMIT = 50
@@ -153,11 +156,11 @@ class UsageLedger:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with sqlite_connection(self.path, isolation_level=None) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            yield connection
 
     @staticmethod
     def owner_hash(owner_key: str) -> str:

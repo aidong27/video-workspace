@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f7f8fa">
   <meta name="description" content="面向 B站、抖音与本地视频的字幕和媒体提取工作台">
   <title>字幕工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260905-1">
-  <script src="/static/app.js?v=20260905-1" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260912-1">
+  <script src="/static/app.js?v=20260912-1" defer></script>
 </head>
 <body class="view-compose">
   <header class="topbar">
@@ -591,7 +591,14 @@
         <div class="output-shell" id="output-shell" hidden>
           <div class="output-toolbar">
             <div class="output-stats">
-              <span id="output-format-label">TXT</span>
+              <span id="output-format-label" hidden>TXT</span>
+              <select id="result-format" class="result-format" aria-label="结果格式" title="结果格式">
+                <option value="txt">TXT</option>
+                <option value="srt">SRT</option>
+                <option value="vtt">VTT</option>
+                <option value="markdown">Markdown</option>
+                <option value="json">JSON</option>
+              </select>
               <span id="output-stats-label"></span>
             </div>
             <div class="output-tools">
@@ -602,7 +609,7 @@
                   <path d="m21 21-4.3-4.3"></path>
                 </svg>
                 <input id="result-search" type="search" maxlength="80" autocomplete="off" placeholder="查找字幕">
-                <span id="search-count"></span>
+                <span id="search-count" aria-live="polite"></span>
               </label>
               <button class="icon-button output-icon-button active" id="toggle-wrap" type="button" title="切换自动换行" aria-label="切换自动换行" aria-pressed="true">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">

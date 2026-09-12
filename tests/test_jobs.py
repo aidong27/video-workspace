@@ -1,4 +1,5 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import time
 from threading import Event
@@ -20,6 +21,59 @@ def wait_for_terminal(manager: JobManager, job_id: str, timeout: float = 2.0):
 
 
 class JobManagerTests(unittest.TestCase):
+    def test_cancelled_ids_do_not_accumulate_behind_busy_worker(self) -> None:
+        started, release = Event(), Event()
+        processed = []
+
+        def processor(payload, _update):
+            processed.append(payload["value"])
+            started.set()
+            release.wait(2)
+            return payload
+
+        manager = JobManager(processor, max_pending=2, max_records=10)
+        manager.start()
+        try:
+            manager.submit({"value": "running"})
+            self.assertTrue(started.wait(1))
+            for index in range(250):
+                job = manager.submit({"value": index})
+                manager.cancel(job["id"])
+                self.assertEqual(len(manager.queue), 0)
+            final = manager.submit({"value": "final"})
+            self.assertEqual(final["queue_position"], 1)
+            release.set()
+            self.assertEqual(wait_for_terminal(manager, final["id"])["status"], "completed")
+            self.assertEqual(processed, ["running", "final"])
+        finally:
+            release.set()
+            manager.stop()
+
+    def test_concurrent_submissions_and_workers_execute_exactly_once(self) -> None:
+        processed = []
+        manager = JobManager(lambda payload, update: processed.append(payload["value"]) or payload,
+                             max_pending=100, worker_count=3)
+        manager.start()
+        try:
+            with ThreadPoolExecutor(max_workers=8) as submitters:
+                jobs = list(submitters.map(lambda i: manager.submit({"value": i}), range(60)))
+            for job in jobs:
+                self.assertEqual(manager.wait(job["id"], timeout=2)["status"], "completed")
+            self.assertEqual(sorted(processed), list(range(60)))
+            self.assertEqual(len(manager.queue), 0)
+        finally:
+            manager.stop()
+
+    def test_queue_positions_follow_fifo_after_cancellation(self) -> None:
+        manager = JobManager(lambda payload, update: payload, max_pending=3)
+        first, middle, last = [manager.submit({"value": value}) for value in range(3)]
+        manager.cancel(middle["id"])
+        self.assertEqual(manager.get(last["id"])["queue_position"], 2)
+        self.assertEqual(manager.get(first["id"])["queue_position"], 1)
+        manager.stop()
+        self.assertEqual(len(manager.queue), 0)
+        self.assertEqual(manager.get(last["id"])["status"], "cancelled")
+
     def test_internal_failure_log_does_not_echo_exception_details(self) -> None:
         def processor(_payload, _update):
             raise RuntimeError("secret at /tmp/private/video.mp4")

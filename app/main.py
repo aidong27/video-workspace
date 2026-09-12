@@ -1798,9 +1798,11 @@ def deserialize_entries(items: Any) -> list[SubtitleEntry]:
             continue
         try:
             text = str(item.get("text") or "").strip()
-            if text:
-                entries.append(SubtitleEntry(float(item.get("start") or 0), float(item.get("end") or 0), text))
-        except (TypeError, ValueError):
+            start = float(item.get("start") or 0)
+            end = float(item.get("end") or 0)
+            if text and math.isfinite(start) and math.isfinite(end):
+                entries.append(SubtitleEntry(start, end, text))
+        except (TypeError, ValueError, OverflowError):
             continue
     return entries
 
@@ -1819,7 +1821,7 @@ def load_cached_result(key: str, now: float | None = None) -> tuple[list[Subtitl
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         path.unlink(missing_ok=True)
         return None
     except OSError:
@@ -1829,7 +1831,7 @@ def load_cached_result(key: str, now: float | None = None) -> tuple[list[Subtitl
         return None
     entries = deserialize_entries(payload.get("entries"))
     metadata = payload.get("metadata")
-    if not entries or not isinstance(metadata, dict):
+    if not entries or len(entries) != len(payload["entries"]) or not isinstance(metadata, dict):
         path.unlink(missing_ok=True)
         return None
     try:
@@ -1882,7 +1884,7 @@ def cleanup_result_cache(now: float | None = None) -> int:
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             payload = None
         if not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION:
             try:
@@ -2634,7 +2636,7 @@ def rendered_raw_content(meta: dict[str, Any], output_format: str) -> str | None
 def public_result_payload(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         return {}
-    payload = copy.deepcopy(result)
+    payload = copy.deepcopy({key: value for key, value in result.items() if not key.startswith("_")})
     metadata = public_result_metadata(payload.get("metadata"))
     if "metadata" in payload:
         payload["metadata"] = metadata
@@ -3453,6 +3455,7 @@ def burned_subtitle_ocr_worker(
             f"crop=iw:trunc(ih*{crop_height:.4f}/2)*2:0:trunc(ih*{OCR_CROP_TOP_RATIO:.4f}/2)*2"
         )
         total_frames = min(OCR_MAX_FRAMES, max(1, int(math.ceil(duration * OCR_SAMPLE_FPS))))
+        ffmpeg_threads = str(min(4, OCR_CPU_THREADS))
         ffmpeg_process = subprocess.Popen(
             [
                 shutil.which("ffmpeg") or "ffmpeg",
@@ -3462,9 +3465,13 @@ def burned_subtitle_ocr_worker(
                 "-nostdin",
                 "-protocol_whitelist",
                 LOCAL_MEDIA_PROTOCOL_WHITELIST,
+                "-threads",
+                ffmpeg_threads,
                 "-i",
                 media_path,
                 "-an",
+                "-filter_threads",
+                ffmpeg_threads,
                 "-vf",
                 video_filter,
                 "-frames:v",
@@ -3475,6 +3482,8 @@ def burned_subtitle_ocr_worker(
                 "image2pipe",
                 "-vcodec",
                 "mjpeg",
+                "-threads",
+                ffmpeg_threads,
                 "pipe:1",
             ],
             stdout=subprocess.PIPE,
@@ -3483,16 +3492,27 @@ def burned_subtitle_ocr_worker(
         stderr_capture = LimitedStreamCapture(ffmpeg_process.stderr, PROCESS_ERROR_OUTPUT_BYTES).start()
         result_queue.put({"kind": "started", "ffmpeg_pid": ffmpeg_process.pid})
         frames: list[dict[str, Any]] = []
+        previous_digest = None
+        previous_lines: list[dict[str, Any]] = []
+        reused_frames = 0
         if ffmpeg_process.stdout is None:
             raise RuntimeError("ffmpeg did not expose an OCR frame stream")
         for index, image in enumerate(iter_mjpeg_images(ffmpeg_process.stdout)):
             if index >= OCR_MAX_FRAMES:
                 break
-            try:
-                result = engine(image)
-                lines = ocr_lines_from_result(result)
-            except Exception:
-                lines = []
+            digest = hashlib.sha256(image).digest()
+            # Exact duplicates can reuse recognition without dropping timeline samples.
+            if digest == previous_digest:
+                lines = previous_lines
+                reused_frames += 1
+            else:
+                try:
+                    result = engine(image)
+                    lines = ocr_lines_from_result(result)
+                    previous_digest, previous_lines = digest, lines
+                except Exception:
+                    lines = []
+                    previous_digest = None
             frames.append({"time": index / OCR_SAMPLE_FPS, "lines": lines})
             if index % 20 == 0:
                 result_queue.put({"kind": "progress", "processed": index + 1, "total": total_frames})
@@ -3501,7 +3521,7 @@ def burned_subtitle_ocr_worker(
         except subprocess.TimeoutExpired:
             terminate_process(ffmpeg_process)
             return_code = int(ffmpeg_process.returncode or -1)
-        if return_code != 0 and not frames:
+        if return_code != 0:
             error = stderr_capture.text() if stderr_capture is not None else ""
             raise RuntimeError(f"ffmpeg frame extraction failed with exit code {return_code}: {error}")
         entries = build_ocr_entries(frames, OCR_SAMPLE_FPS)
@@ -3512,6 +3532,7 @@ def burned_subtitle_ocr_worker(
                 "entries": [(entry.start, entry.end, entry.text) for entry in entries],
                 "meta": {
                     "ocr_frames": len(frames),
+                    "ocr_reused_frames": reused_frames,
                     "ocr_sample_fps": OCR_SAMPLE_FPS,
                     "ocr_crop_top_ratio": OCR_CROP_TOP_RATIO,
                     "ocr_engine": "RapidOCR PP-OCRv6",
@@ -6610,21 +6631,29 @@ def extract_uploaded_subtitle_data(req: UploadJobRequest) -> tuple[list[Subtitle
     return entries, meta
 
 
-def upload_extraction_payload(req: UploadJobRequest) -> dict[str, Any]:
-    entries, meta = extract_uploaded_subtitle_data(req)
-    content = render_entries(entries, req.format, meta)
+def subtitle_result_payload(
+    entries: list[SubtitleEntry], meta: dict[str, Any], output_format: str
+) -> dict[str, Any]:
+    fmt = "markdown" if output_format == "md" else output_format
     payload = {
         "ok": True,
-        "format": req.format,
-        "filename": safe_filename(meta.get("title"), req.format),
-        "content_type": content_type_for(req.format),
+        "format": output_format,
+        "filename": safe_filename(meta.get("title"), fmt),
+        "content_type": content_type_for(fmt),
         "metadata": meta,
-        "content": content,
+        "content": render_entries(entries, fmt, meta),
+        # Retained only in the owned job record, never in public API responses.
+        "_entries": [{"start": e.start, "end": e.end, "text": e.text} for e in entries],
     }
-    raw_content = rendered_raw_content(meta, req.format)
+    raw_content = rendered_raw_content(meta, fmt)
     if raw_content is not None:
         payload["raw_content"] = raw_content
     return payload
+
+
+def upload_extraction_payload(req: UploadJobRequest) -> dict[str, Any]:
+    entries, meta = extract_uploaded_subtitle_data(req)
+    return subtitle_result_payload(entries, meta, req.format)
 
 
 def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
@@ -6646,18 +6675,7 @@ def cached_upload_payload(req: UploadJobRequest) -> dict[str, Any] | None:
     apply_upload_metadata(meta, req)
     meta["entry_count"] = len(entries)
     meta["character_count"] = sum(len(entry.text) for entry in entries)
-    payload = {
-        "ok": True,
-        "format": req.format,
-        "filename": safe_filename(meta.get("title"), req.format),
-        "content_type": content_type_for(req.format),
-        "metadata": meta,
-        "content": render_entries(entries, req.format, meta),
-    }
-    raw_content = rendered_raw_content(meta, req.format)
-    if raw_content is not None:
-        payload["raw_content"] = raw_content
-    return payload
+    return subtitle_result_payload(entries, meta, req.format)
 
 
 def extraction_http_error(req: ExtractRequest, exc: ExtractionFailure, failures: list[dict[str, Any]]) -> HTTPException:
@@ -6804,19 +6822,8 @@ def safe_filename(title: str | None, fmt: str) -> str:
 
 
 def extraction_payload(req: ExtractRequest) -> dict[str, Any]:
-    content, meta, fmt = extract_subtitle(req)
-    payload = {
-        "ok": True,
-        "format": fmt,
-        "filename": safe_filename(meta.get("title"), fmt),
-        "content_type": content_type_for(fmt),
-        "metadata": meta,
-        "content": content,
-    }
-    raw_content = rendered_raw_content(meta, fmt)
-    if raw_content is not None:
-        payload["raw_content"] = raw_content
-    return payload
+    entries, meta = extract_subtitle_data(req)
+    return subtitle_result_payload(entries, meta, req.format)
 
 
 def cached_extraction_payload(
@@ -6856,19 +6863,7 @@ def cached_extraction_payload(
     meta["elapsed_seconds"] = round(time.monotonic() - started, 3)
     meta["force_refresh"] = False
     meta.setdefault("platform", detect_platform(canonical))
-    content = render_entries(entries, req.format, meta)
-    payload = {
-        "ok": True,
-        "format": req.format,
-        "filename": safe_filename(meta.get("title"), req.format),
-        "content_type": content_type_for(req.format),
-        "metadata": meta,
-        "content": content,
-    }
-    raw_content = rendered_raw_content(meta, req.format)
-    if raw_content is not None:
-        payload["raw_content"] = raw_content
-    return payload
+    return subtitle_result_payload(entries, meta, req.format)
 
 
 def _process_queued_job(
@@ -8228,8 +8223,7 @@ async def api_create_upload_job(
             discard_upload_payload(payload)
 
 
-@app.get("/api/jobs/{job_id}")
-def api_get_job(job_id: str, request: Request) -> JSONResponse:
+def owned_job(job_id: str, request: Request) -> dict[str, Any]:
     owner_id, _, _ = media_request_owner(request, create_guest=False)
     try:
         job = JOB_MANAGER.get(job_id, owner_id=owner_id)
@@ -8243,7 +8237,36 @@ def api_get_job(job_id: str, request: Request) -> JSONResponse:
                 "retryable": True,
             },
         ) from exc
+    return job
+
+
+@app.get("/api/jobs/{job_id}")
+def api_get_job(job_id: str, request: Request) -> JSONResponse:
+    job = owned_job(job_id, request)
     return JSONResponse(public_job_payload(job), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/jobs/{job_id}/result")
+def api_export_job_result(
+    job_id: str,
+    request: Request,
+    output_format: Literal["txt", "srt", "json", "markdown", "md", "vtt"] = Query("txt", alias="format"),
+) -> JSONResponse:
+    job = owned_job(job_id, request)
+    result = job.get("result")
+    if job.get("status") != "completed" or not isinstance(result, dict):
+        raise HTTPException(409, detail={
+            "code": "job_not_ready", "reason": "job_not_ready",
+            "message": "任务尚未完成，暂时无法导出。", "retryable": True,
+        })
+    entries = deserialize_entries(result.get("_entries"))
+    if not entries:
+        raise HTTPException(410, detail={
+            "code": "result_unavailable", "reason": "result_unavailable",
+            "message": "该任务没有可转换的字幕结果，已保留当前预览。", "retryable": False,
+        })
+    payload = subtitle_result_payload(entries, result.get("metadata") or {}, output_format)
+    return JSONResponse(public_result_payload(payload), headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/artifacts/{artifact_token}")

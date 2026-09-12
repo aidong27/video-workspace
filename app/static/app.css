@@ -2448,14 +2448,38 @@ body[data-operation="audio"] .empty-document { color: var(--green); }
   font-weight: 820;
 }
 
+.result-format {
+  width: 120px;
+  height: 34px;
+  flex: 0 0 120px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--blue);
+  background-color: var(--panel);
+  font-size: 13px;
+  font-weight: 660;
+}
+
+.output-shell[aria-busy="true"] pre {
+  opacity: 0.65;
+}
+
+.status-panel.reconnecting {
+  border-color: var(--line);
+}
+
 .output-tools {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   align-items: center;
   gap: 6px;
 }
 
 .result-search {
   display: flex;
+  min-width: 0;
   width: 180px;
   height: 34px;
   align-items: center;
@@ -2478,6 +2502,7 @@ body[data-operation="audio"] .empty-document { color: var(--green); }
 }
 
 .result-search input {
+  width: 0;
   min-width: 0;
   flex: 1;
   padding: 0;
@@ -2501,9 +2526,15 @@ body[data-operation="audio"] .empty-document { color: var(--green); }
 .output-icon-button {
   width: 34px;
   height: 34px;
-  flex-basis: 34px;
+  flex: 0 0 34px;
   border-color: var(--line);
   background: var(--panel);
+}
+
+.output-tools .version-toggle {
+  height: 34px;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .output-icon-button .icon {
@@ -3226,6 +3257,12 @@ body.app-ready .result-pane {
     min-height: 23px;
     justify-content: space-between;
     padding: 0 4px;
+  }
+
+  .result-format {
+    width: 132px;
+    flex-basis: 132px;
+    font-size: 16px;
   }
 
   .output-tools {
