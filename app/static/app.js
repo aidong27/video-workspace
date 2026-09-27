@@ -130,7 +130,16 @@
     mediaFileDetail: $("media-file-detail"),
     recentSection: $("recent-section"),
     recentList: $("recent-list"),
-    clearHistory: $("clear-history"),
+    refreshHistory: $("refresh-history"),
+    openHistory: $("open-history"),
+    closeHistory: $("close-history"),
+    historyDialog: $("history-dialog"),
+    historyDialogList: $("history-dialog-list"),
+    historyCaption: $("history-caption"),
+    historyDialogCaption: $("history-dialog-caption"),
+    retryHistory: $("retry-history"),
+    resultExpiry: $("result-expiry"),
+    settingsSummary: $("settings-summary"),
     loginSection: $("login-section"),
     loginStart: $("login-start"),
     loginStatus: $("login-status"),
@@ -167,6 +176,9 @@
     capabilities: null,
     healthLoading: false,
     history: [],
+    historyError: false,
+    historyController: null,
+    retentionSeconds: 86400,
     uploadMaxBytes: 512 * 1024 * 1024,
     uploadExtensions: [],
     mediaEnabled: true,
@@ -329,6 +341,7 @@
   }
 
   function savePreferences() {
+    updateSettingsSummary();
     if (!state.preferencesLoaded) return;
     const value = {
       operation: selectedOperation(),
@@ -350,18 +363,9 @@
     }
   }
 
-  function loadHistory(userId) {
+  function removeLegacyHistory(userId) {
     try {
-      const value = JSON.parse(localStorage.getItem(historyStorageKey(userId)) || "[]");
-      return Array.isArray(value) ? value.slice(0, 8) : [];
-    } catch (_) {
-      return [];
-    }
-  }
-
-  function saveHistory() {
-    try {
-      localStorage.setItem(historyStorageKey(storageOwnerKey()), JSON.stringify(state.history.slice(0, 8)));
+      localStorage.removeItem(historyStorageKey(userId));
     } catch (_) {
       return;
     }
@@ -434,7 +438,7 @@
       clearActiveJob();
       return;
     }
-    if (!saved || !saved.jobId || !saved.payload || Date.now() - Number(saved.savedAt || 0) > 2 * 60 * 60 * 1000) {
+    if (!saved || !saved.jobId || !saved.payload || Date.now() - Number(saved.savedAt || 0) > 86400 * 1000) {
       clearActiveJob();
       return;
     }
@@ -581,7 +585,8 @@
         state.user = null;
         applyAccessState();
         loadPreferences("guest");
-        state.history = loadHistory("guest");
+        removeLegacyHistory("guest");
+        state.history = [];
         renderHistory();
         resumeActiveJob();
         return false;
@@ -600,7 +605,8 @@
       elements.accountTrigger.disabled = false;
       elements.accountArea.setAttribute("aria-busy", "false");
       loadPreferences(data.user.id);
-      state.history = loadHistory(data.user.id);
+      removeLegacyHistory(data.user.id);
+      loadHistory();
       renderHistory();
       if (state.jobId && state.busy) saveActiveJob();
       else resumeActiveJob();
@@ -869,6 +875,7 @@
   }
 
   function syncInputMode() {
+    updateSettingsSummary();
     let operation = selectedOperation();
     if (state.guest && operation === "subtitle") {
       const videoRadio = elements.form.querySelector('input[name="operation"][value="video"]');
@@ -922,7 +929,7 @@
   }
 
   function syncEmptyState() {
-    if (state.current || state.busy || ["error", "cancelled"].includes(elements.resultPane.dataset.state)) return;
+    if (state.current || state.busy || ["error", "cancelled", "expired"].includes(elements.resultPane.dataset.state)) return;
     const operation = selectedOperation();
     const label = operation === "video" ? "视频" : operation === "audio" ? "音频" : "字幕";
     elements.idleTitle.textContent = `尚无${label}`;
@@ -941,12 +948,14 @@
     elements.mediaResult.hidden = true;
     elements.metadataStrip.hidden = true;
     elements.notice.hidden = true;
+    elements.resultExpiry.hidden = true;
     elements.retryTask.hidden = true;
     elements.output.textContent = "";
     elements.resultKicker.textContent = "任务结果";
     elements.idleOutput.hidden = false;
     elements.idleOutput.classList.remove("processing");
     syncEmptyState();
+    renderHistory();
   }
 
   function setInputMode(value) {
@@ -971,6 +980,12 @@
       state.capabilities.features
       && state.capabilities.features.local_processing
     );
+  }
+
+  function updateSettingsSummary() {
+    elements.settingsSummary.hidden = selectedOperation() !== "subtitle";
+    const language = elements.lang.options[elements.lang.selectedIndex];
+    elements.settingsSummary.textContent = `${language ? language.textContent : "中文"} · ${elements.format.value.toUpperCase()}`;
   }
 
   function syncPrecisionOptions() {
@@ -1250,6 +1265,7 @@
     elements.retryAccurate.hidden = busy || elements.retryAccurate.hidden;
     elements.copyResult.hidden = Boolean(state.current && state.current.kind === "media");
     syncInputMode();
+    renderHistory();
     if (state.elapsedTimer) clearInterval(state.elapsedTimer);
     state.elapsedTimer = null;
     if (!busy) {
@@ -1266,6 +1282,7 @@
   }
 
   function showStatus(kind, title, detail, progress, mark) {
+    elements.resultExpiry.hidden = true;
     elements.resultPane.dataset.state = kind || "idle";
     elements.retryTask.hidden = kind !== "error";
     elements.retryTask.textContent = "返回任务设置";
@@ -1407,7 +1424,7 @@
   }
 
   function shouldOfferAccurateRetry(meta, payload) {
-    if (!payload || payload.kind === "upload" || payload.kind === "media") return false;
+    if (!payload || !payload.input || payload.kind === "upload" || payload.kind === "media") return false;
     if (payload.quality === "fast") return true;
     if (meta.track_source_type === "platform_ai") return true;
     if (meta.quality_warning) return true;
@@ -1415,17 +1432,18 @@
     return Number(meta.repeated_segment_ratio || 0) >= 0.1;
   }
 
-  function renderResult(data, payload, jobId) {
+  function renderResult(data, payload, jobId, expiresAt) {
     payload = payload || {};
     elements.resultPane.dataset.state = "complete";
     elements.retryTask.hidden = true;
     if (data.kind === "media" || data.download_url) {
-      renderMediaResult(data, payload);
+      renderMediaResult(data, payload, jobId, expiresAt);
       return;
     }
     state.current = {
       kind: "subtitle",
       resultJobId: jobId || null,
+      expiresAt: Number(expiresAt || 0),
       content: data.content || "",
       rawContent: data.raw_content || "",
       showingRaw: false,
@@ -1466,13 +1484,16 @@
     elements.retryAccurate.hidden = !shouldOfferAccurateRetry(meta, payload);
     elements.resultActions.hidden = false;
     elements.forceRefresh.checked = false;
-    if (payload.kind !== "upload") addHistory(payload, meta);
+    updateResultExpiry();
+    loadHistory();
     setMobileView("result");
   }
 
-  function renderMediaResult(data, payload) {
+  function renderMediaResult(data, payload, jobId, expiresAt) {
     state.current = {
       kind: "media",
+      resultJobId: jobId || null,
+      expiresAt: Number(expiresAt || 0),
       filename: data.filename || (data.media_type === "audio" ? "audio.mp3" : "video.mp4"),
       contentType: data.content_type || "application/octet-stream",
       downloadUrl: data.download_url || "",
@@ -1502,71 +1523,153 @@
     elements.copyResult.hidden = true;
     elements.resultActions.hidden = false;
     elements.forceRefresh.checked = false;
-    addHistory(payload, meta);
+    updateResultExpiry();
+    loadHistory();
     setMobileView("result");
   }
 
-  function addHistory(payload, meta) {
-    const operation = payload.kind === "media" ? payload.media_type : "subtitle";
-    const sourceId = meta.id || payload.input;
-    const id = `${sourceId}:${operation}`;
-    const item = {
-      id,
-      input: payload.input,
-      title: meta.title || sourceId,
-      operation,
-      source: payload.source,
-      quality: payload.quality || "balanced",
-      asrMode: payload.asr_mode || "auto",
-      embeddedSubtitles: Boolean(payload.embedded_subtitles),
-      format: payload.format || (operation === "audio" ? "mp3" : "mp4"),
-      lang: payload.lang || "",
-      platform: meta.platform || detectPlatform(payload.input),
-      time: Date.now()
-    };
-    state.history = [item].concat(state.history.filter((entry) => entry.id !== id)).slice(0, 8);
-    saveHistory();
-    renderHistory();
+  function updateResultExpiry() {
+    const current = state.current;
+    if (!current || !Number.isFinite(current.expiresAt) || !current.expiresAt || state.busy) {
+      elements.resultExpiry.hidden = true;
+      return;
+    }
+    if (current.expiresAt * 1000 <= Date.now()) {
+      state.current = null;
+      elements.output.textContent = "";
+      elements.resultActions.hidden = true;
+      showStatus("expired", "结果已过期", "已超过保留时间，请重新提交任务。", NaN, "!");
+      elements.idleOutput.hidden = true;
+      elements.retryTask.hidden = false;
+      elements.resultTitle.textContent = "结果已过期";
+      renderHistory();
+      return;
+    }
+    const deadline = new Intl.DateTimeFormat("zh-CN", {
+      month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false
+    }).format(new Date(current.expiresAt * 1000));
+    elements.resultExpiry.textContent = `${current.kind === "media" ? "下载文件" : "字幕结果"}保留至 ${deadline}`;
+    elements.resultExpiry.hidden = false;
+  }
+
+  async function loadHistory() {
+    if (!state.user) return;
+    if (state.historyController) state.historyController.abort();
+    const controller = new AbortController();
+    state.historyController = controller;
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    elements.refreshHistory.disabled = true;
+    try {
+      const response = await apiFetch("/api/jobs?limit=20", { cache: "no-store", signal: controller.signal });
+      const data = await response.json();
+      if (!response.ok || !Array.isArray(data.jobs)) throw new Error("history_unavailable");
+      if (state.historyController !== controller) return;
+      state.history = data.jobs.filter(item => item && typeof item.id === "string"
+        && typeof item.status === "string" && Number.isFinite(Number(item.created_at)));
+      state.retentionSeconds = Number(data.retention_seconds) > 0 ? Number(data.retention_seconds) : 86400;
+      state.historyError = false;
+    } catch (_) {
+      if (state.historyController !== controller) return;
+      state.historyError = true;
+    } finally {
+      clearTimeout(timeout);
+      if (state.historyController === controller) {
+        state.historyController = null;
+        elements.refreshHistory.disabled = false;
+        renderHistory();
+      }
+    }
+  }
+
+  function setHistoryDialog(open) {
+    elements.historyDialog.hidden = !open;
+    document.body.classList.toggle("dialog-open", open);
+    if (open) {
+      loadHistory();
+      elements.closeHistory.focus();
+    } else if (elements.openHistory.getClientRects().length) {
+      elements.openHistory.focus();
+    }
+  }
+
+  async function openHistoryItem(item) {
+    if (state.busy) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    setBusy(true);
+    try {
+      const response = await apiFetch(`/api/jobs/${encodeURIComponent(item.id)}`, {
+        cache: "no-store", signal: controller.signal
+      });
+      const job = await response.json();
+      if (!response.ok) {
+        if (response.status === 404 || response.status === 410) {
+          state.history = state.history.filter(entry => entry.id !== item.id);
+          throw new Error("这条记录已过期，当前结果未被覆盖。");
+        }
+        throw new Error("暂时无法读取记录，请稍后重试。");
+      }
+      if (!validJobSnapshot(job)) throw new Error("记录暂不可用，请稍后重试。");
+      setHistoryDialog(false);
+      state.currentPayload = { kind: item.kind, media_type: item.media_type };
+      state.current = null;
+      if (["queued", "running"].includes(job.status)) {
+        state.jobId = job.id;
+        setBusy(true, Number(job.created_at) * 1000 || Date.now());
+        saveActiveJob();
+        handleJob(job);
+        pollJob();
+        setMobileView("result");
+      } else {
+        handleJob(job);
+      }
+    } catch (error) {
+      setBusy(false);
+      updateResultExpiry();
+      showToast(error.name === "AbortError" ? "读取记录超时，请重试。" : error.message, true);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   function renderHistory() {
     elements.recentList.textContent = "";
-    elements.recentSection.hidden = state.history.length === 0;
-    state.history.forEach((item) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "recent-item";
-      const platform = document.createElement("span");
-      platform.className = `recent-platform ${item.platform || "bilibili"}`;
-      platform.textContent = platformLabel(item.platform || "bilibili");
-      const title = document.createElement("span");
-      title.className = "recent-title";
-      title.textContent = item.title;
-      const detail = document.createElement("span");
-      detail.className = "recent-detail";
-      detail.textContent = `${String(item.format || "txt").toUpperCase()} · ${new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(item.time)}`;
-      button.append(platform, title, detail);
-      button.addEventListener("click", () => {
-        if (state.busy) return;
-        setSelectedOperation(item.operation || "subtitle");
-        setInputMode("link");
-        elements.input.value = item.input;
-        if ((item.operation || "subtitle") === "subtitle") {
-          elements.format.value = item.format;
-          elements.lang.value = item.lang || "zh";
-          elements.hotwords.value = "";
-          setSelectedSource(item.source || "auto");
-          setSelectedAsrMode(item.asrMode || "auto");
-          elements.embeddedSubtitles.checked = Boolean(item.embeddedSubtitles);
-          syncInputMode();
-        }
-        elements.forceRefresh.checked = false;
-        updatePlatformDetect();
-        schedulePageLookup();
-        submitCurrentForm();
+    elements.historyDialogList.textContent = "";
+    elements.recentSection.hidden = !state.user;
+    elements.openHistory.hidden = !state.user;
+    const caption = `字幕最多保留 ${Math.round(state.retentionSeconds / 3600)} 小时`;
+    elements.historyCaption.textContent = state.historyError ? "记录暂不可用，可刷新重试" : caption;
+    elements.historyDialogCaption.textContent = elements.historyCaption.textContent;
+    state.history = state.history.filter(item => !item.expires_at || item.expires_at * 1000 > Date.now());
+    const labels = { queued: "排队中", running: "处理中", completed: "已完成", failed: "未完成", cancelled: "已取消" };
+    for (const container of [elements.recentList, elements.historyDialogList]) {
+      if (!state.history.length) {
+        const empty = document.createElement("p");
+        empty.className = "history-empty";
+        empty.textContent = state.historyError ? "暂时无法读取记录" : "暂无近期任务";
+        container.append(empty);
+      }
+      state.history.forEach((item) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "recent-item";
+        button.setAttribute("aria-current", String(item.id === (state.current && state.current.resultJobId || state.jobId)));
+        button.disabled = state.busy;
+        button.title = item.title || "视频任务";
+        const platform = document.createElement("span");
+        platform.className = `recent-platform ${["bilibili", "douyin", "upload"].includes(item.platform) ? item.platform : "upload"}`;
+        platform.textContent = item.kind === "media" ? (item.media_type === "audio" ? "音频" : "视频") : "字幕";
+        const title = document.createElement("span");
+        title.className = "recent-title";
+        title.textContent = item.title;
+        const detail = document.createElement("span");
+        detail.className = "recent-detail";
+        detail.textContent = `${labels[item.status] || "未完成"} · ${new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(Number(item.created_at || 0) * 1000))}`;
+        button.append(platform, title, detail);
+        button.addEventListener("click", () => openHistoryItem(item));
+        container.appendChild(button);
       });
-      elements.recentList.appendChild(button);
-    });
+    }
   }
 
   function finishWithError(value, status) {
@@ -1587,6 +1690,7 @@
     setMobileView("result");
     showToast(message, true);
     loadHealth();
+    loadHistory();
   }
 
   function handleJob(job) {
@@ -1619,9 +1723,10 @@
       stopPolling();
       clearActiveJob();
       state.jobId = null;
-      renderResult(job.result || {}, state.currentPayload, job.id);
+      renderResult(job.result || {}, state.currentPayload, job.id, job.expires_at);
       clearUnavailableUploadSelection();
       setBusy(false);
+      updateResultExpiry();
       loadHealth();
       return;
     }
@@ -1637,6 +1742,7 @@
       elements.idleDetail.textContent = "可以修改设置后重新提交";
       setBusy(false);
       loadHealth();
+      loadHistory();
       return;
     }
     if (job.status === "failed") {
@@ -1721,6 +1827,7 @@
   }
 
   async function changeResultFormat() {
+    updateResultExpiry();
     const current = state.current;
     if (!current || current.kind !== "subtitle" || !current.resultJobId || state.busy) return;
     const format = elements.resultFormat.value;
@@ -1736,6 +1843,7 @@
         cache: "no-store", signal: controller.signal
       });
       const data = await response.json().catch(() => ({}));
+      updateResultExpiry();
       if (state.current !== current) return;
       if (!response.ok || typeof data.content !== "string") {
         showToast(response.ok ? "格式转换暂时不可用，已保留当前结果。" : friendlyError(data, response.status), true);
@@ -1961,6 +2069,7 @@
   }
 
   async function copyResult() {
+    updateResultExpiry();
     if (!state.current || state.current.kind === "media") return;
     const content = currentDisplayedContent();
     try {
@@ -1979,6 +2088,7 @@
   }
 
   function downloadResult() {
+    updateResultExpiry();
     if (!state.current) return;
     if (state.current.kind === "media") {
       if (!state.current.downloadUrl) {
@@ -2396,7 +2506,8 @@
   });
   document.addEventListener("keydown", (event) => {
     const dialog = !elements.cloudConfirmDialog.hidden ? elements.cloudConfirmDialog
-      : !elements.passwordDialog.hidden ? elements.passwordDialog : null;
+      : !elements.passwordDialog.hidden ? elements.passwordDialog
+      : !elements.historyDialog.hidden ? elements.historyDialog : null;
     if (event.key === "Tab" && dialog) {
       const controls = Array.from(dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]'))
         .filter((element) => element.getClientRects().length > 0);
@@ -2414,16 +2525,20 @@
     setAccountMenu(false);
     if (!elements.passwordDialog.hidden) setPasswordDialog(false);
     if (!elements.cloudConfirmDialog.hidden) setCloudConfirmDialog(false, false);
+    if (!elements.historyDialog.hidden) setHistoryDialog(false);
   });
-  elements.clearHistory.addEventListener("click", () => {
-    state.history = [];
-    saveHistory();
-    renderHistory();
+  elements.refreshHistory.addEventListener("click", loadHistory);
+  elements.retryHistory.addEventListener("click", loadHistory);
+  elements.openHistory.addEventListener("click", () => setHistoryDialog(true));
+  elements.closeHistory.addEventListener("click", () => setHistoryDialog(false));
+  elements.historyDialog.addEventListener("click", event => {
+    if (event.target === elements.historyDialog) setHistoryDialog(false);
   });
   elements.loginStart.addEventListener("click", startLogin);
   elements.logoutAccount.addEventListener("click", logoutAccount);
   window.addEventListener("online", reconnectJob);
   document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) { updateResultExpiry(); loadHistory(); }
     if (!document.hidden && !state.pollPaused) reconnectJob();
   });
 
@@ -2440,4 +2555,5 @@
 
   initializeApp();
   setInterval(loadHealth, 30000);
+  setInterval(() => { if (!document.hidden) { updateResultExpiry(); renderHistory(); } }, 30000);
 })();

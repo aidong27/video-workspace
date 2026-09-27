@@ -4,6 +4,7 @@ import tempfile
 import time
 from threading import Event
 import unittest
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -21,6 +22,101 @@ def wait_for_terminal(manager: JobManager, job_id: str, timeout: float = 2.0):
 
 
 class JobManagerTests(unittest.TestCase):
+    def test_subtitle_retention_is_absolute_and_media_stays_short_lived(self) -> None:
+        manager = JobManager(lambda payload, update: payload, result_ttl_seconds=3600,
+                             subtitle_ttl_seconds=86400)
+        with patch("app.jobs.time.time", return_value=100000):
+            subtitle = manager.submit_completed({}, {"content": "text"}, owner_id=1)
+            media = manager.submit_completed({"kind": "media"}, {
+                "metadata": {"expires_at": 100000 + 1800}}, owner_id=1)
+            legacy_media = manager.submit_completed({"kind": "media"}, {
+                "metadata": {"artifact_ttl_seconds": 1800}}, owner_id=1)
+        self.assertEqual(subtitle["expires_at"], 186400)
+        self.assertEqual(media["expires_at"], 101800)
+        self.assertEqual(legacy_media["expires_at"], 101800)
+        with patch("app.jobs.time.time", return_value=186399):
+            self.assertEqual(manager.get(subtitle["id"])["expires_at"], 186400)
+            with self.assertRaises(JobNotFound):
+                manager.get(media["id"])
+        with patch("app.jobs.time.time", return_value=186400):
+            with self.assertRaises(JobNotFound):
+                manager.get(subtitle["id"])
+
+    def test_recent_records_are_owned_bounded_and_do_not_include_payloads(self) -> None:
+        manager = JobManager(lambda payload, update: payload)
+        first = manager.submit_completed({"hotwords": "private", "upload_path": "/private"},
+            {"content": "private", "metadata": {"title": "A", "platform": "upload"}}, owner_id=1)
+        manager.submit_completed({}, {"metadata": {"title": "B"}}, owner_id=2)
+        second = manager.submit_completed({}, {"metadata": {"title": "C"}}, owner_id=1)
+        items = manager.recent(1, limit=1)
+        self.assertEqual([item["id"] for item in items], [second["id"]])
+        self.assertEqual({item["id"] for item in manager.recent(1)}, {first["id"], second["id"]})
+        self.assertNotIn("private", str(manager.recent(1)))
+        self.assertNotIn("result", items[0])
+
+    def test_restart_prunes_expired_rows_beyond_restore_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.db"
+            manager = JobManager(lambda payload, update: payload, state_path=path,
+                                 max_records=100, subtitle_ttl_seconds=86400)
+            with patch("app.jobs.time.time", return_value=100000):
+                for _ in range(30):
+                    manager.submit_completed({}, {"content": "old"}, owner_id=1)
+            restored = JobManager(lambda payload, update: payload, state_path=path,
+                                  max_records=10, subtitle_ttl_seconds=86400)
+            with patch("app.jobs.time.time", return_value=186400):
+                restored.start()
+                try:
+                    self.assertEqual(restored.recent(1), [])
+                    with restored._connect_state() as connection:
+                        self.assertEqual(connection.execute("SELECT count(*) FROM jobs").fetchone()[0], 0)
+                finally:
+                    restored.stop()
+
+    def test_pending_jobs_do_not_expire_with_completed_results(self) -> None:
+        manager = JobManager(lambda payload, update: payload)
+        job = manager.submit({})
+        manager.records[job["id"]].updated_at = 1
+        self.assertIsNone(manager.get(job["id"])["expires_at"])
+        self.assertEqual(manager.cleanup(), 0)
+
+    def test_periodic_cleanup_prunes_rows_outside_restore_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.db"
+            manager = JobManager(lambda payload, update: payload, state_path=path, max_records=100)
+            with patch("app.jobs.time.time", return_value=100000):
+                for _ in range(30):
+                    manager.submit_completed({}, {"content": "old"}, owner_id=1)
+                restored = JobManager(lambda payload, update: payload, state_path=path, max_records=10)
+                restored.start()
+            try:
+                self.assertEqual(len(restored.records), 10)
+                with patch("app.jobs.time.time", return_value=103600):
+                    restored.cleanup()
+                with restored._connect_state() as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM jobs").fetchone()[0], 0)
+            finally:
+                restored.stop()
+
+    def test_corrupt_result_metadata_does_not_break_recent_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.db"
+            manager = JobManager(lambda payload, update: payload, state_path=path)
+            good = manager.submit_completed({}, {"content": "good"}, owner_id=1)
+            for malformed in ([1], {"metadata": [1]}):
+                job = manager.submit_completed({}, {"content": "bad"}, owner_id=1)
+                record = manager.records[job["id"]]
+                record.result = malformed
+                manager._persist_locked(record)
+            restored = JobManager(lambda payload, update: payload, state_path=path)
+            restored.start()
+            try:
+                self.assertEqual([item["id"] for item in restored.recent(1)], [good["id"]])
+                with restored._connect_state() as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+            finally:
+                restored.stop()
+
     def test_cancelled_ids_do_not_accumulate_behind_busy_worker(self) -> None:
         started, release = Event(), Event()
         processed = []

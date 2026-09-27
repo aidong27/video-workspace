@@ -663,7 +663,7 @@ class ResultCacheTests(unittest.TestCase):
         main.RESULT_CACHE_MAX_ITEMS = 2
         for index in range(3):
             path = main.RESULT_CACHE_DIR / f"{index}.json"
-            path.write_text(f'{{"version":{main.RESULT_CACHE_VERSION}}}', encoding="utf-8")
+            path.write_text(json.dumps({"version": main.RESULT_CACHE_VERSION, "created_at": time.time()}), encoding="utf-8")
             modified = time.time() - (10 - index)
             os.utime(path, (modified, modified))
         removed = main.cleanup_result_cache()
@@ -676,6 +676,34 @@ class ResultCacheTests(unittest.TestCase):
         removed = main.cleanup_result_cache()
         self.assertEqual(removed, 1)
         self.assertFalse(path.exists())
+
+    def test_cache_reads_do_not_extend_absolute_retention(self) -> None:
+        with patch.object(main.time, "time", return_value=100000):
+            main.save_cached_result("day", [main.SubtitleEntry(0, 1, "text")], {})
+        with patch.object(main, "RESULT_CACHE_TTL_SECONDS", 86400):
+            self.assertIsNotNone(main.load_cached_result("day", now=186399))
+            self.assertEqual(main.load_cached_result("day", now=186399)[2], 86399)
+            self.assertIsNone(main.load_cached_result("day", now=186400))
+        self.assertFalse(main.result_cache_path("day").exists())
+
+    def test_cache_cleanup_uses_creation_time_despite_recent_access(self) -> None:
+        with patch.object(main.time, "time", return_value=100000):
+            main.save_cached_result("day", [main.SubtitleEntry(0, 1, "text")], {})
+        os.utime(main.result_cache_path("day"), None)
+        with patch.object(main, "RESULT_CACHE_TTL_SECONDS", 86400):
+            self.assertEqual(main.cleanup_result_cache(now=186400), 1)
+
+    def test_invalid_cache_creation_time_fails_closed(self) -> None:
+        for created in (None, True, float("nan"), float("inf"), "yesterday", -1):
+            with self.subTest(created=created):
+                with patch.object(main.time, "time", return_value=100000):
+                    main.save_cached_result("badtime", [main.SubtitleEntry(0, 1, "text")], {})
+                path = main.result_cache_path("badtime")
+                data = json.loads(path.read_text())
+                data["created_at"] = created
+                path.write_text(json.dumps(data))
+                self.assertIsNone(main.load_cached_result("badtime"))
+                self.assertFalse(path.exists())
 
     def test_corrupt_cache_file_is_deleted_before_recalculation(self) -> None:
         key = "f" * 64

@@ -112,6 +112,13 @@ curl -b session.cookie -X POST \
 
 The upload endpoint accepts common video containers up to `UPLOAD_MAX_BYTES`. `PUBLIC_UPLOAD_MAX_BYTES` can expose a lower browser-side limit when a reverse proxy or CDN rejects smaller requests (for example, use a value below the edge limit); the API's own hard limit remains `UPLOAD_MAX_BYTES`. ASR requires an audio stream; embedded-subtitle extraction also accepts silent video. The web client sends upload hotwords through the percent-encoded `X-ASR-Hotwords` header so they are not placed in the request URL. The original video is temporary; normalized subtitle entries can remain in the result cache for `RESULT_CACHE_TTL_SECONDS`, allowing the same video to be re-uploaded in another output format without repeating recognition.
 
+Subtitle jobs and recognition caches now default to at most 24 hours. Opening a
+result does not renew its lifetime. `GET /api/jobs?limit=20` lists the signed-in
+user's recent tasks without transcript bodies; opening a completed task or
+switching its export format never submits another transcription. Results show
+their actual expiry time. Video/audio downloads retain their shorter independent
+lifetimes. See [retention and upgrade details](docs/day-retention-upgrade.md).
+
 Request parameters:
 
 - `source`: `auto`, `official`, or `asr`
@@ -131,7 +138,8 @@ Request parameters:
 ```env
 JOB_QUEUE_MAX_PENDING=4
 JOB_WORKER_COUNT=2
-JOB_RESULT_TTL_SECONDS=3600
+TRANSCRIPT_RETENTION_DAYS=1
+JOB_RESULT_TTL_SECONDS=86400
 JOB_STATE_DB_PATH=./var/cache/jobs.db
 CLOUD_ASR_ENABLED=false
 LOCAL_ASR_ENABLED=true
@@ -192,7 +200,7 @@ OCR_MAX_FRAMES=12000
 MIN_FREE_DISK_BYTES=2147483648
 MIN_FREE_DISK_RATIO=0.05
 PROCESS_ERROR_OUTPUT_BYTES=16384
-RESULT_CACHE_TTL_SECONDS=604800
+RESULT_CACHE_TTL_SECONDS=86400
 RESULT_CACHE_MAX_ITEMS=100
 LEGACY_WAIT_TIMEOUT_SECONDS=1200
 OMP_NUM_THREADS=3

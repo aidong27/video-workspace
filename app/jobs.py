@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -76,10 +77,12 @@ class JobManager:
         worker_count: int = 1,
         discarder: JobDiscarder | None = None,
         state_path: Path | None = None,
+        subtitle_ttl_seconds: int | None = None,
     ) -> None:
         self.processor = processor
         self.max_pending = max(1, max_pending)
         self.result_ttl_seconds = max(60, result_ttl_seconds)
+        self.subtitle_ttl_seconds = max(60, subtitle_ttl_seconds or result_ttl_seconds)
         self.max_records = max(10, max_records)
         self.worker_count = max(1, worker_count)
         self.discarder = discarder
@@ -91,6 +94,7 @@ class JobManager:
         self.stop_event = Event()
         self.workers: list[Thread] = []
         self._restored = False
+        self._last_state_prune = float("-inf")
 
     def start(self) -> None:
         with self.lock:
@@ -249,6 +253,7 @@ class JobManager:
             return self._public_locked(record)
 
     def cancel(self, job_id: str, owner_id: int | None = None) -> dict[str, Any]:
+        self.cleanup()
         discarded_request: dict[str, Any] | None = None
         with self.lock:
             record = self.records.get(job_id)
@@ -289,6 +294,48 @@ class JobManager:
                 "running": sum(item.status == "running" for item in owned),
             }
 
+    def recent(self, owner_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        self.cleanup()
+        with self.lock:
+            records = sorted(
+                (item for item in self.records.values() if item.owner_id == owner_id),
+                key=lambda item: item.created_at,
+                reverse=True,
+            )[:max(1, min(50, limit))]
+            items = []
+            for record in records:
+                result = record.result or {}
+                metadata = result.get("metadata") or {}
+                payload = self._public_locked(record)
+                payload.pop("result", None)
+                payload.pop("error", None)
+                payload.pop("error_status", None)
+                payload.update({
+                    "title": str(metadata.get("title") or record.request.get("filename") or "视频任务")[:200],
+                    "platform": str(metadata.get("platform") or ""),
+                    "kind": record.request.get("kind", "subtitle"),
+                    "media_type": record.request.get("media_type"),
+                })
+                items.append(payload)
+            return items
+
+    def _ttl(self, request: dict[str, Any]) -> int:
+        return self.result_ttl_seconds if request.get("kind") == "media" else self.subtitle_ttl_seconds
+
+    def _expires_at(self, record: JobRecord) -> float | None:
+        if record.status not in {"completed", "failed", "cancelled"}:
+            return None
+        expires = record.updated_at + self._ttl(record.request)
+        if record.request.get("kind") == "media" and record.result:
+            metadata = record.result.get("metadata") or {}
+            artifact_expiry = metadata.get("expires_at")
+            artifact_ttl = metadata.get("artifact_ttl_seconds")
+            if artifact_expiry is None and isinstance(artifact_ttl, (float, int)) and artifact_ttl > 0:
+                artifact_expiry = record.updated_at + artifact_ttl
+            if isinstance(artifact_expiry, (float, int)) and math.isfinite(artifact_expiry):
+                expires = min(expires, artifact_expiry)
+        return expires
+
     def cleanup(self) -> int:
         now = time.time()
         removed = 0
@@ -300,7 +347,7 @@ class JobManager:
                 if item.status in {"completed", "failed", "cancelled"}
             ]
             for item in finished:
-                if now - item.updated_at > self.result_ttl_seconds:
+                if now >= self._expires_at(item):
                     self.records.pop(item.job_id, None)
                     self._delete_persisted_locked(item.job_id)
                     discarded.append(dict(item.request))
@@ -319,6 +366,8 @@ class JobManager:
                     self._delete_persisted_locked(item.job_id)
                     discarded.append(dict(item.request))
                     removed += 1
+            if now - self._last_state_prune >= 60 or now < self._last_state_prune:
+                self._prune_persisted_locked(now)
         for request in discarded:
             self._discard(request)
         return removed
@@ -342,6 +391,7 @@ class JobManager:
             "queue_position": position,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
+            "expires_at": self._expires_at(record),
         }
         if record.status == "completed":
             payload["result"] = record.result
@@ -514,10 +564,30 @@ class JobManager:
         except (OSError, sqlite3.Error):
             return
 
+    def _prune_persisted_locked(self, now: float) -> None:
+        if self.state_path is None:
+            return
+        try:
+            with self._connect_state() as connection:
+                # Prune the whole table, not just the bounded in-memory restore window.
+                connection.execute(
+                    """DELETE FROM jobs WHERE CASE WHEN json_valid(payload_json) THEN
+                    json_extract(payload_json, '$.status') IN ('completed','failed','cancelled')
+                    AND updated_at <= ? - CASE
+                      WHEN json_extract(payload_json, '$.request.kind') = 'media' THEN ?
+                      ELSE ? END
+                    ELSE 1 END""",
+                    (now, self.result_ttl_seconds, self.subtitle_ttl_seconds),
+                )
+            self._last_state_prune = now
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.error("job state cleanup failed error_type=%s", type(exc).__name__)
+
     def _restore_locked(self) -> None:
         if self.state_path is None:
             return
         now = time.time()
+        self._prune_persisted_locked(now)
         try:
             with self._connect_state() as connection:
                 rows = connection.execute(
@@ -540,22 +610,30 @@ class JobManager:
                 updated_at = float(payload["updated_at"])
                 status = str(payload["status"])
                 request = payload["request"]
+                created_at = float(payload["created_at"])
+                result = payload.get("result")
                 if not isinstance(request, dict):
                     raise ValueError("invalid request")
-                if status in {"completed", "failed", "cancelled"} and now - updated_at > self.result_ttl_seconds:
+                if not math.isfinite(updated_at) or not math.isfinite(created_at):
+                    raise ValueError("invalid completion time")
+                if result is not None and (not isinstance(result, dict) or not isinstance(result.get("metadata", {}), dict)):
+                    raise ValueError("invalid result")
+                if str(payload["job_id"]) != str(job_id):
+                    raise ValueError("invalid job id")
+                if status in {"completed", "failed", "cancelled"} and now - updated_at >= self._ttl(request):
                     invalid_ids.append(str(job_id))
                     continue
                 record = JobRecord(
                     job_id=str(payload["job_id"]),
                     request=request,
                     owner_id=int(payload["owner_id"]) if payload.get("owner_id") is not None else None,
-                    created_at=float(payload["created_at"]),
+                    created_at=created_at,
                     updated_at=updated_at,
                     status=status,
                     stage=str(payload.get("stage") or status),
                     progress=int(payload.get("progress") or 0),
                     message=str(payload.get("message") or ""),
-                    result=payload.get("result"),
+                    result=result,
                     error=payload.get("error"),
                     error_status=int(payload.get("error_status") or 500),
                     idempotency_key=payload.get("idempotency_key"),

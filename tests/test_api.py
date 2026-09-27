@@ -53,6 +53,9 @@ class ApiIntegrationTests(unittest.TestCase):
         main.MEDIA_ARTIFACT_TTL_SECONDS = 3600
         main.JOB_MANAGER.state_path = root / "cache" / "jobs.db"
         main.JOB_MANAGER._restored = False
+        with main.JOB_MANAGER.lock:
+            main.JOB_MANAGER.records.clear()
+            main.JOB_MANAGER.queue.clear()
         self.original_env = {
             key: os.environ.get(key)
             for key in (
@@ -117,6 +120,37 @@ class ApiIntegrationTests(unittest.TestCase):
         ) = self.original_media_limits
         main.JOB_MANAGER.state_path, main.JOB_MANAGER._restored = self.original_job_state
         self.tmp.cleanup()
+
+    def test_recent_jobs_are_owned_private_and_do_not_restart_work(self) -> None:
+        result = main.subtitle_result_payload([main.SubtitleEntry(0, 1, "hello")],
+                                             {"title": "Saved result", "platform": "bilibili"}, "txt")
+        with patch.object(main, "cached_extraction_payload", return_value=result):
+            job = self.client.post("/api/jobs", json={"input": "BV14jFvzbEvj"}).json()
+        main.JOB_MANAGER.submit_completed({"hotwords": "private"}, result, owner_id=999)
+        with patch.object(main.JOB_MANAGER, "submit") as submit:
+            response = self.client.get("/api/jobs?limit=20")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["cache-control"], "private, no-store")
+            self.assertEqual(response.json()["retention_seconds"], 86400)
+            self.assertEqual([item["id"] for item in response.json()["jobs"]], [job["id"]])
+            self.assertEqual(job["expires_at"], job["updated_at"] + 86400)
+            self.assertNotIn("hello", response.text)
+            self.assertNotIn("private", response.text)
+            self.assertNotIn("_entries", response.text)
+            submit.assert_not_called()
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/api/jobs").status_code, 401)
+
+    def test_expired_subtitle_is_unavailable_in_list_get_and_export(self) -> None:
+        owner = self.client.get("/api/auth/me").json()["user"]["id"]
+        result = main.subtitle_result_payload([main.SubtitleEntry(0, 1, "expired")], {}, "txt")
+        job = main.JOB_MANAGER.submit_completed({}, result, owner_id=owner)
+        main.JOB_MANAGER.records[job["id"]].updated_at = time.time() - 86401
+        self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
+        self.assertEqual(self.client.get(f"/api/jobs/{job['id']}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/jobs/{job['id']}/result").status_code, 404)
+        with main.JOB_MANAGER._connect_state() as database:
+            self.assertIsNone(database.execute("SELECT job_id FROM jobs WHERE job_id = ?", (job["id"],)).fetchone())
 
     def test_job_submission_is_idempotent_and_legacy_get_is_retired(self) -> None:
         result = {
@@ -1103,7 +1137,7 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function submitCurrentForm()", script)
         self.assertIn("function changeAccountPassword(", script)
         self.assertIn("guest_media_disabled", script)
-        self.assertIn("/static/app.js?v=20260912-1", page)
+        self.assertIn("/static/app.js?v=20260927-1", page)
         self.assertIn('id="result-format"', page)
         self.assertIn("function syncRailNavigation(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
@@ -1147,7 +1181,7 @@ class FrontendRecoveryTests(unittest.TestCase):
     def test_user_preferences_exclude_links_and_hotwords(self) -> None:
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
         preference_block = script.split("function savePreferences()", 1)[1].split(
-            "function loadHistory", 1
+            "function removeLegacyHistory", 1
         )[0]
         active_job_block = script.split("function saveActiveJob()", 1)[1].split(
             "function restoreForm", 1

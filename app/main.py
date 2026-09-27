@@ -55,6 +55,7 @@ from app.asr.base import AsrProvider, AsrProviderError, Transcript
 from app.asr.postprocess import normalize_segments
 from app.asr.signing import SignedAudioError, SignedAudioStore
 from app.asr.usage import UsageLedger, UsageLimitExceeded
+from app.maintenance import MaintenanceLoop
 from app.auth import (
     AuthFailure,
     SESSION_COOKIE_NAME,
@@ -276,22 +277,23 @@ ASR_CONCURRENCY_LIMIT = max(
     int(os.getenv("ASR_JOB_CONCURRENCY", os.getenv("ASR_CONCURRENCY_LIMIT", "1"))),
 )
 ASR_TMP_MAX_AGE_SECONDS = max(300, int(os.getenv("ASR_TMP_MAX_AGE_SECONDS", "86400")))
-RESULT_CACHE_TTL_SECONDS = max(
+TRANSCRIPT_RETENTION_SECONDS = max(1, int(os.getenv("TRANSCRIPT_RETENTION_DAYS", "1"))) * 86400
+RESULT_CACHE_TTL_SECONDS = min(TRANSCRIPT_RETENTION_SECONDS, max(
     0,
     int(
         os.getenv(
             "RESULT_CACHE_TTL_SECONDS",
-            str(max(1, int(os.getenv("TRANSCRIPT_RETENTION_DAYS", "7"))) * 86400),
+            str(TRANSCRIPT_RETENTION_SECONDS),
         )
     ),
-)
+))
 RESULT_CACHE_MAX_ITEMS = max(1, int(os.getenv("RESULT_CACHE_MAX_ITEMS", "100")))
 JOB_QUEUE_MAX_PENDING = max(1, int(os.getenv("JOB_QUEUE_MAX_PENDING", "4")))
-JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("JOB_RESULT_TTL_SECONDS", "3600")))
+JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("JOB_RESULT_TTL_SECONDS", "86400")))
 JOB_STATE_DB_PATH = Path(os.getenv("JOB_STATE_DB_PATH", str(ASR_CACHE_DIR / "jobs.db")))
 MEDIA_ARTIFACT_TTL_SECONDS = max(
     60,
-    int(os.getenv("MEDIA_ARTIFACT_TTL_SECONDS", str(JOB_RESULT_TTL_SECONDS))),
+    int(os.getenv("MEDIA_ARTIFACT_TTL_SECONDS", "3600")),
 )
 JOB_MAX_RECORDS = max(10, int(os.getenv("JOB_MAX_RECORDS", "100")))
 JOB_WORKER_COUNT = max(1, int(os.getenv("JOB_WORKER_COUNT", "2")))
@@ -413,6 +415,7 @@ OCR_PIPELINE_VERSION = 1
 ASR_SEMAPHORE = BoundedSemaphore(ASR_CONCURRENCY_LIMIT)
 LEGACY_REQUEST_SEMAPHORE = BoundedSemaphore(max(1, min(2, JOB_WORKER_COUNT)))
 RESULT_CACHE_LOCK = Lock()
+RESULT_CACHE_IO_LOCK = Lock()
 RESULT_KEY_LOCKS: dict[str, ResultKeyLockEntry] = {}
 ASR_WORKER_LOCK = Lock()
 ASR_WORKER_PROCESS: Any = None
@@ -1808,16 +1811,25 @@ def deserialize_entries(items: Any) -> list[SubtitleEntry]:
 
 
 def load_cached_result(key: str, now: float | None = None) -> tuple[list[SubtitleEntry], dict[str, Any], float] | None:
+    with RESULT_CACHE_IO_LOCK:
+        return _load_cached_result(key, now)
+
+
+def cache_age(payload: Any, now: float) -> float | None:
+    created = payload.get("created_at") if isinstance(payload, dict) else None
+    if isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created):
+        return None
+    if created <= 0 or created > now + 60:
+        return None
+    return max(0.0, now - created)
+
+
+def _load_cached_result(key: str, now: float | None = None) -> tuple[list[SubtitleEntry], dict[str, Any], float] | None:
     if not result_cache_enabled():
         return None
     path = result_cache_path(key)
     current = time.time() if now is None else now
     try:
-        stat = path.stat()
-        age = max(0.0, current - stat.st_mtime)
-        if age > RESULT_CACHE_TTL_SECONDS:
-            path.unlink(missing_ok=True)
-            return None
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
@@ -1826,7 +1838,9 @@ def load_cached_result(key: str, now: float | None = None) -> tuple[list[Subtitl
         return None
     except OSError:
         return None
-    if not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION:
+    age = cache_age(payload, current)
+    if (not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION
+            or age is None or age >= RESULT_CACHE_TTL_SECONDS):
         path.unlink(missing_ok=True)
         return None
     entries = deserialize_entries(payload.get("entries"))
@@ -1842,6 +1856,12 @@ def load_cached_result(key: str, now: float | None = None) -> tuple[list[Subtitl
 
 
 def save_cached_result(key: str, entries: list[SubtitleEntry], metadata: dict[str, Any]) -> None:
+    with RESULT_CACHE_IO_LOCK:
+        _save_cached_result(key, entries, metadata)
+    cleanup_result_cache()
+
+
+def _save_cached_result(key: str, entries: list[SubtitleEntry], metadata: dict[str, Any]) -> None:
     if not result_cache_enabled():
         return
     RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1861,10 +1881,14 @@ def save_cached_result(key: str, entries: list[SubtitleEntry], metadata: dict[st
         return
     finally:
         temp_path.unlink(missing_ok=True)
-    cleanup_result_cache()
 
 
 def cleanup_result_cache(now: float | None = None) -> int:
+    with RESULT_CACHE_IO_LOCK:
+        return _cleanup_result_cache(now)
+
+
+def _cleanup_result_cache(now: float | None = None) -> int:
     if not RESULT_CACHE_DIR.exists():
         return 0
     current = time.time() if now is None else now
@@ -1886,7 +1910,9 @@ def cleanup_result_cache(now: float | None = None) -> int:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             payload = None
-        if not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION:
+        age = cache_age(payload, current)
+        if (not isinstance(payload, dict) or payload.get("version") != RESULT_CACHE_VERSION
+                or age is None or age >= RESULT_CACHE_TTL_SECONDS):
             try:
                 path.unlink()
                 removed += 1
@@ -2686,6 +2712,7 @@ def public_job_payload(job: Any) -> dict[str, Any]:
         "queue_position",
         "created_at",
         "updated_at",
+        "expires_at",
         "reused",
         "platform",
         "error_status",
@@ -4669,6 +4696,7 @@ def finalize_media_artifact(
         "cookie_used": platform == "bilibili" and cookie_allowed(req.use_cookie),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "artifact_ttl_seconds": artifact_ttl,
+        "expires_at": expires_at,
     }
     report_progress("media_finalize", 97, "正在准备下载文件")
     payload = {
@@ -6919,11 +6947,17 @@ JOB_MANAGER = JobManager(
     process_queued_job,
     max_pending=JOB_QUEUE_MAX_PENDING,
     result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+    subtitle_ttl_seconds=TRANSCRIPT_RETENTION_SECONDS,
     max_records=JOB_MAX_RECORDS,
     worker_count=JOB_WORKER_COUNT,
     discarder=discard_job_payload,
     state_path=JOB_STATE_DB_PATH,
 )
+MAINTENANCE = MaintenanceLoop((
+    lambda: JOB_MANAGER.cleanup(),
+    lambda: cleanup_result_cache(),
+    lambda: maybe_cleanup_stale_media_artifacts(),
+))
 
 
 def request_idempotency_key(request: Request) -> str | None:
@@ -7507,6 +7541,7 @@ def startup() -> None:
     cleanup_result_cache()
     initialize_cloud_services()
     JOB_MANAGER.start()
+    MAINTENANCE.start()
     if (
         local_asr_enabled()
         and env_bool("ASR_PERSISTENT_WORKER", True)
@@ -7517,6 +7552,7 @@ def startup() -> None:
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    MAINTENANCE.stop()
     JOB_MANAGER.stop()
     prewarm_thread = stop_asr_prewarm()
     stop_asr_worker()
@@ -7708,6 +7744,7 @@ def api_client_config(request: Request) -> JSONResponse:
     auto_ready = local_ready if auto_backend == "local" else cloud_ready
     payload = {
         "status": "ok",
+        "retention": {"subtitle_seconds": TRANSCRIPT_RETENTION_SECONDS},
         "features": {
             "local_processing": local_ready,
             "cloud_enhancement": cloud_ready,
@@ -8221,6 +8258,16 @@ async def api_create_upload_job(
     finally:
         if not transferred:
             discard_upload_payload(payload)
+
+
+@app.get("/api/jobs")
+def api_recent_jobs(request: Request, limit: int = Query(20, ge=1, le=50)) -> JSONResponse:
+    user = require_auth_user(request)
+    return JSONResponse(
+        {"jobs": JOB_MANAGER.recent(user.user_id, limit),
+         "retention_seconds": TRANSCRIPT_RETENTION_SECONDS},
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 def owned_job(job_id: str, request: Request) -> dict[str, Any]:

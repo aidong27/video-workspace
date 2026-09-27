@@ -56,6 +56,9 @@ async function workspace(t, options = {}) {
       body = options.guest ? {} : { user: { id: 7, username: "preview", created_at: 1700000000 } };
     } else if (endpoint === "/api/health") body = { status: "ok" };
     else if (endpoint.endsWith("config")) body = config;
+    else if (endpoint === "/api/jobs" && req.method() === "GET") body = {
+      jobs: options.history || [], retention_seconds: 86400
+    };
     else if (endpoint === "/api/bilibili/pages") body = {
       base_url: "https://www.bilibili.com/video/BV14jFvzbEvj", current_page: 1,
       pages: [{ page: 1, title: "Introduction" }, { page: 2, title: "Part two" }]
@@ -67,7 +70,7 @@ async function workspace(t, options = {}) {
       if (options.failure) { status = 503; body = { detail: { reason: "download_failed" } }; }
       else if (options.waiting) body = { id: "fixture-job", status: "queued", progress: 3, queue_position: 2 };
       else if (options.running) body = { id: "fixture-job", status: "running", stage: "media_convert", progress: 58, message: "正在转换" };
-      else body = { id: "fixture-job", status: "completed", result: {
+      else body = { id: "fixture-job", status: "completed", expires_at: Date.now() / 1000 + 86400, result: {
         content: "第一段测试字幕。\n第二段介绍缓存与任务恢复。\n字幕结果保留原始语义。", raw_content: "原始识别结果。",
         format: "txt", filename: "fixture.txt",
         metadata: { title: "字幕工作台测试视频", platform: "bilibili", source: "asr_local", entry_count: 3,
@@ -93,6 +96,159 @@ async function workspace(t, options = {}) {
 async function screenshot(page, name) {
   if (captureRoot) await page.screenshot({ path: path.join(captureRoot, `${name}.png`), fullPage: true, animations: "disabled" });
 }
+
+function savedSubtitle(id = "saved-job") {
+  const created = Math.floor(Date.now() / 1000) - 600;
+  return { id, kind: "subtitle", status: "completed", stage: "completed", progress: 100,
+    created_at: created, updated_at: created, expires_at: created + 86400,
+    title: "城市漫步：用光影记录普通的一天", platform: "bilibili",
+    result: { content: "傍晚的街道渐渐安静下来。\n我们沿着河边，记录这座城市的日常。",
+      raw_content: "傍晚的街道渐渐安静下来。", filename: "城市漫步.txt", format: "txt",
+      metadata: { title: "城市漫步：用光影记录普通的一天", platform: "bilibili",
+        source: "official_no_cookie", entry_count: 2, duration: 86, elapsed_seconds: 1.2 } }
+  };
+}
+
+for (const width of [1440, 390, 320]) {
+  test(`saved results open without new extraction at ${width}px`, async t => {
+    const job = savedSubtitle();
+    const { result, ...summary } = job;
+    const { page, submissions } = await workspace(t, { viewport: { width, height: 900 }, history: [summary],
+      route: async (route, endpoint) => {
+        if (endpoint !== "/api/jobs/saved-job") return false;
+        await route.fulfill({ contentType: "application/json", body: JSON.stringify(job) });
+        return true;
+      }
+    });
+    const selector = width > 1180 ? "#recent-list" : "#history-dialog-list";
+    if (width <= 1180) {
+      await page.locator("#open-history").click();
+      await screenshot(page, `history-${width}`);
+      const box = await page.locator(".history-dialog").boundingBox();
+      assert.ok(box.x >= 0 && box.x + box.width <= width);
+    }
+    await page.locator(`${selector} .recent-item`).click();
+    await page.locator("#output-shell").waitFor({ state: "visible" });
+    assert.match(await page.locator("#output").textContent(), /傍晚/);
+    assert.match(await page.locator("#result-expiry").textContent(), /字幕结果保留至/);
+    assert.equal(await page.locator("#retry-accurate").isVisible(), false);
+    assert.equal(submissions.length, 0);
+    const bounds = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth,
+      controls: ["open-history", "health-trigger", "account-trigger"].map(id => {
+        const r = document.getElementById(id).getBoundingClientRect();
+        return { left: r.left, right: r.right, width: r.width };
+      }) }));
+    assert.equal(bounds.scroll <= width, true);
+    for (const box of bounds.controls) if (box.width) assert.ok(box.left >= 0 && box.right <= width);
+    const visibleControls = bounds.controls.filter(box => box.width).sort((a, b) => a.left - b.left);
+    for (let i = 1; i < visibleControls.length; i += 1) assert.ok(visibleControls[i].left >= visibleControls[i - 1].right);
+    if (width <= 1180) {
+      assert.ok(await page.locator("#open-history").evaluate(el => {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        return range.getBoundingClientRect().height;
+      }) < 30);
+    }
+    await screenshot(page, `saved-result-${width}`);
+    await page.reload();
+    await page.locator("body.app-ready").waitFor();
+    if (width <= 1180) await page.locator("#open-history").click();
+    await page.locator(`${selector} .recent-item`).waitFor();
+    assert.equal(submissions.length, 0);
+  });
+}
+
+test("an expired history entry does not replace an already opened result", async t => {
+  const job = savedSubtitle();
+  const { result, ...summary } = job;
+  const { page, submissions } = await workspace(t, { history: [summary, { ...summary, id: "gone", title: "过期项" }],
+    route: async (route, endpoint) => {
+      if (endpoint === "/api/jobs/saved-job") {
+        await route.fulfill({ contentType: "application/json", body: JSON.stringify(job) }); return true;
+      }
+      if (endpoint === "/api/jobs/gone") {
+        await route.fulfill({ status: 410, contentType: "application/json", body: "{}" }); return true;
+      }
+      return false;
+    }
+  });
+  await page.locator("#recent-list .recent-item").first().click();
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  await page.getByRole("button", { name: /过期项/ }).click();
+  await page.waitForFunction(() => document.querySelector("#toast").textContent.includes("过期"));
+  assert.match(await page.locator("#output").textContent(), /傍晚/);
+  assert.equal(submissions.length, 0);
+});
+
+test("an open subtitle and its history expire without keeping text in local storage", async t => {
+  const job = savedSubtitle();
+  const { result, ...summary } = job;
+  const { page, submissions } = await workspace(t, { history: [summary],
+    beforeLoad: async page => { await page.clock.install({ time: new Date() }); },
+    route: async (route, endpoint) => {
+      if (endpoint !== "/api/jobs/saved-job") return false;
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(job) }); return true;
+    }
+  });
+  await page.locator("#recent-list .recent-item").click();
+  await page.locator("#output-shell").waitFor({ state: "visible" });
+  await page.clock.fastForward(86400 * 1000);
+  assert.equal(await page.locator("#output").textContent(), "");
+  assert.equal(await page.locator("#status-title").textContent(), "结果已过期");
+  assert.equal(await page.locator("#recent-list .recent-item").count(), 0);
+  assert.equal(await page.evaluate(() => JSON.stringify(localStorage).includes("傍晚")), false);
+  assert.equal(submissions.length, 0);
+});
+
+test("history failure can be retried without creating tasks", async t => {
+  let reads = 0;
+  const { result, ...summary } = savedSubtitle();
+  const { page, submissions } = await workspace(t, { route: async (route, endpoint) => {
+    if (endpoint !== "/api/jobs" || route.request().method() !== "GET") return false;
+    reads += 1;
+    await route.fulfill({ status: reads === 1 ? 503 : 200, contentType: "application/json",
+      body: JSON.stringify(reads === 1 ? {} : { jobs: [summary], retention_seconds: 86400 }) });
+    return true;
+  } });
+  await page.waitForFunction(() => document.querySelector("#history-caption").textContent.includes("重试"));
+  await page.locator("#refresh-history").click();
+  await page.locator("#recent-list .recent-item").waitFor();
+  assert.equal(submissions.length, 0);
+});
+
+for (const action of ["copy", "download", "format"]) {
+  test(`expired results reject ${action} before the cleanup timer runs`, async t => {
+    const job = savedSubtitle();
+    const { result, ...summary } = job;
+    let exports = 0;
+    const { page } = await workspace(t, { history: [summary], beforeLoad: page => page.clock.install(),
+      route: async (route, endpoint) => {
+        if (endpoint.endsWith("/result")) exports += 1;
+        if (endpoint !== "/api/jobs/saved-job") return false;
+        await route.fulfill({ json: job }); return true;
+      }
+    });
+    await page.locator("#recent-list .recent-item").click();
+    await page.locator("#output-shell").waitFor({ state: "visible" });
+    await page.clock.setSystemTime(new Date((job.expires_at + 1) * 1000));
+    if (action === "format") await page.locator("#result-format").selectOption("srt");
+    else await page.locator(`#${action}-result`).click();
+    assert.equal(await page.locator("#output").textContent(), "");
+    assert.equal(await page.locator("#result-actions").isVisible(), false);
+    assert.equal(exports, 0);
+  });
+}
+
+test("a new task clears the previous result's expiry and selection", async t => {
+  const { page } = await workspace(t);
+  await page.locator("#video-input").fill("BV14jFvzbEvj");
+  await page.locator("#extract-button").click();
+  await page.locator("#result-expiry").waitFor({ state: "visible" });
+  await page.locator("#rail-new-task").click();
+  assert.equal(await page.locator("#result-expiry").isVisible(), false);
+  assert.equal(await page.locator("#output").textContent(), "");
+  assert.equal(await page.locator('#recent-list [aria-current="true"]').count(), 0);
+});
 
 for (const width of [1440, 1280, 1024, 820, 390, 320]) {
   test(`workspace fits ${width}px and sources remain a two-column control`, async t => {
@@ -200,6 +356,7 @@ test("result formats convert without a second submission, including the raw vers
   await page.locator("#video-input").fill("BV14jFvzbEvj");
   await page.locator("#extract-button").click();
   await page.locator("#output-shell").waitFor({ state: "visible" });
+  await page.locator("#advanced-options > summary").click();
   await page.locator("#format-select").selectOption("json");
   assert.equal(submissions.length, 1);
   await page.locator("#result-format").selectOption("srt");
