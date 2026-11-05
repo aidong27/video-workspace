@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,9 +9,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app import main
+from app import access, auth, main
 from app.asr.signing import SignedAudioStore
-from app.guest import GuestMediaRateLimiter, GuestSessionCodec
 
 
 class ApiIntegrationTests(unittest.TestCase):
@@ -60,7 +58,6 @@ class ApiIntegrationTests(unittest.TestCase):
             key: os.environ.get(key)
             for key in (
                 "AUTH_DB_PATH",
-                "INVITE_CODE_HASH",
                 "ASR_PREWARM",
                 "ASR_ENABLED",
                 "LOCAL_ASR_ENABLED",
@@ -68,11 +65,9 @@ class ApiIntegrationTests(unittest.TestCase):
                 "AUTH_COOKIE_SECURE",
             )
         }
-        invite = "integration-invite"
         os.environ.update(
             {
                 "AUTH_DB_PATH": str(root / "auth" / "auth.db"),
-                "INVITE_CODE_HASH": hashlib.sha256(invite.encode()).hexdigest(),
                 "ASR_PREWARM": "false",
                 "ASR_ENABLED": "false",
                 "LOCAL_ASR_ENABLED": "false",
@@ -82,11 +77,18 @@ class ApiIntegrationTests(unittest.TestCase):
         )
         self.client_context = TestClient(main.app, base_url="https://testserver")
         self.client = self.client_context.__enter__()
-        response = self.client.post(
-            "/api/auth/register",
-            json={"username": "integration", "password": "strong-pass", "invite_code": invite},
-        )
-        self.assertEqual(response.status_code, 200)
+        self.code = self.sign_in("integration")
+
+    def sign_in(self, username: str, role: str = "member") -> str:
+        """Issue a code for ``username`` and enter through the gate with it."""
+        code, _ = access.issue_code(label=username, username=username, role=role)
+        self.client.cookies.clear()
+        response = self.client.post("/api/auth/activate", json={"code": code})
+        self.assertEqual(response.status_code, 200, response.text)
+        return code
+
+    def member_id(self, label: str) -> int:
+        return next(item["id"] for item in access.list_members() if item["label"] == label)
 
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
@@ -198,6 +200,13 @@ class ApiIntegrationTests(unittest.TestCase):
             submitted = self.client.post("/api/jobs", json={"input": "BV14jFvzbEvj"})
         job_id = submitted.json()["id"]
         self.assertNotIn("_entries", submitted.json()["result"])
+        self.assertEqual(
+            submitted.json()["result"]["segments"],
+            [{"start": 3600.0, "end": 3601.25, "text": "第一段测试。"}],
+        )
+        self.assertEqual(submitted.json()["result"]["raw_segments"][0]["text"], "原始结果。")
+        detail = self.client.get(f"/api/jobs/{job_id}").json()
+        self.assertEqual(detail["result"]["segments"][0]["text"], "第一段测试。")
         with patch.object(main, "extract_subtitle_data") as extract, patch.object(
             main.JOB_MANAGER, "submit"
         ) as submit, patch.object(main, "load_cached_result") as cache:
@@ -226,9 +235,7 @@ class ApiIntegrationTests(unittest.TestCase):
         finally:
             restored.stop()
         self.assertEqual(self.client.get(f"/api/jobs/{job_id}/result?format=exe").status_code, 422)
-        self.client.post("/api/auth/register", json={
-            "username": "another-user", "password": "strong-pass", "invite_code": "integration-invite",
-        })
+        self.sign_in("another-user")
         self.assertEqual(self.client.get(f"/api/jobs/{job_id}/result").status_code, 404)
         self.client.cookies.clear()
         self.assertEqual(self.client.get(f"/api/jobs/{job_id}/result").status_code, 401)
@@ -446,7 +453,7 @@ class ApiIntegrationTests(unittest.TestCase):
 
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(allowed.headers["cache-control"], "private, no-store")
-        self.assertEqual(allowed.headers["x-robots-tag"], "noindex, nofollow")
+        self.assertEqual(allowed.headers["x-robots-tag"], main.NOINDEX)
         payload = allowed.json()
         self.assertEqual(payload["queue"]["worker_count"], main.JOB_MANAGER.worker_count)
         self.assertEqual(payload["cloud_asr"]["failures"]["total"], 1)
@@ -457,7 +464,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertNotIn("private-workspace-value", encoded)
         self.assertNotIn("/private/", encoded)
         self.assertEqual(allowed_page.status_code, 200)
-        self.assertEqual(allowed_page.headers["x-robots-tag"], "noindex, nofollow")
+        self.assertEqual(allowed_page.headers["x-robots-tag"], main.NOINDEX)
 
         self.client.cookies.clear()
         unauthenticated = self.client.get("/api/admin/diagnostics")
@@ -471,39 +478,224 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["asr_worker"]["snapshot_consistent"])
 
-    def test_account_can_change_password_and_logout_all_sessions(self) -> None:
-        wrong = self.client.post(
-            "/api/auth/change-password",
-            json={"current_password": "wrong-password", "new_password": "new-strong-pass"},
-        )
-        self.assertEqual(wrong.status_code, 400)
-        self.assertEqual(wrong.json()["detail"]["reason"], "current_password_invalid")
+    def test_gate_blocks_everything_without_a_session(self) -> None:
+        self.client.cookies.clear()
+        page = self.client.get("/", follow_redirects=False)
+        self.assertEqual(page.status_code, 303)
+        self.assertEqual(page.headers["location"], "/login")
+        self.assertEqual(page.headers["x-robots-tag"], main.NOINDEX)
+        self.assertEqual(self.client.get("/admin", follow_redirects=False).status_code, 303)
+        self.assertEqual(self.client.get("/register", follow_redirects=False).status_code, 303)
+        for path in ("/api/jobs", "/api/client-config", "/api/admin/members", "/api/public-config", "/api/auth/me"):
+            self.assertEqual(self.client.get(path).status_code, 401, path)
+        for path in ("/api/auth/login", "/api/auth/register", "/api/media-jobs"):
+            self.assertEqual(self.client.post(path, json={}).status_code, 401, path)
+        for asset in ("app.js", "app.css", "admin.js", "fx.js", "index.html"):
+            self.assertEqual(self.client.get(f"/static/{asset}").status_code, 404, asset)
+        gate_asset = self.client.get("/static/gate.js?v=1")
+        self.assertEqual(gate_asset.status_code, 200)
+        self.assertTrue(gate_asset.headers["cache-control"].startswith("public"))
+        gate = self.client.get("/login")
+        self.assertEqual(gate.status_code, 200)
+        self.assertIn("/static/gate.js", gate.text)
+        self.assertNotIn("/static/app.js", gate.text)
+        robots = self.client.get("/robots.txt")
+        self.assertIn("Disallow: /", robots.text)
+        self.assertEqual(self.client.get("/api/health").json(), {"status": "ok"})
 
-        changed = self.client.post(
-            "/api/auth/change-password",
-            json={"current_password": "strong-pass", "new_password": "new-strong-pass"},
+    def test_signed_in_assets_are_never_publicly_cacheable(self) -> None:
+        for path in ("/static/app.js?v=7", "/static/app.js", "/static/admin.css?v=7"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertTrue(response.headers["cache-control"].startswith("private"), path)
+        self.assertEqual(self.client.get("/").headers["cache-control"], "private, no-cache")
+        self.assertEqual(self.client.get("/login", follow_redirects=False).status_code, 303)
+
+    def test_cross_site_writes_are_refused(self) -> None:
+        refused = self.client.post(
+            "/api/auth/logout-all",
+            headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
         )
-        self.assertEqual(changed.status_code, 200)
-        self.assertNotIn("password", json.dumps(changed.json()).lower())
+        self.assertEqual(refused.status_code, 403)
+        self.assertEqual(refused.json()["detail"]["reason"], "invalid_origin")
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 200)
+
+    def test_activation_code_signs_in_and_bad_codes_lock_the_address(self) -> None:
+        self.client.cookies.clear()
+        for attempt in range(4):
+            response = self.client.post("/api/auth/activate", json={"code": "ABCDE-FGHJK-MNPQR-STVWX"})
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json()["detail"]["reason"], "invalid_code")
+            self.assertEqual(response.json()["detail"]["attempts_left"], 4 - attempt)
+        locked = self.client.post("/api/auth/activate", json={"code": "not-a-code"})
+        self.assertEqual(locked.status_code, 429)
+        self.assertEqual(locked.json()["detail"]["reason"], "gate_locked")
+        self.assertGreater(int(locked.headers["retry-after"]), 800)
+        still_locked = self.client.post("/api/auth/activate", json={"code": self.code})
+        self.assertEqual(still_locked.status_code, 429)
+        overview = access.gate_overview()
+        self.assertEqual(overview["summary"]["locked"][0]["ip"], "testclient")
+
+        self.assertEqual(access.unlock_address("testclient"), 5)
+        typed = self.code.lower().replace("-", " ")
+        granted = self.client.post("/api/auth/activate", json={"code": typed})
+        self.assertEqual(granted.status_code, 200)
+        self.assertEqual(granted.json()["user"], {"label": "integration", "role": "member"})
+        cookie = granted.headers["set-cookie"]
+        self.assertIn("__Host-caption_session=", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Secure", cookie)
+        self.assertIn("samesite=lax", cookie.lower())
+        self.assertNotIn("Domain=", cookie)
         me = self.client.get("/api/auth/me")
-        self.assertEqual(me.status_code, 200)
-        self.assertEqual(me.json()["user"]["active_sessions"], 1)
-        self.assertIn("created_at", me.json()["user"])
+        self.assertEqual(me.headers["cache-control"], "private, no-store")
+        user = me.json()["user"]
+        self.assertEqual(user["label"], "integration")
+        self.assertFalse(user["is_admin"])
+        self.assertEqual(user["code_hint"], access.normalize_code(self.code)[-4:])
+        self.assertEqual(user["quota"]["limit"], 30)
+        self.assertNotIn(access.normalize_code(self.code), me.text)
+        self.assertEqual(access.gate_overview()["events"][0]["kind"], "granted")
 
-        self.client.post("/api/auth/logout")
-        old_login = self.client.post(
-            "/api/auth/login",
-            json={"username": "integration", "password": "strong-pass"},
-        )
-        self.assertEqual(old_login.status_code, 401)
-        new_login = self.client.post(
-            "/api/auth/login",
-            json={"username": "integration", "password": "new-strong-pass"},
-        )
-        self.assertEqual(new_login.status_code, 200)
-        logged_out = self.client.post("/api/auth/logout-all")
-        self.assertEqual(logged_out.status_code, 200)
+    def test_codes_are_stored_only_as_keyed_hashes(self) -> None:
+        normalized = access.normalize_code(self.code)
+        with auth.connect() as connection:
+            stored = [bytes(row[0]) for row in connection.execute("SELECT code_hash FROM access_codes")]
+        self.assertEqual(stored, [access.code_digest(normalized)])
+        database = Path(os.environ["AUTH_DB_PATH"]).read_bytes()
+        self.assertNotIn(normalized.encode(), database)
+        self.assertNotIn(self.code.encode(), database)
+        self.assertEqual(oct((Path(os.environ["AUTH_DB_PATH"]).parent / "access-pepper").stat().st_mode & 0o777), "0o600")
+
+    def test_revoked_disabled_or_expired_codes_end_existing_sessions(self) -> None:
+        member = self.member_id("integration")
+        new_code = access.reset_code(member)
         self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        old = self.client.post("/api/auth/activate", json={"code": self.code})
+        self.assertEqual(old.status_code, 403)
+        self.assertEqual(old.json()["detail"]["reason"], "code_revoked")
+        self.assertEqual(self.client.post("/api/auth/activate", json={"code": new_code}).status_code, 200)
+
+        access.update_member(member, active=False)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        disabled = self.client.post("/api/auth/activate", json={"code": new_code})
+        self.assertEqual(disabled.json()["detail"]["reason"], "code_revoked")
+
+        access.update_member(member, active=True)
+        access.unlock_address("testclient")
+        self.assertEqual(self.client.post("/api/auth/activate", json={"code": new_code}).status_code, 200)
+        with auth.connect() as connection:
+            connection.execute("UPDATE access_codes SET expires_at = ?", (int(time.time()) - 1,))
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        expired = self.client.post("/api/auth/activate", json={"code": new_code})
+        self.assertEqual(expired.json()["detail"]["reason"], "code_expired")
+
+    def test_device_limit_evicts_the_oldest_session(self) -> None:
+        access.update_member(self.member_id("integration"), max_devices=2)
+        laptop = TestClient(main.app, base_url="https://testserver")
+        phone = TestClient(main.app, base_url="https://testserver")
+        for client in (laptop, phone):
+            self.assertEqual(client.post("/api/auth/activate", json={"code": self.code}).status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        self.assertEqual(laptop.get("/api/auth/me").status_code, 200)
+        me = phone.get("/api/auth/me").json()["user"]
+        self.assertEqual((me["active_sessions"], me["max_devices"]), (2, 2))
+        logged_out = phone.post("/api/auth/logout-all")
+        self.assertEqual(logged_out.status_code, 200)
+        self.assertEqual(laptop.get("/api/auth/me").status_code, 401)
+
+    def test_member_daily_quota_and_active_job_limit(self) -> None:
+        member = self.member_id("integration")
+        access.update_member(member, daily_job_limit=1)
+        result = main.subtitle_result_payload([main.SubtitleEntry(0, 1, "hello")], {"title": "quota"}, "txt")
+        with patch.object(main, "cached_extraction_payload", return_value=result):
+            first = self.client.post("/api/jobs", json={"input": "BV14jFvzbEvj"}, headers={"Idempotency-Key": "quota-key-0001"})
+            again = self.client.post("/api/jobs", json={"input": "BV14jFvzbEvj"}, headers={"Idempotency-Key": "quota-key-0001"})
+            blocked = self.client.post("/api/jobs", json={"input": "BV1xx411c7mD"})
+        self.assertEqual((first.status_code, again.status_code), (202, 202))
+        self.assertEqual(first.json()["id"], again.json()["id"])
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked.json()["detail"]["reason"], "daily_quota_reached")
+        self.assertEqual(access.quota_status(member)["used"], 1)
+
+        access.update_member(member, daily_job_limit=0)
+        with patch.object(main.JOB_MANAGER, "owner_stats", return_value={"queued": 1, "running": 1}):
+            busy = self.client.post("/api/jobs", json={"input": "BV1xx411c7mD"})
+        self.assertEqual(busy.status_code, 429)
+        self.assertEqual(busy.json()["detail"]["reason"], "member_busy")
+        self.assertEqual(access.quota_status(member)["used"], 1)
+
+    def test_owner_console_issues_codes_once_and_protects_the_owner(self) -> None:
+        self.assertEqual(self.client.get("/api/admin/members").status_code, 403)
+        self.assertEqual(self.client.post("/api/admin/members", json={"label": "x"}).status_code, 403)
+        self.sign_in("boss", role="owner")
+        created = self.client.post(
+            "/api/admin/members",
+            json={"label": "小王", "expires_in_days": 7, "max_devices": 1, "daily_job_limit": 5},
+        )
+        self.assertEqual(created.status_code, 201)
+        code = created.json()["code"]
+        self.assertIsNotNone(access.normalize_code(code))
+        listing = self.client.get("/api/admin/members")
+        self.assertEqual(listing.headers["cache-control"], "private, no-store")
+        self.assertNotIn(code, listing.text)
+        self.assertNotIn(access.normalize_code(code), listing.text)
+        self.assertNotIn("hash", listing.text)
+        members = {item["label"]: item for item in listing.json()["members"]}
+        self.assertEqual(list(members)[0], "boss")
+        friend = members["小王"]
+        self.assertEqual((friend["max_devices"], friend["daily_job_limit"], friend["state"]), (1, 5, "active"))
+        self.assertGreater(friend["code"]["expires_at"], time.time() + 6 * 86400)
+        boss = members["boss"]
+        self.assertIsNone(boss["daily_job_limit"])
+        protected = self.client.patch(f"/api/admin/members/{boss['id']}", json={"active": False})
+        self.assertEqual(protected.status_code, 400)
+        self.assertEqual(protected.json()["detail"]["reason"], "owner_protected")
+        self.assertEqual(self.client.delete(f"/api/admin/members/{boss['id']}").status_code, 400)
+
+        renamed = self.client.patch(f"/api/admin/members/{friend['id']}", json={"label": "老王", "daily_job_limit": None})
+        self.assertEqual(renamed.status_code, 200)
+        updated = {item["label"]: item for item in self.client.get("/api/admin/members").json()["members"]}["老王"]
+        self.assertEqual(updated["daily_job_limit"], 30)
+        reset = self.client.post(f"/api/admin/members/{friend['id']}/reset").json()["code"]
+        self.assertNotEqual(reset, code)
+        self.assertEqual(self.client.delete(f"/api/admin/members/{friend['id']}").status_code, 200)
+        gate = self.client.get("/api/admin/gate").json()
+        self.assertGreaterEqual(gate["summary"]["granted_24h"], 2)
+        self.assertEqual(self.client.post("/api/admin/gate/unlock", json={"ip": "203.0.113.9"}).json()["cleared"], 0)
+
+    def test_bilibili_login_is_owner_only_and_used_for_every_request(self) -> None:
+        self.assertEqual(self.client.post("/api/admin/bilibili/qrcode").status_code, 403)
+        self.assertEqual(self.client.get("/api/admin/bilibili").status_code, 403)
+        self.assertEqual(self.client.get("/api/login/qrcode").status_code, 404)
+        self.assertFalse(main.cookie_allowed(True))
+        main.BILI_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        main.save_bili_cookie("SESSDATA=secret-session; bili_jct=secret-csrf")
+        try:
+            self.assertTrue(main.cookie_allowed(False))
+            config = self.client.get("/api/client-config").json()
+            self.assertTrue(config["features"]["bilibili_login"])
+            self.assertTrue(config["platform_status"]["bilibili"]["signed_in"])
+            self.assertNotIn("secret", json.dumps(config))
+
+            self.sign_in("boss", role="owner")
+            nav = {"code": 0, "data": {"isLogin": True, "uname": "测试账号", "mid": 42,
+                                       "level_info": {"current_level": 6}, "vipStatus": 1,
+                                       "vip_label": {"text": "年度大会员"}}}
+            with patch.object(main, "api_get_json", return_value=nav) as fetched:
+                status = self.client.get("/api/admin/bilibili?refresh=true").json()
+            self.assertEqual((status["state"], status["uname"], status["level"]), ("ok", "测试账号", 6))
+            self.assertTrue(fetched.call_args.kwargs["allow_cookie"])
+            self.assertNotIn("secret", json.dumps(status))
+            with patch.object(main.httpx, "Client", side_effect=RuntimeError("offline")):
+                removed = self.client.delete("/api/admin/bilibili")
+            self.assertEqual(removed.json(), {"ok": True, "remote_signed_out": False})
+            self.assertFalse(main.BILI_COOKIE_PATH.exists())
+            self.assertFalse(main.cookie_allowed(True))
+            self.assertEqual(self.client.get("/api/admin/bilibili").json()["state"], "none")
+        finally:
+            main.BILI_COOKIE_PATH.unlink(missing_ok=True)
+            os.environ.pop("BILI_COOKIE", None)
 
     def test_signed_provider_audio_is_public_short_lived_and_revocable(self) -> None:
         audio = main.ASR_TMP_DIR / "asr-cloud-test" / "provider-audio.mp3"
@@ -736,286 +928,11 @@ class ApiIntegrationTests(unittest.TestCase):
             b"down" if ranged.status_code == 206 else b"downloadable-video",
         )
 
-        self.client.post("/api/auth/logout")
-        second = self.client.post(
-            "/api/auth/register",
-            json={"username": "integration2", "password": "strong-pass-2", "invite_code": "integration-invite"},
-        )
-        self.assertEqual(second.status_code, 200)
+        self.sign_in("integration2")
         forbidden = self.client.get(job["result"]["download_url"])
         self.assertEqual(forbidden.status_code, 404)
         forbidden_job = self.client.get(f"/api/jobs/{job['id']}")
         self.assertEqual(forbidden_job.status_code, 404)
-
-    def test_guest_access_only_exposes_media_and_safe_public_config(self) -> None:
-        self.client.post("/api/auth/logout")
-        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
-        limiter = GuestMediaRateLimiter(session_limit=6, global_limit=24)
-        with patch.dict(
-            os.environ,
-            {"GUEST_MEDIA_ENABLED": "true"},
-        ), patch.object(
-            main,
-            "GUEST_SESSION_CODEC",
-            codec,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_RATE_LIMITER",
-            limiter,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_MAX_BYTES",
-            1024,
-        ):
-            page = self.client.get("/")
-            config = self.client.get("/api/public-config")
-            subtitle = self.client.post(
-                "/api/jobs",
-                json={"input": "BV14jFvzbEvj", "format": "txt"},
-            )
-            upload = self.client.post(
-                "/api/upload-jobs?filename=clip.mp4",
-                content=b"video",
-            )
-
-        self.assertEqual(page.status_code, 200)
-        self.assertEqual(config.status_code, 200)
-        self.assertTrue(config.json()["features"]["guest_media"])
-        self.assertEqual(config.json()["guest_media"]["bilibili_max_video_height"], 720)
-        self.assertNotIn("max_video_height", config.json()["guest_media"])
-        self.assertEqual(config.json()["account_required"], ["subtitle", "upload", "cloud_asr"])
-        self.assertEqual(subtitle.status_code, 401)
-        self.assertEqual(upload.status_code, 401)
-        encoded = json.dumps(config.json()).lower()
-        for forbidden in (
-            str(self.root).lower(),
-            "service_version",
-            "asr_model",
-            "server",
-            "workspace",
-            "api_key",
-            "free_bytes",
-            "process_rss",
-        ):
-            self.assertNotIn(forbidden, encoded)
-
-    def test_disabled_guest_media_blocks_new_jobs_from_existing_guest_session(self) -> None:
-        self.client.post("/api/auth/logout")
-        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
-        token, _ = codec.issue()
-        self.client.cookies.set("caption_guest", token)
-        queued_job = {
-            "id": "a" * 32,
-            "status": "queued",
-            "stage": "queued",
-            "progress": 0,
-            "message": "任务已进入队列",
-        }
-
-        with patch.dict(
-            os.environ,
-            {"GUEST_MEDIA_ENABLED": "false"},
-        ), patch.object(
-            main,
-            "GUEST_SESSION_CODEC",
-            codec,
-        ), patch.object(
-            main,
-            "submit_media_job",
-            return_value=queued_job,
-        ) as submit:
-            response = self.client.post(
-                "/api/media-jobs",
-                json={"input": "BV14jFvzbEvj", "media_type": "video"},
-            )
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["detail"]["reason"], "guest_media_disabled")
-        submit.assert_not_called()
-
-    def test_guest_media_cookie_job_and_artifact_are_owner_scoped(self) -> None:
-        self.client.post("/api/auth/logout")
-        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
-        limiter = GuestMediaRateLimiter(session_limit=6, global_limit=24)
-        seen_requests: list[main.MediaJobRequest] = []
-
-        def fake_media_result(request: main.MediaJobRequest) -> dict:
-            seen_requests.append(request)
-            directory = main.media_artifact_directory(request.artifact_token)
-            directory.mkdir(parents=True, mode=0o700)
-            final = directory / "artifact.mp4"
-            final.write_bytes(b"guest-video")
-            return main.finalize_media_artifact(
-                request,
-                final,
-                "video/mp4",
-                {
-                    "id": "BV14jFvzbEvj",
-                    "title": "访客媒体",
-                    "duration": 9,
-                    "webpage_url": request.input,
-                    "source_container": "mp4",
-                },
-                time.monotonic(),
-            )
-
-        def wait_for_job(client: TestClient, job: dict) -> dict:
-            deadline = time.monotonic() + 2
-            while job["status"] not in {"completed", "failed"} and time.monotonic() < deadline:
-                time.sleep(0.01)
-                job = client.get(f"/api/jobs/{job['id']}").json()
-            return job
-
-        with patch.dict(
-            os.environ,
-            {"GUEST_MEDIA_ENABLED": "true", "AUTH_COOKIE_SECURE": "true"},
-        ), patch.object(
-            main,
-            "GUEST_SESSION_CODEC",
-            codec,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_RATE_LIMITER",
-            limiter,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_MAX_BYTES",
-            1024,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_MAX_DURATION_SECONDS",
-            1800,
-        ), patch.object(
-            main,
-            "media_extraction_payload",
-            side_effect=fake_media_result,
-        ):
-            first = self.client.post(
-                "/api/media-jobs",
-                json={
-                    "input": "BV14jFvzbEvj",
-                    "media_type": "video",
-                    "use_cookie": True,
-                },
-                headers={"Idempotency-Key": "guest-media-owner-1"},
-            )
-            self.assertEqual(first.status_code, 202)
-            cookie = first.headers.get("set-cookie", "").lower()
-            self.assertIn("caption_guest=", cookie)
-            self.assertIn("httponly", cookie)
-            self.assertIn("secure", cookie)
-            self.assertIn("samesite=lax", cookie)
-            first_job = wait_for_job(self.client, first.json())
-            self.assertEqual(first_job["status"], "completed")
-            self.assertTrue(seen_requests[0].guest)
-            self.assertFalse(seen_requests[0].use_cookie)
-            self.assertLess(seen_requests[0].owner_id, 0)
-            self.assertEqual(seen_requests[0].max_bytes, 1024)
-            artifact_url = first_job["result"]["download_url"]
-            self.assertEqual(self.client.get(artifact_url).content, b"guest-video")
-
-            other = TestClient(main.app, base_url="https://testserver")
-            second = other.post(
-                "/api/media-jobs",
-                json={"input": "BV1xx411c7mD", "media_type": "video"},
-                headers={"Idempotency-Key": "guest-media-owner-2"},
-            )
-            self.assertEqual(second.status_code, 202)
-            wait_for_job(other, second.json())
-            self.assertEqual(other.get(f"/api/jobs/{first_job['id']}").status_code, 404)
-            self.assertEqual(other.get(artifact_url).status_code, 404)
-            other.close()
-
-    def test_guest_idempotent_reuse_does_not_consume_another_allowance(self) -> None:
-        self.client.post("/api/auth/logout")
-        codec = GuestSessionCodec("g" * 32, ttl_seconds=3600)
-        limiter = GuestMediaRateLimiter(session_limit=1, global_limit=10)
-        completed = {
-            "ok": True,
-            "kind": "media",
-            "media_type": "video",
-            "filename": "video.mp4",
-            "content_type": "video/mp4",
-            "size": 1,
-            "download_url": "/api/artifacts/" + "a" * 32,
-            "metadata": {"platform": "bilibili", "title": "cached"},
-        }
-        with patch.dict(
-            os.environ,
-            {"GUEST_MEDIA_ENABLED": "true"},
-        ), patch.object(
-            main,
-            "GUEST_SESSION_CODEC",
-            codec,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_RATE_LIMITER",
-            limiter,
-        ), patch.object(
-            main,
-            "GUEST_MEDIA_MAX_BYTES",
-            1024,
-        ), patch.object(
-            main.JOB_MANAGER,
-            "submit",
-            return_value={
-                "id": "b" * 32,
-                "status": "completed",
-                "result": completed,
-                "reused": False,
-            },
-        ) as submit:
-            headers = {"Idempotency-Key": "guest-idempotent-1"}
-            request = {"input": "BV14jFvzbEvj", "media_type": "video"}
-            first = self.client.post("/api/media-jobs", json=request, headers=headers)
-            self.assertEqual(first.status_code, 202)
-            identity = codec.resolve(self.client.cookies.get("caption_guest"))
-            self.assertIsNotNone(identity)
-            with patch.object(
-                main.JOB_MANAGER,
-                "get_by_idempotency",
-                return_value={
-                    "id": "b" * 32,
-                    "status": "completed",
-                    "result": completed,
-                    "reused": True,
-                },
-            ):
-                repeated = self.client.post("/api/media-jobs", json=request, headers=headers)
-            self.assertEqual(repeated.status_code, 202)
-            self.assertTrue(repeated.json()["reused"])
-            self.assertEqual(submit.call_count, 1)
-            limit = limiter.consume(identity.owner_id)
-            self.assertIsNotNone(limit)
-            self.assertEqual(limit.reason, "guest_media_session_limit")
-
-    def test_guest_allowance_is_refunded_when_storage_reservation_fails(self) -> None:
-        limiter = GuestMediaRateLimiter(session_limit=1, global_limit=10)
-        owner_id = -123
-        with patch.object(
-            main,
-            "GUEST_MEDIA_RATE_LIMITER",
-            limiter,
-        ), patch.object(
-            main,
-            "reserve_media_artifact",
-            side_effect=main.HTTPException(
-                status_code=429,
-                detail={"reason": "media_storage_busy"},
-            ),
-        ):
-            with self.assertRaises(main.HTTPException):
-                main.submit_media_job(
-                    main.MediaRequest(
-                        input="BV14jFvzbEvj",
-                        media_type="video",
-                    ),
-                    owner_id,
-                    None,
-                    guest=True,
-                )
-
-        self.assertIsNone(limiter.consume(owner_id, now=time.time()))
 
     def test_cloud_modes_require_explicit_server_side_consent(self) -> None:
         denied = self.client.post(
@@ -1061,8 +978,8 @@ class ApiIntegrationTests(unittest.TestCase):
         versioned = self.client.get("/static/app.js?v=20260727-3")
         plain = self.client.get("/static/app.js")
         self.assertEqual(versioned.status_code, 200)
-        self.assertIn("immutable", versioned.headers["cache-control"])
-        self.assertNotIn("immutable", plain.headers.get("cache-control", ""))
+        self.assertEqual(versioned.headers["cache-control"], "private, max-age=31536000, immutable")
+        self.assertEqual(plain.headers.get("cache-control"), "private, no-cache")
 
 
 class FrontendRecoveryTests(unittest.TestCase):
@@ -1075,8 +992,11 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertNotIn("innerHTML", script)
         self.assertNotRegex(page, r"\sstyle=")
         self.assertNotRegex(page, r"<script(?![^>]+\bsrc=)")
-        self.assertIn("data.generated_at * 1000", script)
-        self.assertIn('const negativeWhenTrue = key === "paid_allowed"', script)
+        for endpoint in ("/api/admin/members", "/api/admin/gate", "/api/admin/bilibili/qrcode", "/api/admin/diagnostics"):
+            self.assertIn(endpoint, script)
+        self.assertIn("new Date(timestamp * 1000)", script)
+        self.assertIn('id="code-value"', page)
+        self.assertIn("只显示这一次", page)
 
     def test_frontend_defaults_to_local_balanced_chinese_with_platform_subtitles(self) -> None:
         page = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -1107,7 +1027,7 @@ class FrontendRecoveryTests(unittest.TestCase):
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
         css = (main.STATIC_DIR / "app.css").read_text(encoding="utf-8")
 
-        self.assertIn("1.0 Beta", page)
+        self.assertIn('class="beta-badge">Private<', page)
         for element_id in (
             "health-trigger",
             "health-popover",
@@ -1117,12 +1037,19 @@ class FrontendRecoveryTests(unittest.TestCase):
             "stage-track",
             "result-search",
             "toggle-wrap",
-            "rail-subtitle",
-            "rail-video",
-            "rail-audio",
+            "new-task",
+            "open-history",
+            "history-drawer",
+            "theme-toggle",
+            "view-segments",
+            "view-source",
+            "segment-list",
+            "platform-notice",
             "account-popover",
-            "password-dialog",
-            "guest-access-banner",
+            "account-quota",
+            "open-command",
+            "signal-canvas",
+            "segment-timeline",
             "cloud-mode-zone",
             "cloud-confirm-dialog",
             "link-input-panel",
@@ -1135,18 +1062,22 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertIn("function updateStageTrack(", script)
         self.assertIn("function retryAccurate()", script)
         self.assertIn("function submitCurrentForm()", script)
-        self.assertIn("function changeAccountPassword(", script)
-        self.assertIn("guest_media_disabled", script)
-        self.assertIn("/static/app.js?v=20260927-1", page)
+        for retired in ("guest", "changeAccountPassword", "/api/public-config", "use_cookie", "/api/login/"):
+            self.assertNotIn(retired, script)
+            self.assertNotIn(retired, page)
+        self.assertIn("/static/app.js?v=20261106-2", page)
+        self.assertIn("/static/fx.js?v=20261106-2", page)
+        self.assertIn("/static/theme.js?v=20261106-2", page)
         self.assertIn('id="result-format"', page)
-        self.assertIn("function syncRailNavigation(", script)
+        self.assertIn("function setHistoryDrawer(", script)
+        self.assertIn("function renderSegments(", script)
         local_ready_block = script.split("function isLocalAsrReady()", 1)[1].split(
             "function syncPrecisionOptions", 1
         )[0]
         self.assertIn("state.capabilities.features.local_processing", local_ready_block)
         self.assertIn('autoBackend === "local"', script)
         self.assertIn('state.capabilities.asr_modes.auto.available', script)
-        self.assertIn('state.user ? "/api/client-config" : "/api/public-config"', script)
+        self.assertIn('apiFetch("/api/client-config"', script)
         self.assertIn("cloud_consent: true", script)
         submit_block = script.split("function submitCurrentForm()", 1)[1].split(
             "elements.form.addEventListener", 1
@@ -1155,14 +1086,12 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertLess(submit_block.index("validateUpload()"), submit_block.index("requestCloudConfirmation"))
         self.assertIn("uploads.max_bytes", script)
         self.assertIn("body.dialog-open", css)
-        self.assertNotIn("linear-gradient", css)
         self.assertNotRegex(script, r"\bstate\.health\b")
         self.assertNotIn("meta.asr_model", script)
         self.assertNotIn("asr_provider_seconds", script)
         self.assertNotIn("estimated_cost_cny", script)
         self.assertNotIn("4C / 4G", page)
         self.assertNotIn("单机任务队列", page)
-        self.assertNotIn("服务器", page + script)
         for internal_field in (
             "free_bytes",
             "process_rss_mb",
@@ -1173,10 +1102,11 @@ class FrontendRecoveryTests(unittest.TestCase):
             self.assertNotIn(internal_field, script)
 
         example = (main.STATIC_DIR.parent.parent / ".env.example").read_text(encoding="utf-8")
-        self.assertIn("GUEST_SESSION_TTL_SECONDS=", example)
-        self.assertIn("GUEST_MEDIA_MAX_ACTIVE=", example)
-        self.assertIn('"GUEST_SESSION_TTL_SECONDS"', (main.STATIC_DIR.parent / "main.py").read_text())
-        self.assertIn('"GUEST_MEDIA_MAX_ACTIVE"', (main.STATIC_DIR.parent / "main.py").read_text())
+        for setting in ("MEMBER_DAILY_JOB_LIMIT=", "MEMBER_MAX_ACTIVE_JOBS=", "ACCESS_MAX_DEVICES=",
+                        "BILI_MIN_INTERVAL_SECONDS="):
+            self.assertIn(setting, example)
+        for retired in ("GUEST_", "INVITE_CODE_HASH", "WEB_QR_LOGIN_ENABLED"):
+            self.assertNotIn(retired, example)
 
     def test_user_preferences_exclude_links_and_hotwords(self) -> None:
         script = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -1191,23 +1121,21 @@ class FrontendRecoveryTests(unittest.TestCase):
         self.assertNotIn("hotwords", preference_block)
         self.assertIn("delete persistedPayload.hotwords", active_job_block)
 
-    def test_auth_page_has_password_visibility_and_caps_lock_feedback(self) -> None:
-        page = (main.STATIC_DIR / "auth.html").read_text(encoding="utf-8")
-        script = (main.STATIC_DIR / "auth.js").read_text(encoding="utf-8")
-        css = (main.STATIC_DIR / "auth.css").read_text(encoding="utf-8")
+    def test_gate_page_is_self_contained_and_only_talks_to_activate(self) -> None:
+        page = (main.STATIC_DIR / "gate.html").read_text(encoding="utf-8")
+        script = (main.STATIC_DIR / "gate.js").read_text(encoding="utf-8")
 
-        self.assertIn("1.0 Beta", page)
-        self.assertIn('id="toggle-password"', page)
-        self.assertIn('id="toggle-confirm-password"', page)
-        self.assertIn('id="caps-warning"', page)
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertIn('getModifierState("CapsLock")', script)
-        self.assertIn("setupPasswordToggle(", script)
-        self.assertIn('fetch("/api/auth/config"', script)
-        self.assertNotIn("service_version", script)
-        self.assertNotIn("服务器", script)
-        self.assertNotIn("linear-gradient", css)
+        self.assertNotRegex(page, r"\sstyle=")
+        self.assertNotRegex(page, r"<script(?![^>]+\bsrc=)")
+        self.assertIn('id="code"', page)
+        self.assertIn('name="robots" content="noindex, nofollow"', page)
+        assets = set(re.findall(r'(?:src|href)="(/static/[^"?]+)', page))
+        self.assertEqual(assets, set(main.GATE_STATIC) - {"/static/theme.js"})
+        self.assertEqual(re.findall(r'fetch\("([^"]+)"', script), ["/api/auth/activate"])
+        self.assertNotIn("innerHTML", script)
+        self.assertNotIn("localStorage", script)
 
 
 if __name__ == "__main__":

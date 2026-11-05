@@ -1101,7 +1101,7 @@ class LocalMediaFixtureTests(unittest.TestCase):
 
 
 class ResourceSafetyTests(unittest.TestCase):
-    def test_ytdlp_worker_enforces_guest_duration_and_bounded_height(self) -> None:
+    def test_ytdlp_worker_enforces_duration_and_bounded_height(self) -> None:
         messages: list[dict] = []
         captured: dict = {}
         case = self
@@ -1137,7 +1137,7 @@ class ResourceSafetyTests(unittest.TestCase):
             "max_bytes": 1024,
             "max_duration_seconds": 60,
             "max_video_height": 720,
-            "duration_limit_reason": "guest_media_duration_too_long",
+            "duration_limit_reason": "media_duration_too_long",
         }
         with patch.object(main, "YoutubeDL", FakeYdl), patch.object(
             main.os,
@@ -1148,7 +1148,7 @@ class ResourceSafetyTests(unittest.TestCase):
 
         result = next(item for item in messages if item.get("kind") == "result")
         self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "guest_media_duration_too_long")
+        self.assertEqual(result["reason"], "media_duration_too_long")
         self.assertEqual(
             captured["format"],
             "bestvideo[height<=720]+bestaudio/best[height<=720]",
@@ -1625,9 +1625,13 @@ class BilibiliSelectionTests(unittest.TestCase):
             "webpage_url": normalized,
             "uploader": "tester",
         }
-        with patch.object(main, "extract_info", return_value=info) as extract:
+        transient = main.ExtractionFailure(502, "network down", "api_request_failed")
+        with patch.object(main, "api_get_json", side_effect=transient) as api, patch.object(
+            main, "extract_info", return_value=info
+        ) as extract:
             source = main.view_source(normalized)
 
+        self.assertIn("aid=123456", api.call_args.args[0])
         self.assertEqual(source.video_id, "123456")
         self.assertEqual(source.duration, 9)
         extract.assert_called_once()
@@ -1814,14 +1818,8 @@ class BilibiliCookiePersistenceTests(unittest.TestCase):
 
 
 class BilibiliCookieFallbackTests(unittest.TestCase):
-    def test_auto_asr_fallback_keeps_requested_cookie(self) -> None:
-        request = main.ExtractRequest(input="BV14jFvzbEvj", source="auto", use_cookie=True)
-        anonymous_failure = main.ExtractionFailure(
-            404,
-            "No anonymous subtitle.",
-            "no_official_subtitle",
-            can_try_asr=True,
-        )
+    def test_auto_asr_fallback_keeps_the_saved_login(self) -> None:
+        request = main.ExtractRequest(input="BV14jFvzbEvj", source="auto")
         cookie_failure = main.ExtractionFailure(
             404,
             "No cookie subtitle.",
@@ -1834,7 +1832,7 @@ class BilibiliCookieFallbackTests(unittest.TestCase):
         with patch.object(main, "cookie_allowed", return_value=True), patch.object(
             main,
             "official_subtitle",
-            side_effect=[anonymous_failure, cookie_failure],
+            side_effect=[cookie_failure],
         ), patch.object(main, "asr_subtitle", return_value=(entries, metadata)) as asr:
             result_entries, result_metadata = main.extract_subtitle_uncached(request)
 
@@ -1846,8 +1844,17 @@ class BilibiliCookieFallbackTests(unittest.TestCase):
         self.assertEqual(result_entries, entries)
         self.assertEqual(
             [attempt["source"] for attempt in result_metadata["attempts"]],
-            ["official_no_cookie", "official_with_cookie"],
+            ["official_with_cookie"],
         )
+
+    def test_cookie_policy_ignores_the_request_flag(self) -> None:
+        with patch.object(main, "cookie_enabled", return_value=True), patch.object(
+            main, "configured_cookie_header", return_value="SESSDATA=x; bili_jct=y"
+        ):
+            self.assertTrue(main.cookie_allowed(False))
+            self.assertTrue(main.cookie_allowed(True))
+        with patch.object(main, "cookie_enabled", return_value=False):
+            self.assertFalse(main.cookie_allowed(True))
 
 
 class RenderingTests(unittest.TestCase):

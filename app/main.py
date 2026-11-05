@@ -1,7 +1,7 @@
 import base64
 import asyncio
 import copy
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from difflib import SequenceMatcher
 import errno
 import gc
@@ -56,35 +56,23 @@ from app.asr.postprocess import normalize_segments
 from app.asr.signing import SignedAudioError, SignedAudioStore
 from app.asr.usage import UsageLedger, UsageLimitExceeded
 from app.maintenance import MaintenanceLoop
+from app import access
 from app.auth import (
     AuthFailure,
-    SESSION_COOKIE_NAME,
+    AuthUser,
     account_summary,
-    auth_user_from_request,
     auth_error,
-    change_password,
     clear_session_cookie,
-    create_session,
     delete_session,
     delete_user_sessions,
     initialize_auth_db,
-    invite_configured,
-    max_sessions_per_user,
-    register_user,
+    is_admin_user,
     require_admin_user,
     require_auth_user,
     resolve_session,
-    authenticate_user,
-    session_ttl_seconds,
+    session_cookie_name,
     set_session_cookie,
     user_count,
-)
-from app.guest import (
-    GUEST_COOKIE_NAME,
-    GuestIdentity,
-    GuestMediaRateLimiter,
-    GuestSessionCodec,
-    set_guest_cookie,
 )
 
 from app.douyin import (
@@ -115,6 +103,37 @@ from app.processes import (
     terminate_process,
     terminate_process_id,
 )
+from app.bilibili import (
+    RISK_CONTROL_API_CODES,
+    RISK_CONTROL_HTTP_STATUSES,
+    PlatformAccessGuard,
+    WbiKeyCache,
+    bili_page_number,
+    bili_redirect_host_allowed,
+    canonical_bili_url,
+    extract_aid,
+    extract_bili_url,
+    extract_bvid,
+    mixin_key_from_nav,
+    platform_block_failure,
+    wbi_sign,
+)
+from app.errors import (
+    USER_ERROR_MESSAGES,
+    ExtractionFailure,
+    error_retryable,
+    failure_user_message,
+    public_reason,
+    redact_sensitive,
+    stable_error_code,
+)
+from app.subtitles import (
+    SubtitleEntry,
+    deserialize_entries,
+    parse_json_subtitle,  # noqa: F401 - re-exported for callers of app.main
+    parse_subtitle_text,
+    render_entries,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -131,7 +150,7 @@ AsrQuality = Literal["fast", "balanced", "accurate"]
 
 
 APP_TITLE = os.getenv("APP_TITLE", "Video Workspace")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0-beta.6")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.2.0")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_INPUT_LENGTH = 512
 LOCAL_MEDIA_PROTOCOL_WHITELIST = "file,crypto,data"
@@ -458,12 +477,6 @@ if os.getenv("HF_ENDPOINT"):
 if os.getenv("HF_HUB_DISABLE_XET"):
     os.environ.setdefault("HF_HUB_DISABLE_XET", os.getenv("HF_HUB_DISABLE_XET", ""))
 
-MIXIN_KEY_ENC_TAB = [
-    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
-    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
-    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
-    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
-]
 LOGIN_QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
 LOGIN_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 LOGIN_COOKIE_NAMES = (
@@ -476,36 +489,10 @@ LOGIN_COOKIE_NAMES = (
     "buvid4",
 )
 QR_LOGIN_SESSIONS: dict[str, float] = {}
+BILI_RISK_COOLDOWN_SECONDS = max(0, int(os.getenv("BILI_RISK_COOLDOWN_SECONDS", "300")))
+BILI_ACCESS_GUARD = PlatformAccessGuard(BILI_RISK_COOLDOWN_SECONDS)
+BILI_WBI_KEYS = WbiKeyCache(ttl_seconds=max(60, int(os.getenv("BILI_WBI_KEY_TTL_SECONDS", "1800"))))
 QR_LOGIN_LOCK = Lock()
-BILI_URL_RE = re.compile(
-    r"(https?://(?:www\.)?(?:bilibili\.com|b23\.tv)[^\s<>'\"]+|"
-    r"(?:www\.)?(?:bilibili\.com|b23\.tv)/[^\s<>'\"]+)",
-    re.IGNORECASE,
-)
-TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？、)]}）】》"
-SENSITIVE_PATTERNS = (
-    re.compile(r"(?i)\bsk-[A-Za-z0-9._-]{8,}\b"),
-    re.compile(r"(?i)\b(authorization|cookie)\s*:\s*[^\r\n]+"),
-    re.compile(
-        r"(?i)\b("
-        r"authorization|cookie|token|access_token|password|passwd|secret|invite_code|qrcode_key|"
-        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie|mstoken|"
-        r"x-bogus|x_bogus|a_bogus|auth_key|signature"
-        r")([=:])([^;\s&]+)"
-    ),
-    re.compile(
-        r"(?i)([?&]("
-        r"authorization|cookie|token|access_token|password|passwd|secret|invite_code|qrcode_key|"
-        r"sessdata|bili_jct|dedeuserid|dedeuserid__ckmd5|bili_cookie|mstoken|"
-        r"x-bogus|x_bogus|a_bogus|auth_key|signature"
-        r")=)[^&\s]+"
-    ),
-)
-LOCAL_PATH_PATTERNS = (
-    re.compile(r"(?i)\bfile:///[^\s\"'<>]+"),
-    re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s\"'<>]+(?:/[^\s\"'<>]+)*)"),
-    re.compile(r"(?i)\b[A-Z]:[\\/][^\s\"'<>]+"),
-)
 UPLOAD_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 MEDIA_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 UPLOAD_ALLOWED_EXTENSIONS = frozenset(
@@ -579,27 +566,33 @@ class MediaJobRequest(MediaRequest):
     kind: Literal["media"] = "media"
     artifact_token: str = Field(..., pattern=r"^[0-9a-f]{32}$")
     owner_id: int
-    guest: bool = False
     max_bytes: int = Field(MEDIA_MAX_BYTES, gt=0)
     max_duration_seconds: int = Field(MEDIA_MAX_DURATION_SECONDS, gt=0)
     max_video_height: int = Field(1080, ge=240, le=2160)
     audio_bitrate_kbps: int = Field(192, ge=64, le=320)
 
 
-class RegisterRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=32)
-    password: str = Field(..., min_length=8, max_length=128)
-    invite_code: str = Field(..., min_length=4, max_length=128)
+class ActivateRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=64)
 
 
-class LoginRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=64)
-    password: str = Field(..., min_length=1, max_length=128)
+class MemberCreateRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=48)
+    max_devices: int | None = Field(default=None, ge=1, le=20)
+    daily_job_limit: int | None = Field(default=None, ge=0, le=1000)
+    expires_in_days: int | None = Field(default=None, ge=0, le=3650)
 
 
-class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(..., min_length=1, max_length=128)
-    new_password: str = Field(..., min_length=8, max_length=128)
+class MemberUpdateRequest(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=48)
+    max_devices: int | None = Field(default=None, ge=1, le=20)
+    daily_job_limit: int | None = Field(default=None, ge=0, le=1000)
+    expires_in_days: int | None = Field(default=None, ge=0, le=3650)
+    active: bool | None = None
+
+
+class UnlockRequest(BaseModel):
+    ip: str = Field(..., min_length=1, max_length=64)
 
 
 @dataclass
@@ -614,13 +607,6 @@ class SubtitleTrack:
 
 
 @dataclass
-class SubtitleEntry:
-    start: float
-    end: float
-    text: str
-
-
-@dataclass
 class ExtractionSource:
     title: str | None
     video_id: str | None
@@ -630,26 +616,6 @@ class ExtractionSource:
     duration: float | None = None
     platform: str = "bilibili"
     author: str | None = None
-
-
-class ExtractionFailure(Exception):
-    def __init__(
-        self,
-        status_code: int,
-        detail: str,
-        reason: str = "failed",
-        can_try_asr: bool = False,
-        terminal: bool = False,
-        retryable: bool | None = None,
-    ) -> None:
-        detail = redact_sensitive(detail)
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
-        self.reason = reason
-        self.can_try_asr = can_try_asr
-        self.terminal = terminal
-        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -732,84 +698,58 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-GUEST_MEDIA_SESSION_TTL_SECONDS = max(
-    300,
-    int(
-        os.getenv(
-            "GUEST_SESSION_TTL_SECONDS",
-            os.getenv("GUEST_MEDIA_SESSION_TTL_SECONDS", "86400"),
-        )
-    ),
-)
-GUEST_MEDIA_MAX_BYTES = min(
-    MEDIA_MAX_BYTES,
-    max(10_000_000, int(os.getenv("GUEST_MEDIA_MAX_BYTES", "262144000"))),
-)
-GUEST_MEDIA_MAX_DURATION_SECONDS = max(
-    60,
-    int(os.getenv("GUEST_MEDIA_MAX_DURATION_SECONDS", "1800")),
-)
-GUEST_MEDIA_MAX_VIDEO_HEIGHT = min(
-    1080,
-    max(240, int(os.getenv("GUEST_MEDIA_MAX_VIDEO_HEIGHT", "720"))),
-)
-GUEST_MEDIA_ARTIFACT_TTL_SECONDS = min(
-    MEDIA_ARTIFACT_TTL_SECONDS,
-    max(300, int(os.getenv("GUEST_MEDIA_ARTIFACT_TTL_SECONDS", "1800"))),
-)
-GUEST_MEDIA_AUDIO_BITRATE_KBPS = min(
-    320,
-    max(64, int(os.getenv("GUEST_MEDIA_AUDIO_BITRATE_KBPS", "160"))),
-)
-GUEST_MEDIA_MAX_ACTIVE_PER_SESSION = max(
-    1,
-    int(
-        os.getenv(
-            "GUEST_MEDIA_MAX_ACTIVE",
-            os.getenv("GUEST_MEDIA_MAX_ACTIVE_PER_SESSION", "1"),
-        )
-    ),
-)
-GUEST_SESSION_CODEC = GuestSessionCodec(
-    os.getenv("GUEST_MEDIA_SECRET", ""),
-    GUEST_MEDIA_SESSION_TTL_SECONDS,
-)
-GUEST_MEDIA_RATE_LIMITER = GuestMediaRateLimiter(
-    session_limit=max(1, int(os.getenv("GUEST_MEDIA_SESSION_HOURLY_LIMIT", "6"))),
-    global_limit=max(1, int(os.getenv("GUEST_MEDIA_GLOBAL_HOURLY_LIMIT", "24"))),
-)
+MEMBER_MAX_ACTIVE_JOBS = max(1, int(os.getenv("MEMBER_MAX_ACTIVE_JOBS", "2")))
 
 
-def guest_media_enabled() -> bool:
-    return bool(env_bool("GUEST_MEDIA_ENABLED", False) and GUEST_SESSION_CODEC.enabled)
+def request_owner_id(request: Request) -> int:
+    return require_auth_user(request).user_id
 
 
-def media_request_owner(
-    request: Request,
-    *,
-    create_guest: bool,
-) -> tuple[int, bool, tuple[str, GuestIdentity] | None]:
-    user = auth_user_from_request(request)
-    if user is not None:
-        return user.user_id, False, None
-    token = request.cookies.get(GUEST_COOKIE_NAME)
-    identity = GUEST_SESSION_CODEC.resolve(token)
-    if identity is not None:
-        return identity.owner_id, True, None
-    if not create_guest or not guest_media_enabled():
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "reason": "guest_session_expired" if token else "authentication_required",
-                "message": (
-                    "游客任务凭据已失效，请重新提交。"
-                    if token
-                    else "请先登录，或稍后再使用免登录媒体提取。"
-                ),
-            },
-        )
-    token, identity = GUEST_SESSION_CODEC.issue()
-    return identity.owner_id, True, (token, identity)
+def admit_job(user: AuthUser, idempotency_key: str | None) -> bool:
+    """Apply per-person limits before a new task and charge today's quota.
+
+    Returns True when a quota unit was charged, so the caller can refund it if
+    the task is not created or turns out to be a reused idempotent task.
+    """
+    if idempotency_key and JOB_MANAGER.get_by_idempotency(user.user_id, idempotency_key) is not None:
+        return False
+    if not is_admin_user(user):
+        owned = JOB_MANAGER.owner_stats(user.user_id)
+        if owned["queued"] + owned["running"] >= MEMBER_MAX_ACTIVE_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "reason": "member_busy",
+                    "code": "member_busy",
+                    "message": f"你已有 {MEMBER_MAX_ACTIVE_JOBS} 个任务在处理，等它们完成后再提交。",
+                    "retryable": True,
+                },
+            )
+    try:
+        access.consume_job_quota(user.user_id)
+    except AuthFailure as exc:
+        raise auth_error(exc) from exc
+    return True
+
+
+@contextmanager
+def charged_job(user: AuthUser, idempotency_key: str | None) -> Any:
+    """Charge a quota unit for the task created inside the block.
+
+    The block sets ``state["job"]``; the unit is refunded when the block fails
+    or the job manager hands back an existing task instead of a new one.
+    """
+    charged = admit_job(user, idempotency_key)
+    state: dict[str, Any] = {}
+    try:
+        yield state
+    except BaseException:
+        if charged:
+            access.refund_job_quota(user.user_id)
+        raise
+    job = state.get("job")
+    if charged and isinstance(job, dict) and job.get("reused"):
+        access.refund_job_quota(user.user_id)
 
 
 def enforce_cloud_consent(asr_mode: str, consent: bool) -> None:
@@ -1493,136 +1433,6 @@ def report_progress(stage: str, progress: int, message: str) -> None:
         callback(stage, progress, message)
 
 
-def redact_sensitive(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: redact_sensitive(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_sensitive(item) for item in value]
-    if not isinstance(value, str):
-        return value
-    redacted = value
-    for pattern in SENSITIVE_PATTERNS:
-        if pattern.groups >= 3:
-            redacted = pattern.sub(lambda match: match.group(1) + match.group(2) + "<redacted>", redacted)
-        elif pattern.groups == 2:
-            redacted = pattern.sub(lambda match: match.group(1) + "<redacted>", redacted)
-        else:
-            redacted = pattern.sub("<redacted>", redacted)
-    for pattern in LOCAL_PATH_PATTERNS:
-        redacted = pattern.sub("<local-path>", redacted)
-    return redacted
-
-
-def public_reason(reason: str) -> str:
-    return {
-        "not_found": "video_not_found",
-        "timeout": "asr_timeout",
-        "audio_extract_failed": "download_failed",
-        "subtitle_download_failed": "download_failed",
-        "short_link_request_failed": "download_failed",
-        "douyin_api_failed": "platform_temporarily_unavailable",
-        "douyin_cookie_refresh_failed": "platform_temporarily_unavailable",
-        "douyin_media_missing": "download_failed",
-    }.get(reason, reason)
-
-
-def stable_error_code(reason: str) -> str:
-    normalized = public_reason(reason)
-    return {
-        "invalid_input": "invalid_url",
-        "input_too_long": "invalid_url",
-        "invalid_page": "invalid_url",
-        "short_link_unresolved": "invalid_url",
-        "short_link_untrusted": "invalid_url",
-        "short_link_loop": "invalid_url",
-        "video_not_found": "video_unavailable",
-        "no_official_subtitle": "subtitle_unavailable",
-        "subtitle_empty": "subtitle_unavailable",
-        "empty_subtitle": "subtitle_unavailable",
-        "subtitle_parse_failed": "subtitle_unavailable",
-        "unsupported_subtitle_format": "subtitle_unavailable",
-        "asr_empty": "subtitle_unavailable",
-        "ocr_empty": "subtitle_unavailable",
-        "audio_stream_missing": "no_audio_stream",
-        "upload_audio_missing": "no_audio_stream",
-        "audio_extract_failed": "download_failed",
-        "download_too_large": "media_too_large",
-        "media_convert_failed": "ffmpeg_failed",
-        "media_probe_timeout": "ffmpeg_failed",
-        "upload_probe_timeout": "ffmpeg_failed",
-        "invalid_downloaded_media": "download_failed",
-        "queue_full": "job_queue_full",
-        "job_not_found": "job_expired",
-        "job_cancelled": "task_cancelled",
-        "asr_provider_not_configured": "asr_provider_not_configured",
-        "asr_daily_limit_reached": "asr_daily_limit_reached",
-        "asr_monthly_limit_reached": "asr_monthly_limit_reached",
-        "asr_total_limit_reached": "asr_total_limit_reached",
-        "asr_user_daily_limit_reached": "asr_user_daily_limit_reached",
-    }.get(normalized, normalized)
-
-
-USER_ERROR_MESSAGES = {
-    "invalid_url": "请输入有效的 B站或抖音视频链接。",
-    "unsupported_platform": "暂不支持这个视频平台。",
-    "video_unavailable": "视频不存在、已下架或当前账号无权访问。",
-    "subtitle_unavailable": "没有找到可读取的字幕或语音内容。",
-    "cookie_expired": "B站登录态已失效，请刷新 Cookie 或关闭 Cookie 后重试。",
-    "download_failed": "媒体下载或音轨准备失败，请稍后重试。",
-    "media_too_large": "媒体文件超过服务器允许的大小。",
-    "upload_too_large": "上传文件超过服务器允许的大小。",
-    "disk_space_low": "服务器剩余磁盘空间不足，请稍后重试。",
-    "no_audio_stream": "视频没有音轨，无法进行语音识别或生成 MP3。",
-    "no_subtitle_stream": "视频没有可读取的文本字幕轨。",
-    "asr_timeout": "语音识别超时，请缩短视频或稍后重试。",
-    "asr_worker_crashed": "语音识别进程意外退出，可能是内存不足；请稍后重试。",
-    "asr_model_download_failed": "语音识别模型不可用或下载失败，请检查模型缓存与网络。",
-    "asr_failed": "本地语音识别失败，请稍后重试。",
-    "asr_busy": "精确处理资源正忙，请稍后重试。",
-    "asr_provider_not_configured": "云端语音识别尚未完成配置。",
-    "asr_provider_auth_failed": "云端语音识别凭证无效或模型权限不足。",
-    "asr_provider_unavailable": "云端语音识别服务暂时不可用，请稍后重试。",
-    "asr_temp_upload_failed": "云端临时音频上传失败，请稍后重试。",
-    "asr_provider_rejected": "云端语音识别无法处理这个音频。",
-    "asr_provider_failed": "云端语音识别任务失败，请稍后重试。",
-    "asr_provider_response_invalid": "云端语音识别返回的数据异常，请稍后重试。",
-    "asr_result_download_failed": "云端识别已完成，但结果下载失败。",
-    "asr_audio_fetch_failed": "云端语音识别无法读取临时音频，请稍后重试。",
-    "asr_rate_limited": "云端语音识别请求过于频繁，请稍后重试。",
-    "asr_quota_exhausted": "免费额度已用尽，系统未继续产生付费调用。",
-    "asr_daily_limit_reached": "今日云端语音识别额度已用尽。",
-    "asr_monthly_limit_reached": "本月云端语音识别额度已用尽。",
-    "asr_total_limit_reached": "云端语音识别总免费额度保护线已达到。",
-    "asr_user_daily_limit_reached": "你今天可使用的云端识别时长已用尽。",
-    "ocr_timeout": "画面字幕识别超时，请缩短视频或稍后重试。",
-    "ocr_failed": "画面字幕识别失败；有音轨时会自动尝试语音识别。",
-    "ocr_missing": "服务器未安装画面字幕识别组件。",
-    "ffmpeg_failed": "媒体探测或转换失败，请确认文件可正常播放。",
-    "ffmpeg_missing": "服务器缺少 FFmpeg 或 ffprobe。",
-    "job_queue_full": "任务队列已满，请稍后重试。",
-    "job_expired": "服务可能已重启或任务已过期，请重新提交。",
-    "task_cancelled": "任务已取消。",
-    "invalid_upload_media": "上传文件不是可读取的视频媒体。",
-    "upload_video_missing": "上传文件中没有视频轨。",
-    "asr_duration_too_long": "视频时长超过当前服务器的处理限制。",
-    "cookie_required": "此视频需要有效的 B站登录态。",
-    "platform_temporarily_unavailable": "平台暂时拒绝了请求，请稍后重试。",
-    "douyin_browser_busy": "抖音浏览器资源正忙，请稍后重试。",
-}
-
-
-def error_retryable(status_code: int, code: str, override: bool | None = None) -> bool:
-    if override is not None:
-        return override
-    if code in {"invalid_url", "unsupported_platform", "video_unavailable", "media_too_large", "upload_too_large"}:
-        return False
-    return status_code in {408, 409, 425, 429, 500, 502, 503, 504, 507}
-
-
-def failure_user_message(exc: ExtractionFailure) -> str:
-    return USER_ERROR_MESSAGES.get(stable_error_code(exc.reason), "平台字幕不可用。")
-
-
 def extraction_error_detail(
     source: str,
     exc: ExtractionFailure,
@@ -1792,24 +1602,6 @@ def result_key_guard(key: str, blocking: bool = True):
                 RESULT_KEY_LOCKS.pop(key, None)
 
 
-def deserialize_entries(items: Any) -> list[SubtitleEntry]:
-    if not isinstance(items, list):
-        return []
-    entries: list[SubtitleEntry] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            text = str(item.get("text") or "").strip()
-            start = float(item.get("start") or 0)
-            end = float(item.get("end") or 0)
-            if text and math.isfinite(start) and math.isfinite(end):
-                entries.append(SubtitleEntry(start, end, text))
-        except (TypeError, ValueError, OverflowError):
-            continue
-    return entries
-
-
 def load_cached_result(key: str, now: float | None = None) -> tuple[list[SubtitleEntry], dict[str, Any], float] | None:
     with RESULT_CACHE_IO_LOCK:
         return _load_cached_result(key, now)
@@ -1942,24 +1734,6 @@ def failure_record(source: str, exc: ExtractionFailure) -> dict[str, Any]:
     }
 
 
-def bili_page_number(value: str) -> int:
-    candidate = extract_bili_url(value) or value.strip()
-    raw_page = (urllib.parse.parse_qs(urllib.parse.urlparse(candidate).query).get("p") or ["1"])[0]
-    try:
-        page = int(raw_page)
-    except (TypeError, ValueError) as exc:
-        raise ExtractionFailure(400, "Bilibili page number must be an integer.", "invalid_page", terminal=True) from exc
-    if page < 1 or page > 10_000:
-        raise ExtractionFailure(400, "Bilibili page number is out of range.", "invalid_page", terminal=True)
-    return page
-
-
-def canonical_bili_url(bvid: str, value: str) -> str:
-    page = bili_page_number(value)
-    base = f"https://www.bilibili.com/video/{bvid}"
-    return f"{base}?p={page}" if page > 1 else base
-
-
 def normalize_input(value: str) -> str:
     value = value.strip()
     if len(value) > MAX_INPUT_LENGTH:
@@ -1991,26 +1765,6 @@ def normalize_input(value: str) -> str:
 
 def detect_platform(value: str) -> str:
     return "douyin" if is_douyin_url(value) else "bilibili"
-
-
-def extract_bvid(value: str) -> str | None:
-    match = re.search(r"(BV[0-9A-Za-z]{8,})", value)
-    return match.group(1) if match else None
-
-
-def extract_bili_url(value: str) -> str | None:
-    match = BILI_URL_RE.search(value)
-    if not match:
-        return None
-    url = match.group(1).rstrip(TRAILING_URL_PUNCTUATION)
-    if not re.match(r"https?://", url, flags=re.IGNORECASE):
-        url = f"https://{url}"
-    return url
-
-
-def bili_redirect_host_allowed(host: str | None) -> bool:
-    value = (host or "").lower().rstrip(".")
-    return any(value == root or value.endswith(f".{root}") for root in ("b23.tv", "bilibili.com"))
 
 
 @lru_cache(maxsize=128)
@@ -2105,7 +1859,9 @@ def configured_cookie_header() -> str | None:
 
 
 def cookie_enabled() -> bool:
-    return env_bool("COOKIE_ENABLED", False) or (web_qr_login_enabled() and BILI_COOKIE_PATH.is_file())
+    """A login state counts when the owner saved one by QR login, or when an
+    environment cookie is explicitly enabled."""
+    return env_bool("COOKIE_ENABLED", False) or BILI_COOKIE_PATH.is_file()
 
 
 def cookie_header(allow_cookie: bool) -> str | None:
@@ -2114,12 +1870,16 @@ def cookie_header(allow_cookie: bool) -> str | None:
     return configured_cookie_header()
 
 
-def cookie_allowed(requested: bool) -> bool:
-    return bool(requested and cookie_enabled() and configured_cookie_header())
+def cookie_allowed(requested: bool = True) -> bool:
+    """Whether Bilibili requests go out with the owner's login state.
 
-
-def web_qr_login_enabled() -> bool:
-    return env_bool("WEB_QR_LOGIN_ENABLED", False)
+    Everyone here came in through the gate, and Bilibili refuses anonymous
+    requests from datacenter addresses, so the saved login state is used for
+    every Bilibili request whenever it exists. ``requested`` is accepted for
+    API compatibility only.
+    """
+    del requested
+    return bool(cookie_enabled() and configured_cookie_header())
 
 
 def save_bili_cookie(cookie: str) -> None:
@@ -2150,6 +1910,99 @@ def save_bili_cookie(cookie: str) -> None:
             },
         ) from exc
     os.environ.update({"BILI_COOKIE": value, "BILI_SESSDATA": "", "BILI_JCT": "", "BILI_BUVID3": ""})
+    with BILI_ACCOUNT_LOCK:
+        BILI_ACCOUNT_CACHE.update({"at": 0.0, "value": None})
+
+
+BILI_ACCOUNT_LOCK = Lock()
+BILI_ACCOUNT_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+BILI_ACCOUNT_CACHE_SECONDS = 120
+
+
+def bilibili_account_status(refresh: bool = False) -> dict[str, Any]:
+    """Who the saved Bilibili login belongs to, for the owner console only."""
+    if not cookie_allowed(True):
+        return {"state": "none", "logged_in": False}
+    now = time.time()
+    with BILI_ACCOUNT_LOCK:
+        cached = BILI_ACCOUNT_CACHE["value"]
+        if cached is not None and not refresh and now - BILI_ACCOUNT_CACHE["at"] < BILI_ACCOUNT_CACHE_SECONDS:
+            return cached
+    try:
+        saved_at: int | None = int(BILI_COOKIE_PATH.stat().st_mtime)
+    except OSError:
+        saved_at = None
+    status: dict[str, Any] = {"saved_at": saved_at, "checked_at": int(now)}
+    try:
+        payload = api_get_json(
+            "https://api.bilibili.com/x/web-interface/nav",
+            "https://www.bilibili.com/",
+            allow_cookie=True,
+        )
+    except ExtractionFailure as exc:
+        if exc.reason == "cookie_expired":
+            status.update({"state": "expired", "logged_in": False, "message": "登录已失效，请重新扫码。"})
+        elif exc.reason == "platform_risk_control":
+            status.update({"state": "blocked", "logged_in": True, "message": "B站暂时拒绝了本站的请求。"})
+        else:
+            status.update({"state": "unknown", "logged_in": True, "message": "暂时无法确认登录状态。"})
+    else:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if data.get("isLogin"):
+            level = data.get("level_info") if isinstance(data.get("level_info"), dict) else {}
+            vip_label = data.get("vip_label") if isinstance(data.get("vip_label"), dict) else {}
+            status.update(
+                {
+                    "state": "ok",
+                    "logged_in": True,
+                    "uname": str(data.get("uname") or "")[:40],
+                    "mid": int(data.get("mid") or 0) or None,
+                    "level": level.get("current_level"),
+                    "vip": bool(data.get("vipStatus")),
+                    "vip_label": str(vip_label.get("text") or "")[:20],
+                }
+            )
+        else:
+            status.update({"state": "expired", "logged_in": False, "message": "登录已失效，请重新扫码。"})
+    with BILI_ACCOUNT_LOCK:
+        BILI_ACCOUNT_CACHE.update({"at": now, "value": status})
+    return status
+
+
+def bilibili_logout() -> dict[str, Any]:
+    """Sign the saved session out at Bilibili (best effort) and forget it."""
+    cookie = configured_cookie_header() if BILI_COOKIE_PATH.is_file() else None
+    remote = False
+    if cookie:
+        jar = SimpleCookie()
+        try:
+            jar.load(cookie)
+        except Exception:
+            jar = SimpleCookie()
+        csrf = jar.get("bili_jct")
+        if csrf is not None and csrf.value:
+            try:
+                with httpx.Client(
+                    timeout=10,
+                    follow_redirects=False,
+                    headers=headers_for("https://www.bilibili.com/", True),
+                    event_hooks={"request": [validate_public_request]},
+                ) as client:
+                    resp = client.post(
+                        "https://passport.bilibili.com/login/exit/v2",
+                        data={"biliCSRF": csrf.value},
+                    )
+                    remote = resp.status_code == 200 and resp.json().get("code") == 0
+            except Exception as exc:
+                LOGGER.warning("Bilibili logout request failed: %s", redact_sensitive(str(exc)))
+    with QR_LOGIN_LOCK:
+        BILI_COOKIE_PATH.unlink(missing_ok=True)
+    os.environ.update({"BILI_COOKIE": "", "BILI_SESSDATA": "", "BILI_JCT": "", "BILI_BUVID3": ""})
+    BILI_ACCESS_GUARD.reset()
+    with BILI_ACCOUNT_LOCK:
+        BILI_ACCOUNT_CACHE.update({"at": 0.0, "value": None})
+    LOGGER.info("Bilibili login state removed by owner remote=%s", remote)
+    return {"ok": True, "remote_signed_out": remote}
 
 
 def cookie_header_from_set_cookie(headers: list[str]) -> str:
@@ -2202,7 +2055,41 @@ def remaining_before(deadline: float, label: str) -> float:
     return max(1.0, remaining)
 
 
-def api_get_json(url: str, referer: str, allow_cookie: bool = False) -> dict[str, Any]:
+BILI_MIN_INTERVAL_SECONDS = max(0.0, float(os.getenv("BILI_MIN_INTERVAL_SECONDS", "0.8")))
+BILI_PACE_LOCK = Lock()
+BILI_PACE_STATE = {"last": 0.0}
+
+
+def pace_signed_in_request() -> None:
+    """Space out API calls made with the owner's account so it never bursts."""
+    if BILI_MIN_INTERVAL_SECONDS <= 0:
+        return
+    with BILI_PACE_LOCK:
+        wait = BILI_PACE_STATE["last"] + BILI_MIN_INTERVAL_SECONDS - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        BILI_PACE_STATE["last"] = time.monotonic()
+
+
+def api_get_json(
+    url: str,
+    referer: str,
+    allow_cookie: bool = False,
+    *,
+    wbi_signed: bool = False,
+) -> dict[str, Any]:
+    """GET a Bilibili JSON API and normalize its failure modes.
+
+    HTTP 412 and risk-control API codes mean Bilibili refused this server;
+    they start the access-guard cooldown and fail fast as
+    ``platform_risk_control`` instead of being reported as a broken link.
+    For WBI-signed URLs a -352 usually means the cached key rotated, so the
+    key is dropped and ``wbi_rejected`` lets the caller re-sign once.
+    """
+    with_cookie = bool(allow_cookie)
+    BILI_ACCESS_GUARD.check(with_cookie)
+    if with_cookie:
+        pace_signed_in_request()
     try:
         with httpx.Client(
             timeout=20,
@@ -2211,14 +2098,27 @@ def api_get_json(url: str, referer: str, allow_cookie: bool = False) -> dict[str
             event_hooks={"request": [validate_public_request]},
         ) as client:
             resp = client.get(url)
+            if resp.status_code in RISK_CONTROL_HTTP_STATUSES:
+                BILI_ACCESS_GUARD.record_block(with_cookie)
+                LOGGER.warning("Bilibili refused an API request status=%s", resp.status_code)
+                raise platform_block_failure()
             resp.raise_for_status()
             data = resp.json()
+    except ExtractionFailure:
+        raise
     except Exception as exc:
         raise ExtractionFailure(502, f"Bilibili API request failed: {exc}", "api_request_failed") from exc
     if not isinstance(data, dict):
         raise ExtractionFailure(502, "Bilibili API returned an unexpected response.", "api_bad_response")
-    if data.get("code") != 0:
-        code = data.get("code")
+    code = data.get("code")
+    if code in RISK_CONTROL_API_CODES:
+        if wbi_signed:
+            BILI_WBI_KEYS.invalidate()
+            raise ExtractionFailure(502, "Bilibili rejected the WBI signature.", "wbi_rejected")
+        BILI_ACCESS_GUARD.record_block(with_cookie)
+        LOGGER.warning("Bilibili refused an API request code=%s", code)
+        raise platform_block_failure()
+    if code != 0:
         message = data.get("message")
         if code in {-400, -404, 62002, 62004}:
             raise ExtractionFailure(404, f"Bilibili API error: {message}", "not_found", terminal=True)
@@ -2231,6 +2131,7 @@ def api_get_json(url: str, referer: str, allow_cookie: bool = False) -> dict[str
                 retryable=True,
             )
         raise ExtractionFailure(502, f"Bilibili API error: {message}", "api_error")
+    BILI_ACCESS_GUARD.record_success(with_cookie)
     return data
 
 
@@ -2254,7 +2155,7 @@ def extract_info(url: str, allow_cookie: bool = False, skip_download: bool = Tru
     return info
 
 
-def wbi_mixin_key(allow_cookie: bool = False) -> str | None:
+def fetch_wbi_mixin_key(allow_cookie: bool = False) -> str | None:
     try:
         with httpx.Client(
             timeout=20,
@@ -2264,34 +2165,40 @@ def wbi_mixin_key(allow_cookie: bool = False) -> str | None:
         ) as client:
             resp = client.get("https://api.bilibili.com/x/web-interface/nav")
             resp.raise_for_status()
-            data = resp.json()
+            return mixin_key_from_nav(resp.json())
     except Exception:
         return None
-    wbi_img = ((data.get("data") or {}).get("wbi_img") or {}) if isinstance(data, dict) else {}
-    img_key = str(wbi_img.get("img_url") or "").rsplit("/", 1)[-1].split(".")[0]
-    sub_key = str(wbi_img.get("sub_url") or "").rsplit("/", 1)[-1].split(".")[0]
-    raw = img_key + sub_key
-    if len(raw) < 64:
-        return None
-    return "".join(raw[i] for i in MIXIN_KEY_ENC_TAB)[:32]
+
+
+def wbi_mixin_key(allow_cookie: bool = False) -> str | None:
+    return BILI_WBI_KEYS.get(lambda: fetch_wbi_mixin_key(allow_cookie))
 
 
 def wbi_signed_url(base_url: str, params: dict[str, Any], allow_cookie: bool = False) -> str:
     mixin_key = wbi_mixin_key(allow_cookie)
     if not mixin_key:
         return base_url + "?" + urllib.parse.urlencode(params)
-    signed = {
-        key: "".join(ch for ch in str(value) if ch not in "!'()*")
-        for key, value in params.items()
-        if value is not None and value != ""
-    }
-    signed["wts"] = str(int(time.time()))
-    query = urllib.parse.urlencode(sorted(signed.items()))
-    signed["w_rid"] = hashlib.md5(
-        (query + mixin_key).encode("utf-8"),
-        usedforsecurity=False,
-    ).hexdigest()
-    return base_url + "?" + urllib.parse.urlencode(sorted(signed.items()))
+    return base_url + "?" + urllib.parse.urlencode(wbi_sign(params, mixin_key))
+
+
+def wbi_get_json(base_url: str, params: dict[str, Any], referer: str, allow_cookie: bool = False) -> dict[str, Any]:
+    """Signed GET that re-signs once when the cached WBI key has rotated."""
+    try:
+        return api_get_json(
+            wbi_signed_url(base_url, params, allow_cookie),
+            referer,
+            allow_cookie,
+            wbi_signed=True,
+        )
+    except ExtractionFailure as exc:
+        if exc.reason != "wbi_rejected":
+            raise
+    return api_get_json(
+        wbi_signed_url(base_url, params, allow_cookie),
+        referer,
+        allow_cookie,
+        wbi_signed=True,
+    )
 
 
 def bili_view_context(
@@ -2299,14 +2206,25 @@ def bili_view_context(
     allow_cookie: bool = False,
 ) -> tuple[str, str, dict[str, Any], dict[str, Any] | None, Any]:
     bvid = extract_bvid(url)
-    if not bvid:
+    aid = None if bvid else extract_aid(url)
+    if not bvid and not aid:
         raise ExtractionFailure(400, "Could not find a BV id in the input.", "invalid_bvid", terminal=True)
-    canonical_url = canonical_bili_url(bvid, url)
-    view_url = f"https://api.bilibili.com/x/web-interface/view?bvid={quote(bvid)}"
-    view = api_get_json(view_url, canonical_url, allow_cookie)
+    if bvid:
+        canonical_url = canonical_bili_url(bvid, url)
+        view_url = f"https://api.bilibili.com/x/web-interface/view?bvid={quote(bvid)}"
+        referer = canonical_url
+    else:
+        view_url = f"https://api.bilibili.com/x/web-interface/view?aid={aid}"
+        referer = "https://www.bilibili.com/"
+    view = api_get_json(view_url, referer, allow_cookie)
     data = view.get("data") or {}
     if not isinstance(data, dict):
         raise ExtractionFailure(502, "Bilibili view API returned no data.", "api_bad_response")
+    if not bvid:
+        bvid = extract_bvid(str(data.get("bvid") or ""))
+        if not bvid:
+            raise ExtractionFailure(502, "Bilibili view API returned no BV id.", "api_bad_response")
+        canonical_url = canonical_bili_url(bvid, url)
     pages = [item for item in (data.get("pages") or []) if isinstance(item, dict)]
     page_number = bili_page_number(canonical_url)
     if pages and page_number > len(pages):
@@ -2325,19 +2243,30 @@ def bili_view_context(
     return bvid, canonical_url, data, selected_page, cid
 
 
+def ytdlp_view_source(url: str, allow_cookie: bool = False) -> ExtractionSource:
+    info = extract_info(url, allow_cookie=allow_cookie)
+    return ExtractionSource(
+        title=info.get("title"),
+        video_id=str(info.get("id") or "") or None,
+        webpage_url=str(info.get("webpage_url") or url),
+        tracks=[],
+        duration=float(info.get("duration") or 0) or None,
+        platform="bilibili",
+        author=info.get("uploader"),
+    )
+
+
 def view_source(url: str, allow_cookie: bool = False) -> ExtractionSource:
-    if not extract_bvid(url):
-        info = extract_info(url, allow_cookie=allow_cookie)
-        return ExtractionSource(
-            title=info.get("title"),
-            video_id=str(info.get("id") or "") or None,
-            webpage_url=str(info.get("webpage_url") or url),
-            tracks=[],
-            duration=float(info.get("duration") or 0) or None,
-            platform="bilibili",
-            author=info.get("uploader"),
-        )
-    bvid, canonical_url, data, selected_page, _ = bili_view_context(url, allow_cookie)
+    if not extract_bvid(url) and not extract_aid(url):
+        return ytdlp_view_source(url, allow_cookie)
+    try:
+        bvid, canonical_url, data, selected_page, _ = bili_view_context(url, allow_cookie)
+    except ExtractionFailure as exc:
+        # yt-dlp reaches the same servers; only retry it for transient API errors.
+        if exc.terminal:
+            raise
+        LOGGER.info("Bilibili view API failed reason=%s; trying yt-dlp metadata", exc.reason)
+        return ytdlp_view_source(url, allow_cookie)
     page_number = bili_page_number(canonical_url)
     title = data.get("title")
     if page_number > 1 and selected_page and selected_page.get("part"):
@@ -2362,12 +2291,12 @@ def bili_api_source(url: str, allow_cookie: bool = False) -> ExtractionSource:
     aid = data.get("aid")
     view_subtitles = ((data.get("subtitle") or {}).get("list") or []) if isinstance(data.get("subtitle"), dict) else []
 
-    player_url = wbi_signed_url(
+    player = wbi_get_json(
         "https://api.bilibili.com/x/player/wbi/v2",
         {"aid": aid, "bvid": bvid, "cid": cid},
+        canonical_url,
         allow_cookie,
     )
-    player = api_get_json(player_url, canonical_url, allow_cookie)
     player_data = player.get("data") or {}
     subtitles = ((player_data.get("subtitle") or {}).get("subtitles") or []) if isinstance(player_data, dict) else []
     tracks: list[SubtitleTrack] = []
@@ -2503,114 +2432,6 @@ def fetch_subtitle(track: SubtitleTrack, referer: str, allow_cookie: bool = Fals
         raise ExtractionFailure(502, f"Subtitle download failed: {exc}", "subtitle_download_failed") from exc
 
 
-def parse_json_subtitle(text: str) -> list[SubtitleEntry]:
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ExtractionFailure(502, "Subtitle JSON could not be parsed.", "subtitle_parse_failed") from exc
-    body: Any = None
-    millisecond_times = False
-    if isinstance(data, dict):
-        body = data.get("body")
-        if not isinstance(body, list):
-            body = data.get("utterances")
-            millisecond_times = isinstance(body, list)
-        if not isinstance(body, list) and isinstance(data.get("data"), dict):
-            body = data["data"].get("utterances") or data["data"].get("body")
-            millisecond_times = isinstance(data["data"].get("utterances"), list)
-    elif isinstance(data, list):
-        body = data
-    if not isinstance(body, list):
-        raise ExtractionFailure(502, "字幕 JSON 中没有可识别的字幕列表。", "subtitle_parse_failed")
-    entries: list[SubtitleEntry] = []
-    for item in body:
-        if not isinstance(item, dict):
-            continue
-        start = item.get("from", item.get("start", item.get("start_time", 0)))
-        end = item.get("to", item.get("end", item.get("end_time", start)))
-        content = item.get("content", item.get("text", ""))
-        try:
-            start_value = float(start)
-            end_value = float(end)
-            if millisecond_times or "start_time" in item or "end_time" in item:
-                start_value /= 1000
-                end_value /= 1000
-            entries.append(SubtitleEntry(start_value, end_value, str(content).strip()))
-        except (TypeError, ValueError):
-            continue
-    return [e for e in entries if e.text]
-
-
-def subtitle_time_to_seconds(value: str) -> float:
-    normalized = value.strip().replace(",", ".")
-    parts = normalized.split(":")
-    if len(parts) == 3:
-        hours, minutes, seconds = parts
-    elif len(parts) == 2:
-        hours, minutes, seconds = "0", parts[0], parts[1]
-    else:
-        raise ValueError("invalid subtitle timecode")
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-
-
-SUBTITLE_TIMING_RE = re.compile(
-    r"(?P<start>\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3})\s*-->\s*"
-    r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3})(?:\s+.*)?$"
-)
-
-
-def parse_timed_subtitle(text: str) -> list[SubtitleEntry]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
-    entries: list[SubtitleEntry] = []
-    for block in re.split(r"\n\s*\n", normalized):
-        lines = [line.strip() for line in block.split("\n") if line.strip()]
-        if not lines or lines[0].upper().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
-            continue
-        timing_index = next((index for index, line in enumerate(lines[:3]) if "-->" in line), -1)
-        if timing_index < 0:
-            continue
-        match = SUBTITLE_TIMING_RE.search(lines[timing_index])
-        if not match:
-            continue
-        caption = "\n".join(lines[timing_index + 1 :]).strip()
-        if not caption:
-            continue
-        try:
-            entries.append(
-                SubtitleEntry(
-                    subtitle_time_to_seconds(match.group("start")),
-                    subtitle_time_to_seconds(match.group("end")),
-                    caption,
-                )
-            )
-        except ValueError:
-            continue
-    if not entries:
-        raise ExtractionFailure(502, "字幕文件中没有可识别的时间轴。", "subtitle_parse_failed")
-    return entries
-
-
-def parse_subtitle_text(text: str, ext: str) -> list[SubtitleEntry]:
-    normalized_ext = (ext or "").lower()
-    if normalized_ext == "json":
-        return parse_json_subtitle(text)
-    if normalized_ext in {"srt", "vtt", "webvtt"}:
-        return parse_timed_subtitle(text)
-    raise ExtractionFailure(502, f"暂不支持转换 {normalized_ext or 'unknown'} 字幕格式。", "unsupported_subtitle_format")
-
-
-def seconds_to_srt(value: float) -> str:
-    ms_total = max(0, int(round(value * 1000)))
-    hours, rem = divmod(ms_total, 3600_000)
-    minutes, rem = divmod(rem, 60_000)
-    seconds, ms = divmod(rem, 1000)
-    return f"{hours:02}:{minutes:02}:{seconds:02},{ms:03}"
-
-
-def seconds_to_vtt(value: float) -> str:
-    return seconds_to_srt(value).replace(",", ".")
-
-
 def public_result_metadata(meta: Any) -> dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
@@ -2619,37 +2440,6 @@ def public_result_metadata(meta: Any) -> dict[str, Any]:
         for key in PUBLIC_RESULT_METADATA_FIELDS
         if key in meta and meta[key] is not None
     }
-
-
-def render_entries(entries: list[SubtitleEntry], output_format: str, meta: dict[str, Any]) -> str:
-    fmt = "markdown" if output_format == "md" else output_format
-    if fmt == "json":
-        payload = {
-            "metadata": meta,
-            "entries": [{"start": e.start, "end": e.end, "text": e.text} for e in entries],
-        }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
-    if fmt == "txt":
-        return "\n".join(e.text for e in entries) + "\n"
-    if fmt == "markdown":
-        lines = [f"# {meta.get('title') or 'Video Subtitle'}", ""]
-        note = meta.get("note") or meta.get("warning")
-        if note:
-            lines.extend([f"> {note}", ""])
-        for e in entries:
-            lines.append(f"- `{seconds_to_vtt(e.start)}` {e.text}")
-        return "\n".join(lines) + "\n"
-    if fmt == "srt":
-        blocks = []
-        for i, e in enumerate(entries, 1):
-            blocks.append(f"{i}\n{seconds_to_srt(e.start)} --> {seconds_to_srt(e.end)}\n{e.text}")
-        return "\n\n".join(blocks) + "\n"
-    if fmt == "vtt":
-        blocks = ["WEBVTT", ""]
-        for e in entries:
-            blocks.append(f"{seconds_to_vtt(e.start)} --> {seconds_to_vtt(e.end)}\n{e.text}\n")
-        return "\n".join(blocks)
-    raise ExtractionFailure(400, "Unsupported output format.", "unsupported_format", terminal=True)
 
 
 def rendered_raw_content(meta: dict[str, Any], output_format: str) -> str | None:
@@ -2682,6 +2472,33 @@ def public_result_payload(result: Any) -> dict[str, Any]:
             document["metadata"] = metadata
             payload[field] = json.dumps(document, ensure_ascii=False, indent=2)
     return payload
+
+
+PUBLIC_SEGMENT_LIMIT = 20_000
+
+
+def public_segments(items: Any) -> list[dict[str, Any]]:
+    return [
+        {"start": round(entry.start, 3), "end": round(entry.end, 3), "text": entry.text}
+        for entry in deserialize_entries(items)[:PUBLIC_SEGMENT_LIMIT]
+    ]
+
+
+def public_result_segments(result: Any) -> dict[str, Any]:
+    """Timed transcript lines for the owner's reading view.
+
+    Only completed subtitle jobs carry private ``_entries``; media jobs and
+    legacy records simply omit the fields and the browser falls back to the
+    exported text.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("_entries"), list):
+        return {}
+    segments: dict[str, Any] = {"segments": public_segments(result["_entries"])}
+    metadata = result.get("metadata")
+    raw = public_segments(metadata.get("raw_entries")) if isinstance(metadata, dict) else []
+    if raw:
+        segments["raw_segments"] = raw
+    return segments
 
 
 def public_error_payload(error: Any) -> dict[str, Any]:
@@ -2724,6 +2541,7 @@ def public_job_payload(job: Any) -> dict[str, Any]:
     }
     if job.get("status") == "completed" and "result" in job:
         payload["result"] = public_result_payload(job["result"])
+        payload["result"].update(public_result_segments(job["result"]))
     elif job.get("status") == "failed" and "error" in job:
         payload["error"] = public_error_payload(job["error"])
     return payload
@@ -2764,33 +2582,37 @@ def official_subtitle(req: ExtractRequest, allow_cookie: bool, source_label: str
         )
         attempts.append("douyin_signed_api")
     else:
+        # The JSON API is fast and is what yt-dlp itself reads subtitles from,
+        # so it goes first; yt-dlp only covers link shapes the API cannot parse
+        # and transient API errors.
+        report_progress("platform", 18, "正在查询 B站字幕")
+        api_failure: ExtractionFailure | None = None
         try:
-            report_progress("platform", 18, "正在查询 B站字幕")
-            info = extract_info(url, allow_cookie=allow_cookie)
-            tracks = subtitle_tracks(info)
+            source = bili_api_source(url, allow_cookie=allow_cookie)
+            attempts.append("bilibili_api")
+        except ExtractionFailure as exc:
+            attempts.append(f"bilibili_api_failed:{exc.reason}")
+            if exc.terminal and exc.reason != "invalid_bvid":
+                raise
+            api_failure = exc
+        if source is None:
+            try:
+                info = extract_info(url, allow_cookie=allow_cookie)
+            except ExtractionFailure as exc:
+                attempts.append(f"yt-dlp_failed:{exc.reason}")
+                if api_failure is not None and api_failure.reason != "invalid_bvid":
+                    raise api_failure from exc
+                raise
             source = ExtractionSource(
                 title=info.get("title"),
                 video_id=info.get("id") or extract_bvid(url),
                 webpage_url=info.get("webpage_url") or url,
-                tracks=tracks,
+                tracks=subtitle_tracks(info),
                 duration=float(info.get("duration") or 0) or None,
                 platform="bilibili",
                 author=info.get("uploader"),
             )
             attempts.append("yt-dlp")
-        except ExtractionFailure as exc:
-            attempts.append(f"yt-dlp_failed:{exc.reason}")
-
-        if source is None or not source.tracks:
-            try:
-                source = bili_api_source(url, allow_cookie=allow_cookie)
-                attempts.append("bilibili_api")
-            except ExtractionFailure as exc:
-                if exc.terminal and (source is None or exc.reason != "invalid_bvid"):
-                    raise exc
-                if source is None:
-                    raise exc
-                attempts.append(f"bilibili_api_failed:{exc.reason}")
 
     tracks = source.tracks if source else []
     if not tracks and source and source.note:
@@ -3699,11 +3521,7 @@ def ytdlp_download_worker(payload: dict[str, Any], result_queue: Any) -> None:
     duration_limit_reason = str(
         payload.get("duration_limit_reason") or "asr_duration_too_long"
     )
-    if duration_limit_reason not in {
-        "asr_duration_too_long",
-        "media_duration_too_long",
-        "guest_media_duration_too_long",
-    }:
+    if duration_limit_reason not in {"asr_duration_too_long", "media_duration_too_long"}:
         duration_limit_reason = "asr_duration_too_long"
     too_large = False
     too_long = False
@@ -3903,12 +3721,6 @@ def run_isolated_ytdlp_download(
                 LOGGER.warning("isolated yt-dlp failed: %s", redact_sensitive(str(message.get("error") or reason)))
                 if reason == "media_too_large":
                     raise ExtractionFailure(413, "下载媒体超过大小限制。", "media_too_large")
-                if reason == "guest_media_duration_too_long":
-                    raise ExtractionFailure(
-                        413,
-                        "视频时长超过当前免登录提取限制。",
-                        "guest_media_duration_too_long",
-                    )
                 if reason == "media_duration_too_long":
                     raise ExtractionFailure(
                         413,
@@ -4211,12 +4023,8 @@ def ensure_media_duration(req: MediaJobRequest, duration: Any) -> None:
     if seconds > req.max_duration_seconds:
         raise ExtractionFailure(
             413,
-            (
-                "视频时长超过当前免登录提取限制。"
-                if req.guest
-                else "视频时长超过当前媒体提取限制。"
-            ),
-            "guest_media_duration_too_long" if req.guest else "media_duration_too_long",
+            "视频时长超过当前媒体提取限制。",
+            "media_duration_too_long",
         )
 
 
@@ -4236,11 +4044,7 @@ def download_bilibili_media_ytdlp(
         timeout_seconds=remaining_before(deadline, "Bilibili yt-dlp media download"),
         max_duration_seconds=req.max_duration_seconds,
         max_video_height=req.max_video_height,
-        duration_limit_reason=(
-            "guest_media_duration_too_long"
-            if req.guest
-            else "media_duration_too_long"
-        ),
+        duration_limit_reason="media_duration_too_long",
     )
     ensure_media_duration(req, info.get("duration"))
     source_path, probe = select_downloaded_media(target_dir, req.media_type)
@@ -4655,10 +4459,7 @@ def finalize_media_artifact(
     title = str(info.get("title") or info.get("id") or "video").strip()[:160]
     filename = safe_filename(title, extension)
     now = time.time()
-    artifact_ttl = (
-        GUEST_MEDIA_ARTIFACT_TTL_SECONDS if req.guest else MEDIA_ARTIFACT_TTL_SECONDS
-    )
-    expires_at = now + artifact_ttl
+    expires_at = now + MEDIA_ARTIFACT_TTL_SECONDS
     metadata = {
         "version": 1,
         "artifact_token": req.artifact_token,
@@ -4695,7 +4496,7 @@ def finalize_media_artifact(
         "source_container": info.get("source_container"),
         "cookie_used": platform == "bilibili" and cookie_allowed(req.use_cookie),
         "elapsed_seconds": round(time.monotonic() - started, 3),
-        "artifact_ttl_seconds": artifact_ttl,
+        "artifact_ttl_seconds": MEDIA_ARTIFACT_TTL_SECONDS,
         "expires_at": expires_at,
     }
     report_progress("media_finalize", 97, "正在准备下载文件")
@@ -4736,12 +4537,7 @@ def media_extraction_payload(req: MediaJobRequest) -> dict[str, Any]:
                 max_duration_seconds=req.max_duration_seconds,
             )
         except DouyinAdapterError as exc:
-            reason = (
-                "guest_media_duration_too_long"
-                if req.guest and exc.reason == "media_duration_too_long"
-                else exc.reason
-            )
-            raise ExtractionFailure(exc.status_code, exc.message, reason) from exc
+            raise ExtractionFailure(exc.status_code, exc.message, exc.reason) from exc
         info["source_container"] = source_path.suffix.lower().lstrip(".")
     else:
         report_progress("media_download", 20, "正在下载 B站媒体文件")
@@ -6734,6 +6530,16 @@ def extract_subtitle_uncached(req: ExtractRequest) -> tuple[list[SubtitleEntry],
             entries, meta = official_subtitle(req, allow_cookie=allow_cookie, source_label=source_label)
         elif req.source == "asr":
             entries, meta = asr_subtitle(req, allow_cookie=allow_cookie)
+        elif allow_cookie:
+            # Signed-in requests go first: anonymous ones are refused from
+            # datacenter addresses and would only add to the refusal count.
+            try:
+                entries, meta = official_subtitle(req, allow_cookie=True, source_label="official_with_cookie")
+            except ExtractionFailure as first:
+                failures.append(failure_record("official_with_cookie", first))
+                if first.terminal:
+                    raise first
+                entries, meta = asr_subtitle(req, allow_cookie=True, prior_note=failure_user_message(first))
         else:
             try:
                 entries, meta = official_subtitle(req, allow_cookie=False, source_label="official_no_cookie")
@@ -6741,24 +6547,7 @@ def extract_subtitle_uncached(req: ExtractRequest) -> tuple[list[SubtitleEntry],
                 failures.append(failure_record("official_no_cookie", first))
                 if first.terminal:
                     raise first
-                if allow_cookie:
-                    try:
-                        entries, meta = official_subtitle(req, allow_cookie=True, source_label="official_with_cookie")
-                    except ExtractionFailure as second:
-                        failures.append(failure_record("official_with_cookie", second))
-                        if second.terminal:
-                            raise second
-                        entries, meta = asr_subtitle(
-                            req,
-                            allow_cookie=allow_cookie,
-                            prior_note=failure_user_message(second),
-                        )
-                else:
-                    entries, meta = asr_subtitle(
-                        req,
-                        allow_cookie=False,
-                        prior_note=failure_user_message(first),
-                    )
+                entries, meta = asr_subtitle(req, allow_cookie=False, prior_note=failure_user_message(first))
     except ExtractionFailure as exc:
         raise extraction_http_error(req, exc, failures) from exc
 
@@ -7129,8 +6918,6 @@ def submit_media_job(
     req: MediaRequest,
     owner_id: int,
     idempotency_key: str | None,
-    *,
-    guest: bool = False,
 ) -> dict[str, Any]:
     try:
         canonical_input = normalize_input(req.input)
@@ -7142,7 +6929,7 @@ def submit_media_job(
     canonical_req = req.model_copy(
         update={
             "input": canonical_input,
-            "use_cookie": False if guest else req.use_cookie,
+            "use_cookie": cookie_allowed(req.use_cookie),
         }
     )
     fingerprint = media_idempotency_fingerprint(canonical_req, canonical_input) if idempotency_key else None
@@ -7169,35 +6956,10 @@ def submit_media_job(
                 "retryable": True,
             },
         )
-    if guest:
-        owner_stats = JOB_MANAGER.owner_stats(owner_id)
-        if owner_stats["queued"] + owner_stats["running"] >= GUEST_MEDIA_MAX_ACTIVE_PER_SESSION:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "reason": "guest_media_busy",
-                    "message": "当前游客会话已有媒体任务，请等待完成后再提交。",
-                    "retryable": True,
-                },
-            )
-        rate_limit = GUEST_MEDIA_RATE_LIMITER.consume(owner_id)
-        if rate_limit is not None:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "reason": rate_limit.reason,
-                    "message": "免登录提取请求较多，请稍后再试。",
-                    "retryable": True,
-                    "retry_after_seconds": rate_limit.retry_after_seconds,
-                },
-                headers={"Retry-After": str(rate_limit.retry_after_seconds)},
-            )
-
     artifact_token = secrets.token_hex(16)
-    media_limit = GUEST_MEDIA_MAX_BYTES if guest else MEDIA_MAX_BYTES
+    media_limit = MEDIA_MAX_BYTES
     payload: dict[str, Any] | None = None
     artifact_reserved = False
-    guest_rate_reserved = guest
     transferred = False
     try:
         reserve_media_artifact(artifact_token, media_limit)
@@ -7206,13 +6968,10 @@ def submit_media_job(
             **canonical_req.model_dump(mode="json"),
             artifact_token=artifact_token,
             owner_id=owner_id,
-            guest=guest,
             max_bytes=media_limit,
-            max_duration_seconds=(
-                GUEST_MEDIA_MAX_DURATION_SECONDS if guest else MEDIA_MAX_DURATION_SECONDS
-            ),
-            max_video_height=GUEST_MEDIA_MAX_VIDEO_HEIGHT if guest else 1080,
-            audio_bitrate_kbps=GUEST_MEDIA_AUDIO_BITRATE_KBPS if guest else 192,
+            max_duration_seconds=MEDIA_MAX_DURATION_SECONDS,
+            max_video_height=1080,
+            audio_bitrate_kbps=192,
         )
         payload = media_req.model_dump(mode="json")
         try:
@@ -7245,8 +7004,6 @@ def submit_media_job(
                 discard_media_payload(payload)
             elif artifact_reserved:
                 release_media_reservation(artifact_token)
-            if guest_rate_reserved:
-                GUEST_MEDIA_RATE_LIMITER.refund(owner_id)
 
 
 async def stage_uploaded_video(
@@ -7443,36 +7200,38 @@ def run_legacy_extraction(req: ExtractRequest, request: Request) -> dict[str, An
             detail={"reason": "legacy_busy", "message": "同步接口正忙，请使用任务接口。"},
         )
     try:
-        job = submit_extraction_job(req, user.user_id, request_idempotency_key(request))
+        key = request_idempotency_key(request)
+        with charged_job(user, key) as charge:
+            job = submit_extraction_job(req, user.user_id, key)
+            charge["job"] = job
         return wait_for_legacy_result(job, user.user_id)
     finally:
         LEGACY_REQUEST_SEMAPHORE.release()
 
 
-app = FastAPI(title=APP_TITLE)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    startup()
+    try:
+        yield
+    finally:
+        shutdown()
+
+
+app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-PUBLIC_PATHS = {
-    "/",
-    "/login",
-    "/register",
-    "/api/health",
-    "/api/public-config",
-    "/api/auth/config",
-    "/api/auth/login",
-    "/api/auth/register",
-}
-
-
-def guest_media_path(path: str) -> bool:
-    return bool(
-        path in {"/api/media-jobs", "/api/bilibili/pages"}
-        or re.fullmatch(r"/api/jobs/[0-9a-f]{32}", path)
-        or re.fullmatch(r"/api/artifacts/[0-9a-f]{32}", path)
-    )
+# Without a session only the gate itself is reachable.
+GATE_PATHS = frozenset({"/login", "/api/health", "/api/auth/activate", "/robots.txt"})
+GATE_STATIC = frozenset({"/static/gate.css", "/static/gate.js", "/static/theme.js", "/static/favicon.svg"})
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+NOINDEX = "noindex, nofollow, noarchive"
 
 
 def request_origin_allowed(request: Request) -> bool:
+    fetch_site = request.headers.get("sec-fetch-site", "").lower()
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return False
     origin = request.headers.get("origin", "").rstrip("/")
     if not origin:
         return True
@@ -7480,47 +7239,52 @@ def request_origin_allowed(request: Request) -> bool:
     return secrets.compare_digest(origin, expected)
 
 
+def client_address(request: Request) -> str:
+    return (request.client.host if request.client else "") or "unknown"
+
+
 @app.middleware("http")
-async def account_session_middleware(request: Request, call_next: Callable[[Request], Any]) -> Response:
+async def access_gate_middleware(request: Request, call_next: Callable[[Request], Any]) -> Response:
     path = request.url.path
     is_static = path.startswith("/static/")
-    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    gate_asset = path in GATE_STATIC
+    session_token = request.cookies.get(session_cookie_name())
     user = None
-    if session_token and not is_static:
+    if session_token and not gate_asset:
         user = await run_in_threadpool(resolve_session, session_token)
     request.state.auth_user = user
 
-    if request.method not in {"GET", "HEAD", "OPTIONS"} and not request_origin_allowed(request):
+    if request.method not in SAFE_METHODS and not request_origin_allowed(request):
         return JSONResponse(
             status_code=403,
             content={"detail": {"reason": "invalid_origin", "message": "请求来源校验失败。"}},
         )
-
-    if path in {"/login", "/register"} and user is not None:
+    if path == "/login" and user is not None:
         return RedirectResponse(url="/", status_code=303)
-    is_provider_audio = path.startswith("/api/provider-audio/")
-    is_guest_media = guest_media_path(path)
-    if (
-        path not in PUBLIC_PATHS
-        and not is_static
-        and not is_provider_audio
-        and not is_guest_media
-        and user is None
-    ):
+
+    open_path = path in GATE_PATHS or gate_asset or path.startswith("/api/provider-audio/")
+    if user is None and not open_path:
+        if is_static:
+            return Response(status_code=404, headers={"Cache-Control": "no-store", "X-Robots-Tag": NOINDEX})
         if path.startswith("/api/"):
             return JSONResponse(
                 status_code=401,
-                content={"detail": {"reason": "authentication_required", "message": "请先登录。"}},
-                headers={"Cache-Control": "no-store"},
+                content={"detail": {"reason": "authentication_required", "message": "请先输入激活码。"}},
+                headers={"Cache-Control": "no-store", "X-Robots-Tag": NOINDEX},
             )
-        return RedirectResponse(url="/login", status_code=303)
+        return RedirectResponse(url="/login", status_code=303, headers={"X-Robots-Tag": NOINDEX})
+
     response = await call_next(request)
-    if is_static and request.query_params.get("v"):
-        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    if is_static:
+        # Only the gate's own assets may sit in a shared cache; everything
+        # else is for signed-in browsers and must never be cached publicly.
+        scope = "public" if gate_asset else "private"
+        immutable = ", max-age=31536000, immutable" if request.query_params.get("v") else ", no-cache"
+        response.headers["Cache-Control"] = scope + immutable
+    response.headers["X-Robots-Tag"] = NOINDEX
     return response
 
 
-@app.on_event("startup")
 def startup() -> None:
     global MEDIA_CLEANUP_LAST_RUN
     initialize_auth_db()
@@ -7550,7 +7314,6 @@ def startup() -> None:
         start_asr_prewarm()
 
 
-@app.on_event("shutdown")
 def shutdown() -> None:
     MAINTENANCE.stop()
     JOB_MANAGER.stop()
@@ -7680,47 +7443,23 @@ def api_admin_diagnostics(request: Request) -> JSONResponse:
     )
 
 
-def public_media_capabilities() -> dict[str, Any]:
-    ffmpeg_ready = bool(shutil.which("ffmpeg"))
-    ffprobe_ready = bool(shutil.which("ffprobe"))
-    douyin = douyin_adapter_status()
-    douyin_ready = bool(
-        douyin["enabled"]
-        and douyin["api_adapter_ready"]
-        and douyin["playwright_ready"]
-        and douyin["chromium_ready"]
-    )
-    media_ready = ffmpeg_ready and ffprobe_ready
+def bilibili_platform_status() -> dict[str, Any]:
+    """Whether Bilibili is currently refusing this site.
+
+    With the owner's login state saved, requests go out signed in, so only a
+    refusal of that mode counts; otherwise the anonymous mode decides.
+    """
+    with_cookie = cookie_allowed(True)
+    blocked_until = BILI_ACCESS_GUARD.blocked_until(with_cookie)
+    if blocked_until is None:
+        return {"state": "ok", "signed_in": with_cookie}
     return {
-        "status": "ok",
-        "features": {
-            "media": media_ready,
-            "guest_media": bool(media_ready and guest_media_enabled()),
-        },
-        "platforms": {
-            "bilibili": True,
-            "douyin": douyin_ready,
-        },
-        "guest_media": {
-            "enabled": bool(media_ready and guest_media_enabled()),
-            "media_types": ["video", "audio"],
-            "max_bytes": GUEST_MEDIA_MAX_BYTES,
-            "max_duration_seconds": GUEST_MEDIA_MAX_DURATION_SECONDS,
-            "bilibili_max_video_height": GUEST_MEDIA_MAX_VIDEO_HEIGHT,
-            "artifact_ttl_seconds": GUEST_MEDIA_ARTIFACT_TTL_SECONDS,
-        },
-        "account_required": ["subtitle", "upload", "cloud_asr"],
+        "state": "limited",
+        "signed_in": with_cookie,
+        "reason": "platform_blocked",
+        "message": USER_ERROR_MESSAGES["platform_blocked"],
+        "retry_after_seconds": max(1, math.ceil(blocked_until - time.time())),
     }
-
-
-@app.get("/api/public-config")
-def api_public_config() -> JSONResponse:
-    JOB_MANAGER.cleanup()
-    maybe_cleanup_stale_media_artifacts()
-    return JSONResponse(
-        public_media_capabilities(),
-        headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=30"},
-    )
 
 
 @app.get("/api/client-config")
@@ -7756,13 +7495,15 @@ def api_client_config(request: Request) -> JSONResponse:
             ),
             "uploads": processing_ready,
             "media": ffmpeg_ready and ffprobe_ready,
-            "bilibili_cookie": cookie_enabled() and bool(configured_cookie_header()),
-            "bilibili_qr_login": web_qr_login_enabled(),
+            "bilibili_login": cookie_allowed(True),
         },
         "platforms": {
             "bilibili": True,
             "douyin": douyin_ready,
             "upload": processing_ready,
+        },
+        "platform_status": {
+            "bilibili": bilibili_platform_status(),
         },
         "asr_modes": {
             "auto": {
@@ -7822,84 +7563,45 @@ def api_provider_audio(
     )
 
 
-@app.get("/api/auth/config")
-def api_auth_config() -> dict[str, Any]:
-    return {
-        "registration_enabled": invite_configured(),
-        "username_pattern": "[A-Za-z0-9_.-]{3,32}",
-        "password_min_length": 8,
-    }
-
-
-@app.post("/api/auth/register")
-def api_auth_register(req: RegisterRequest) -> JSONResponse:
+@app.post("/api/auth/activate")
+def api_auth_activate(req: ActivateRequest, request: Request) -> JSONResponse:
     try:
-        user = register_user(req.username, req.password, req.invite_code)
-        token, expires_at = create_session(user)
+        result = access.activate(req.code, client_address(request), request.headers.get("user-agent"))
     except AuthFailure as exc:
+        if exc.reason == "gate_locked":
+            LOGGER.warning("gate locked address=%s", client_address(request))
         raise auth_error(exc) from exc
+    LOGGER.info("gate granted member=%s", result.user.user_id)
     response = JSONResponse(
-        {"ok": True, "user": {"id": user.user_id, "username": user.username}},
+        {"ok": True, "user": {"label": result.user.label, "role": result.user.role}},
         headers={"Cache-Control": "no-store"},
     )
-    set_session_cookie(response, token, expires_at)
-    return response
-
-
-@app.post("/api/auth/login")
-def api_auth_login(req: LoginRequest) -> JSONResponse:
-    try:
-        user = authenticate_user(req.username, req.password)
-        token, expires_at = create_session(user)
-    except AuthFailure as exc:
-        raise auth_error(exc) from exc
-    response = JSONResponse(
-        {"ok": True, "user": {"id": user.user_id, "username": user.username}},
-        headers={"Cache-Control": "no-store"},
-    )
-    set_session_cookie(response, token, expires_at)
+    set_session_cookie(response, result.token, result.expires_at)
     return response
 
 
 @app.get("/api/auth/me")
-def api_auth_me(request: Request) -> dict[str, Any]:
+def api_auth_me(request: Request) -> JSONResponse:
     user = require_auth_user(request)
     try:
         summary = account_summary(user.user_id)
     except AuthFailure as exc:
         raise auth_error(exc) from exc
-    return {
-        "ok": True,
-        "user": {
-            "id": user.user_id,
-            "username": user.username,
-            **summary,
-        },
-    }
-
-
-@app.post("/api/auth/change-password")
-def api_auth_change_password(req: ChangePasswordRequest, request: Request) -> JSONResponse:
-    user = require_auth_user(request)
-    try:
-        updated_user = change_password(
-            user.user_id,
-            req.current_password,
-            req.new_password,
-        )
-        token, expires_at = create_session(updated_user)
-    except AuthFailure as exc:
-        raise auth_error(exc) from exc
-    response = JSONResponse(
+    return JSONResponse(
         {
             "ok": True,
-            "message": "密码已更新，其他设备上的登录已退出。",
-            "user": {"id": updated_user.user_id, "username": updated_user.username},
+            "user": {
+                "id": user.user_id,
+                "username": user.label,
+                "label": user.label,
+                "role": user.role,
+                "is_admin": is_admin_user(user),
+                **summary,
+                "quota": access.quota_status(user.user_id),
+            },
         },
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "private, no-store"},
     )
-    set_session_cookie(response, token, expires_at)
-    return response
 
 
 @app.post("/api/auth/logout-all")
@@ -7907,7 +7609,7 @@ def api_auth_logout_all(request: Request) -> JSONResponse:
     user = require_auth_user(request)
     delete_user_sessions(user.user_id)
     response = JSONResponse(
-        {"ok": True, "message": "所有设备均已退出登录。"},
+        {"ok": True, "message": "所有设备均已退出。"},
         headers={"Cache-Control": "no-store"},
     )
     clear_session_cookie(response)
@@ -7931,7 +7633,7 @@ def api_bilibili_pages(
             )
         bvid, canonical_url, data, selected_page, _ = bili_view_context(
             canonical,
-            cookie_allowed(use_cookie) if auth_user_from_request(request) is not None else False,
+            cookie_allowed(use_cookie),
         )
     except ExtractionFailure as exc:
         raise HTTPException(
@@ -7969,7 +7671,7 @@ def api_bilibili_pages(
 
 @app.post("/api/auth/logout")
 def api_auth_logout(request: Request) -> JSONResponse:
-    delete_session(request.cookies.get(SESSION_COOKIE_NAME))
+    delete_session(request.cookies.get(session_cookie_name()))
     response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
     clear_session_cookie(response)
     return response
@@ -7977,34 +7679,137 @@ def api_auth_logout(request: Request) -> JSONResponse:
 
 @app.get("/login", response_class=FileResponse)
 def login_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "auth.html", headers={"Cache-Control": "no-cache"})
+    return FileResponse(STATIC_DIR / "gate.html", headers={"Cache-Control": "no-cache"})
 
 
-@app.get("/register", response_class=FileResponse)
-def register_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "auth.html", headers={"Cache-Control": "no-cache"})
+@app.get("/robots.txt")
+def robots_txt() -> Response:
+    return Response(
+        "User-agent: *\nDisallow: /\n",
+        media_type="text/plain",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/admin", response_class=FileResponse)
 def admin_page(request: Request) -> FileResponse:
     require_admin_user(request)
-    return FileResponse(
-        STATIC_DIR / "admin.html",
-        headers={
-            "Cache-Control": "private, no-store",
-            "X-Robots-Tag": "noindex, nofollow",
-        },
+    return FileResponse(STATIC_DIR / "admin.html", headers={"Cache-Control": "private, no-store"})
+
+
+# ------------------------------------------------------------ owner console
+
+ADMIN_HEADERS = {"Cache-Control": "private, no-store"}
+
+
+def admin_json(payload: dict[str, Any], status_code: int = 200) -> JSONResponse:
+    return JSONResponse(payload, status_code=status_code, headers=ADMIN_HEADERS)
+
+
+def admin_call(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    try:
+        return function(*args, **kwargs)
+    except AuthFailure as exc:
+        raise auth_error(exc) from exc
+
+
+@app.get("/api/admin/members")
+def api_admin_members(request: Request) -> JSONResponse:
+    require_admin_user(request)
+    return admin_json(
+        {
+            "members": admin_call(access.list_members),
+            "defaults": {
+                "max_devices": access.device_limit("member", None),
+                "daily_job_limit": access.daily_job_limit("member", None),
+                "max_active_jobs": MEMBER_MAX_ACTIVE_JOBS,
+            },
+        }
     )
 
 
-@app.get("/api/login/qrcode")
-@app.post("/api/login/qrcode")
-def api_login_qrcode() -> dict[str, Any]:
-    if not web_qr_login_enabled():
-        raise HTTPException(
-            status_code=403,
-            detail={"reason": "qr_login_disabled", "message": "网页扫码登录当前未启用。"},
-        )
+@app.post("/api/admin/members", status_code=201)
+def api_admin_create_member(req: MemberCreateRequest, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    code, member_id = admin_call(
+        access.issue_code,
+        label=req.label,
+        max_devices=req.max_devices,
+        daily_job_limit=req.daily_job_limit,
+        expires_in_days=req.expires_in_days,
+    )
+    LOGGER.info("activation code issued member=%s", member_id)
+    return admin_json({"ok": True, "code": code, "member_id": member_id}, status_code=201)
+
+
+@app.post("/api/admin/members/{member_id}/reset")
+def api_admin_reset_member(member_id: int, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    code = admin_call(access.reset_code, member_id)
+    LOGGER.info("activation code reset member=%s", member_id)
+    return admin_json({"ok": True, "code": code, "member_id": member_id})
+
+
+@app.patch("/api/admin/members/{member_id}")
+def api_admin_update_member(member_id: int, req: MemberUpdateRequest, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    changes = {name: getattr(req, name) for name in req.model_fields_set}
+    for name in ("label", "active"):
+        if name in changes and changes[name] is None:
+            changes.pop(name)
+    admin_call(access.update_member, member_id, **changes)
+    return admin_json({"ok": True})
+
+
+@app.post("/api/admin/members/{member_id}/sign-out")
+def api_admin_sign_out_member(member_id: int, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    ended = admin_call(access.sign_out_member, member_id)
+    return admin_json({"ok": True, "ended": ended})
+
+
+@app.delete("/api/admin/members/{member_id}/sessions/{session_id}")
+def api_admin_end_session(member_id: int, session_id: int, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    admin_call(access.end_session, member_id, session_id)
+    return admin_json({"ok": True})
+
+
+@app.delete("/api/admin/members/{member_id}")
+def api_admin_delete_member(member_id: int, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    admin_call(access.delete_member, member_id)
+    LOGGER.info("member deleted member=%s", member_id)
+    return admin_json({"ok": True})
+
+
+@app.get("/api/admin/gate")
+def api_admin_gate(request: Request) -> JSONResponse:
+    require_admin_user(request)
+    return admin_json(admin_call(access.gate_overview))
+
+
+@app.post("/api/admin/gate/unlock")
+def api_admin_gate_unlock(req: UnlockRequest, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    return admin_json({"ok": True, "cleared": admin_call(access.unlock_address, req.ip)})
+
+
+@app.get("/api/admin/bilibili")
+def api_admin_bilibili(request: Request, refresh: bool = Query(False)) -> JSONResponse:
+    require_admin_user(request)
+    return admin_json(bilibili_account_status(refresh=refresh))
+
+
+@app.delete("/api/admin/bilibili")
+def api_admin_bilibili_logout(request: Request) -> JSONResponse:
+    require_admin_user(request)
+    return admin_json(bilibili_logout())
+
+
+@app.post("/api/admin/bilibili/qrcode")
+def api_admin_bilibili_qrcode(request: Request) -> JSONResponse:
+    require_admin_user(request)
     headers = {"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"}
     try:
         with httpx.Client(
@@ -8018,34 +7823,35 @@ def api_login_qrcode() -> dict[str, Any]:
             payload = resp.json()
     except Exception as exc:
         LOGGER.warning("Bilibili QR login request failed: %s", redact_sensitive(str(exc)))
-        raise HTTPException(status_code=502, detail="Bilibili QR login request failed.") from exc
+        raise HTTPException(
+            status_code=502,
+            detail={"reason": "qr_unavailable", "message": "B站登录二维码获取失败，请稍后再试。"},
+        ) from exc
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict) or not data.get("qrcode_key") or not data.get("url"):
-        raise HTTPException(status_code=502, detail="Bilibili QR login returned an unexpected response.")
+        raise HTTPException(
+            status_code=502,
+            detail={"reason": "qr_unavailable", "message": "B站返回的二维码数据异常。"},
+        )
     key = str(data["qrcode_key"])
-    url = str(data["url"])
     with QR_LOGIN_LOCK:
         clean_qr_sessions()
         QR_LOGIN_SESSIONS[key] = time.time() + 180
-    return {
-        "ok": True,
-        "qrcode_key": key,
-        "url": url,
-        "expires_in": 180,
-        "qr_svg_data_url": qr_svg_data_url(url),
-    }
+    return admin_json(
+        {"ok": True, "qrcode_key": key, "expires_in": 180, "qr_svg_data_url": qr_svg_data_url(str(data["url"]))}
+    )
 
 
-@app.get("/api/login/poll")
-def api_login_poll(qrcode_key: str = Query(..., min_length=8, max_length=128)) -> dict[str, Any]:
-    if not web_qr_login_enabled():
-        raise HTTPException(status_code=403, detail="Web QR login is disabled.")
+@app.get("/api/admin/bilibili/qrcode/{qrcode_key}")
+def api_admin_bilibili_qrcode_poll(qrcode_key: str, request: Request) -> JSONResponse:
+    require_admin_user(request)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", qrcode_key):
+        raise HTTPException(status_code=400, detail={"reason": "invalid_qrcode_key", "message": "二维码标识无效。"})
     with QR_LOGIN_LOCK:
         clean_qr_sessions()
         expires_at = QR_LOGIN_SESSIONS.get(qrcode_key)
     if not expires_at:
-        raise HTTPException(status_code=410, detail="QR login session expired. Generate a new QR code.")
-
+        return admin_json({"ok": False, "status": "expired", "message": "二维码已过期，请重新生成。"})
     headers = {"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"}
     try:
         with httpx.Client(
@@ -8059,27 +7865,27 @@ def api_login_poll(qrcode_key: str = Query(..., min_length=8, max_length=128)) -
             payload = resp.json()
     except Exception as exc:
         LOGGER.warning("Bilibili QR login polling failed: %s", redact_sensitive(str(exc)))
-        raise HTTPException(status_code=502, detail="Bilibili QR login polling failed.") from exc
+        return admin_json({"ok": False, "status": "retry", "message": "暂时连不上 B站，正在重试。"})
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="Bilibili QR login polling returned an unexpected response.")
-
+        return admin_json({"ok": False, "status": "retry", "message": "B站返回的数据异常，正在重试。"})
     code = data.get("code")
     if code == 0:
-        cookie = cookie_header_from_set_cookie(resp.headers.get_list("set-cookie"))
-        save_bili_cookie(cookie)
+        save_bili_cookie(cookie_header_from_set_cookie(resp.headers.get_list("set-cookie")))
         with QR_LOGIN_LOCK:
             QR_LOGIN_SESSIONS.pop(qrcode_key, None)
-        return {"ok": True, "status": "success", "cookie_saved": True, "cookie_enabled": cookie_enabled()}
+        BILI_ACCESS_GUARD.reset()
+        LOGGER.info("Bilibili login state saved by owner")
+        return admin_json({"ok": True, "status": "success", "account": bilibili_account_status(refresh=True)})
     if code == 86101:
-        return {"ok": True, "status": "waiting_scan", "message": "Waiting for scan."}
+        return admin_json({"ok": True, "status": "waiting_scan", "message": "等待扫码"})
     if code == 86090:
-        return {"ok": True, "status": "waiting_confirm", "message": "Waiting for confirmation in the Bilibili app."}
+        return admin_json({"ok": True, "status": "waiting_confirm", "message": "已扫码，请在手机上确认登录"})
     if code == 86038:
         with QR_LOGIN_LOCK:
             QR_LOGIN_SESSIONS.pop(qrcode_key, None)
-        return {"ok": False, "status": "expired", "message": "QR code expired."}
-    return {"ok": False, "status": "failed", "message": str(data.get("message") or payload.get("message") or code)}
+        return admin_json({"ok": False, "status": "expired", "message": "二维码已过期，请重新生成。"})
+    return admin_json({"ok": False, "status": "failed", "message": str(data.get("message") or "登录失败")})
 
 
 @app.post("/api/extract")
@@ -8093,7 +7899,10 @@ def api_extract(req: ExtractRequest, request: Request) -> JSONResponse:
 @app.post("/api/jobs", status_code=202)
 def api_create_job(req: ExtractRequest, request: Request) -> JSONResponse:
     user = require_auth_user(request)
-    job = submit_extraction_job(req, user.user_id, request_idempotency_key(request))
+    key = request_idempotency_key(request)
+    with charged_job(user, key) as charge:
+        job = submit_extraction_job(req, user.user_id, key)
+        charge["job"] = job
     return JSONResponse(
         public_job_payload(job),
         status_code=202,
@@ -8103,36 +7912,16 @@ def api_create_job(req: ExtractRequest, request: Request) -> JSONResponse:
 
 @app.post("/api/media-jobs", status_code=202)
 def api_create_media_job(req: MediaRequest, request: Request) -> JSONResponse:
-    owner_id, guest, issued_session = media_request_owner(request, create_guest=True)
-    if guest and not guest_media_enabled():
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "reason": "guest_media_disabled",
-                "message": "免登录媒体提取暂时关闭，请登录后重试。",
-                "retryable": True,
-            },
-        )
-    job = submit_media_job(
-        req,
-        owner_id,
-        request_idempotency_key(request),
-        guest=guest,
-    )
-    response = JSONResponse(
+    user = require_auth_user(request)
+    key = request_idempotency_key(request)
+    with charged_job(user, key) as charge:
+        job = submit_media_job(req, user.user_id, key)
+        charge["job"] = job
+    return JSONResponse(
         public_job_payload(job),
         status_code=202,
         headers={"Cache-Control": "no-store"},
     )
-    if issued_session is not None:
-        token, identity = issued_session
-        set_guest_cookie(
-            response,
-            token,
-            identity.expires_at,
-            secure=env_bool("AUTH_COOKIE_SECURE", True),
-        )
-    return response
 
 
 @app.post("/api/upload-jobs", status_code=202)
@@ -8202,18 +7991,25 @@ async def api_create_upload_job(
             },
         )
 
-    upload_req = await stage_uploaded_video(
-        request,
-        filename=filename,
-        output_format=output_format,
-        lang=lang,
-        hotwords=hotwords,
-        quality=quality,
-        asr_mode=asr_mode,
-        cloud_consent=cloud_consent,
-        embedded_subtitles=embedded_subtitles,
-        force_refresh=force_refresh,
-    )
+    charged = await run_in_threadpool(admit_job, user, idempotency_key)
+    try:
+        upload_req = await stage_uploaded_video(
+            request,
+            filename=filename,
+            output_format=output_format,
+            lang=lang,
+            hotwords=hotwords,
+            quality=quality,
+            asr_mode=asr_mode,
+            cloud_consent=cloud_consent,
+            embedded_subtitles=embedded_subtitles,
+            force_refresh=force_refresh,
+        )
+    except BaseException:
+        if charged:
+            await run_in_threadpool(access.refund_job_quota, user.user_id)
+        raise
+    job_result: dict[str, Any] | None = None
     transferred = False
     payload = upload_req.model_dump(mode="json")
     payload["_owner_id"] = user.user_id
@@ -8247,6 +8043,7 @@ async def api_create_upload_job(
                     },
                 ) from exc
             transferred = not bool(job.get("reused"))
+        job_result = job
         job["platform"] = "upload"
         return JSONResponse(
             public_job_payload(job),
@@ -8256,6 +8053,8 @@ async def api_create_upload_job(
     except JobIdempotencyConflict as exc:
         raise idempotency_conflict_error() from exc
     finally:
+        if charged and (job_result is None or job_result.get("reused")):
+            access.refund_job_quota(user.user_id)
         if not transferred:
             discard_upload_payload(payload)
 
@@ -8271,7 +8070,7 @@ def api_recent_jobs(request: Request, limit: int = Query(20, ge=1, le=50)) -> JS
 
 
 def owned_job(job_id: str, request: Request) -> dict[str, Any]:
-    owner_id, _, _ = media_request_owner(request, create_guest=False)
+    owner_id = request_owner_id(request)
     try:
         job = JOB_MANAGER.get(job_id, owner_id=owner_id)
     except JobNotFound as exc:
@@ -8318,7 +8117,7 @@ def api_export_job_result(
 
 @app.get("/api/artifacts/{artifact_token}")
 def api_download_artifact(artifact_token: str, request: Request) -> FileResponse:
-    owner_id, _, _ = media_request_owner(request, create_guest=False)
+    owner_id = request_owner_id(request)
     path, metadata = load_media_artifact(artifact_token, owner_id)
     filename = str(metadata.get("filename") or path.name)
     content_type = str(metadata.get("content_type") or "application/octet-stream")
@@ -8335,7 +8134,7 @@ def api_download_artifact(artifact_token: str, request: Request) -> FileResponse
 
 @app.delete("/api/jobs/{job_id}")
 def api_cancel_job(job_id: str, request: Request) -> JSONResponse:
-    owner_id, _, _ = media_request_owner(request, create_guest=False)
+    owner_id = request_owner_id(request)
     try:
         job = JOB_MANAGER.cancel(job_id, owner_id=owner_id)
     except JobNotFound as exc:
@@ -8387,5 +8186,5 @@ def api_download_get_disabled() -> None:
 def index() -> FileResponse:
     return FileResponse(
         STATIC_DIR / "index.html",
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "private, no-cache"},
     )

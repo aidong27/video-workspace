@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07060d">
+  <meta name="robots" content="noindex, nofollow">
+  <title>字幕工作台 · 验证</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/gate.css?v=20261106-2">
+  <script src="/static/gate.js?v=20261106-2" defer></script>
+</head>
+<body>
+  <canvas class="sky" id="gate-sky" aria-hidden="true"></canvas>
+  <div class="sky-fallback" aria-hidden="true"><i></i><i></i><i></i></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <main class="gate">
+    <section class="vault" id="vault" aria-labelledby="gate-title">
+      <div class="vault-ring" aria-hidden="true"></div>
+
+      <div class="lock" id="lock" aria-hidden="true">
+        <svg viewBox="0 0 76 76">
+          <defs>
+            <linearGradient id="lock-signal" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#7c5cff"></stop>
+              <stop offset="0.55" stop-color="#e255ff"></stop>
+              <stop offset="1" stop-color="#38e1ff"></stop>
+            </linearGradient>
+          </defs>
+          <circle class="lock-track" cx="38" cy="38" r="34"></circle>
+          <circle class="lock-progress" id="lock-progress" cx="38" cy="38" r="34"></circle>
+          <path class="lock-shackle" d="M28.5 35v-6.5a9.5 9.5 0 0 1 19 0V35"></path>
+          <rect class="lock-body" x="24" y="34" width="28" height="21" rx="6"></rect>
+          <path class="lock-key" d="M38 41.5v6"></path>
+        </svg>
+      </div>
+
+      <p class="eyebrow">Private access</p>
+      <h1 id="gate-title">字幕工作台</h1>
+      <p class="lede">邀请制工作台。输入站长发给你的激活码。</p>
+
+      <form id="gate-form" novalidate autocomplete="off">
+        <label class="visually-hidden" for="code">激活码</label>
+        <div class="code-field" id="code-field">
+          <input id="code" name="code" type="text" inputmode="text" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" maxlength="32" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" aria-describedby="gate-message" required>
+        </div>
+        <div class="code-cells" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <p class="gate-message" id="gate-message" role="status" aria-live="polite"></p>
+        <button class="unlock" id="unlock" type="submit" disabled>
+          <span id="unlock-label">解锁</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+        </button>
+      </form>
+
+      <footer class="vault-foot">
+        <span><i class="dot"></i>加密连接</span>
+        <span>多次输错会暂时锁定</span>
+      </footer>
+    </section>
+  </main>
+
+  <div class="warp" id="warp" aria-hidden="true"></div>
+</body>
+</html>

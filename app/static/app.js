@@ -8,8 +8,13 @@
     inputError: $("input-error"),
     paste: $("paste-input"),
     clearInput: $("clear-input"),
+    newTask: $("new-task"),
     taskHeading: $("task-heading"),
     platformDetect: $("platform-detect"),
+    platformNotice: $("platform-notice"),
+    platformNoticeTitle: $("platform-notice-title"),
+    platformNoticeDetail: $("platform-notice-detail"),
+    platformNoticeAction: $("platform-notice-action"),
     pageSelectorRow: $("page-selector-row"),
     pageSelect: $("page-select"),
     inputModeGroup: $("input-mode-group"),
@@ -36,8 +41,6 @@
     hotwordsRow: $("hotwords-row"),
     hotwords: $("hotwords-input"),
     allowPlatformAi: $("allow-platform-ai"),
-    cookieRow: $("cookie-row"),
-    useCookie: $("use-cookie"),
     forceRefresh: $("force-refresh"),
     forceRefreshLabel: $("force-refresh-label"),
     forceRefreshHint: $("force-refresh-hint"),
@@ -48,14 +51,15 @@
     healthTrigger: $("health-trigger"),
     healthPopover: $("health-popover"),
     healthSummary: $("health-summary"),
+    healthBilibili: $("health-bilibili"),
+    healthDouyin: $("health-douyin"),
     healthLocal: $("health-local"),
     healthCloud: $("health-cloud"),
     healthFiles: $("health-files"),
     bilibiliChip: $("bilibili-chip"),
     douyinChip: $("douyin-chip"),
     uploadChip: $("upload-chip"),
-    guestLoginButton: $("guest-login-button"),
-    guestAccessBanner: $("guest-access-banner"),
+    themeToggle: $("theme-toggle"),
     accountArea: $("account-area"),
     accountAvatar: $("account-avatar"),
     accountAvatarLarge: $("account-avatar-large"),
@@ -65,18 +69,13 @@
     accountPopoverName: $("account-popover-name"),
     accountCreatedAt: $("account-created-at"),
     accountSessionSummary: $("account-session-summary"),
-    openPasswordDialog: $("open-password-dialog"),
+    accountQuota: $("account-quota"),
+    accountQuotaLabel: $("account-quota-label"),
+    accountQuotaBar: $("account-quota-bar"),
+    accountCode: $("account-code"),
+    adminLink: $("admin-link"),
     logoutAllDevices: $("logout-all-devices"),
     logoutAccount: $("logout-account"),
-    passwordDialog: $("password-dialog"),
-    passwordForm: $("password-form"),
-    currentPassword: $("current-password"),
-    newPassword: $("new-password"),
-    confirmNewPassword: $("confirm-new-password"),
-    passwordError: $("password-error"),
-    closePasswordDialog: $("close-password-dialog"),
-    cancelPasswordDialog: $("cancel-password-dialog"),
-    submitPassword: $("submit-password"),
     cloudModeZone: $("cloud-mode-zone"),
     cloudSelectionLabel: $("cloud-selection-label"),
     cloudRoutingNote: $("cloud-routing-note"),
@@ -87,11 +86,6 @@
     closeCloudConfirm: $("close-cloud-confirm"),
     cancelCloudConfirm: $("cancel-cloud-confirm"),
     submitCloudConfirm: $("submit-cloud-confirm"),
-    railNewTask: $("rail-new-task"),
-    railSubtitle: $("rail-subtitle"),
-    railSubtitleAccess: $("rail-subtitle-access"),
-    railVideo: $("rail-video"),
-    railAudio: $("rail-audio"),
     resultKicker: $("result-kicker"),
     resultTitle: $("result-title"),
     resultActions: $("result-actions"),
@@ -117,6 +111,10 @@
     retryTask: $("retry-task"),
     outputShell: $("output-shell"),
     output: $("output"),
+    segmentList: $("segment-list"),
+    segmentTimeline: $("segment-timeline"),
+    viewSegments: $("view-segments"),
+    viewSource: $("view-source"),
     outputFormat: $("output-format-label"),
     resultFormat: $("result-format"),
     outputStats: $("output-stats-label"),
@@ -128,22 +126,15 @@
     mediaFileMark: $("media-file-mark"),
     mediaFilename: $("media-filename"),
     mediaFileDetail: $("media-file-detail"),
-    recentSection: $("recent-section"),
-    recentList: $("recent-list"),
-    refreshHistory: $("refresh-history"),
     openHistory: $("open-history"),
-    closeHistory: $("close-history"),
-    historyDialog: $("history-dialog"),
-    historyDialogList: $("history-dialog-list"),
+    historyCount: $("history-count"),
+    historyDrawer: $("history-drawer"),
+    historyList: $("history-list"),
     historyCaption: $("history-caption"),
-    historyDialogCaption: $("history-dialog-caption"),
-    retryHistory: $("retry-history"),
+    refreshHistory: $("refresh-history"),
+    closeHistory: $("close-history"),
     resultExpiry: $("result-expiry"),
     settingsSummary: $("settings-summary"),
-    loginSection: $("login-section"),
-    loginStart: $("login-start"),
-    loginStatus: $("login-status"),
-    qrImage: $("qr-image"),
     composerPane: $("composer-pane"),
     resultPane: $("result-pane"),
     mobileCompose: $("mobile-tab-compose"),
@@ -162,7 +153,6 @@
     pollPaused: false,
     searchTimer: null,
     toastTimer: null,
-    loginPollTimer: null,
     uploadXhr: null,
     uploadFile: null,
     jobId: null,
@@ -172,7 +162,6 @@
     current: null,
     resuming: false,
     user: null,
-    guest: false,
     capabilities: null,
     healthLoading: false,
     history: [],
@@ -183,6 +172,7 @@
     uploadExtensions: [],
     mediaEnabled: true,
     wrapOutput: true,
+    resultView: "segments",
     mobileView: "compose",
     preferencesLoaded: false,
     pageLookupTimer: null,
@@ -232,6 +222,8 @@
     ocr_empty: "没有在视频画面中识别到稳定字幕。",
     ocr_timeout: "画面字幕识别超时，请尝试更短的视频。",
     platform_temporarily_unavailable: "平台暂时拒绝了视频请求，请稍后重试。",
+    platform_unreachable: "暂时无法连接视频平台，请稍后重试。",
+    platform_blocked: "B站当前拒绝了本站的访问（平台风控）。可以改为上传本地视频，或稍后再试。",
     douyin_browser_missing: "抖音处理组件尚未准备完成。",
     douyin_browser_busy: "抖音浏览器资源正忙，请稍后重试。",
     douyin_adapter_missing: "抖音处理组件尚未准备完成。",
@@ -258,19 +250,12 @@
     artifact_not_found: "下载文件不存在或已过期。",
     job_not_found: "服务可能已重启或任务已过期，请重新提交。",
     idempotency_conflict: "这次提交与上一次请求不一致，请重新提交。",
-    authentication_required: "登录已失效，正在返回登录页。",
-    guest_session_expired: "游客任务凭据已失效，请重新提交。",
-    guest_media_busy: "当前已有一个免登录媒体任务，请等待完成。",
-    guest_media_session_limit: "这个浏览器的免登录提取次数较多，请稍后再试。",
-    guest_media_global_limit: "当前免登录提取请求较多，请稍后再试。",
-    guest_media_disabled: "免登录媒体提取暂时关闭，请登录后重试。",
-    guest_media_duration_too_long: "视频时长超过免登录提取限制，请登录后重试。",
+    authentication_required: "访问凭据已失效，正在返回验证页。",
     media_duration_too_long: "视频时长超过当前媒体提取限制。",
     cloud_consent_required: "请先确认云端识别会消耗站点额度。",
-    current_password_invalid: "当前密码不正确。",
-    password_unchanged: "新密码不能与当前密码相同。",
-    password_too_short: "新密码至少需要 8 个字符。",
-    password_too_long: "新密码不能超过 128 个字符。"
+    daily_quota_reached: "今天的任务额度已用完，零点后重置。",
+    member_busy: "你已有任务在处理，等它们完成后再提交。",
+    cookie_expired: "站点的 B站登录已失效，请联系站长重新扫码。"
   };
 
   const stageDetails = {
@@ -298,6 +283,18 @@
     render: "正在整理时间轴与输出文件"
   };
 
+  /* Visual effects live in fx.js and listen for these events; the
+     workspace keeps working when that script is missing or motion is off. */
+  function fx(name, detail) {
+    document.dispatchEvent(new CustomEvent(`workspace:${name}`, { detail: detail || {} }));
+  }
+
+  const THEME_KEY = "video-workspace-theme";
+  const THEME_MODES = ["system", "light", "dark"];
+  const THEME_LABELS = { system: "跟随系统", light: "浅色", dark: "深色" };
+
+  /* ---------- Local storage ---------- */
+
   function historyStorageKey(userId) {
     return `video-workspace-history-v4:${userId}`;
   }
@@ -306,8 +303,12 @@
     return `video-workspace-preferences-v1:${userId}`;
   }
 
+  function activeJobStorageKey(userId) {
+    return `caption-active-job-v1:${userId}`;
+  }
+
   function storageOwnerKey() {
-    return state.user ? String(state.user.id) : "guest";
+    return state.user ? String(state.user.id) : "pending";
   }
 
   function loadPreferences(userId) {
@@ -324,17 +325,13 @@
     setSelectedOperation(!state.user && operation === "subtitle" ? "video" : operation);
     setInputMode(state.user && value.inputMode === "upload" ? "upload" : "link");
     setSelectedSource(["auto", "official", "asr"].includes(value.source) ? value.source : "auto");
-    setSelectedAsrMode(
-      ["auto", "high_accuracy", "economy"].includes(value.asrMode)
-        ? value.asrMode
-        : "auto"
-    );
+    setSelectedAsrMode(["auto", "high_accuracy", "economy"].includes(value.asrMode) ? value.asrMode : "auto");
     if (["txt", "srt", "vtt", "markdown", "json"].includes(value.format)) elements.format.value = value.format;
     elements.lang.value = ["", "zh", "en", "ja", "ko"].includes(value.lang) ? value.lang : "zh";
     elements.embeddedSubtitles.checked = value.embeddedSubtitles === true;
     elements.allowPlatformAi.checked = value.allowPlatformAi !== false;
-    elements.useCookie.checked = value.useCookie === true;
     state.wrapOutput = value.wrapOutput !== false;
+    state.resultView = value.resultView === "source" ? "source" : "segments";
     applyWrapPreference();
     state.preferencesLoaded = true;
     syncInputMode();
@@ -353,8 +350,8 @@
       lang: elements.lang.value,
       embeddedSubtitles: selectedEmbeddedSubtitles(),
       allowPlatformAi: elements.allowPlatformAi.checked,
-      useCookie: elements.useCookie.checked,
-      wrapOutput: state.wrapOutput
+      wrapOutput: state.wrapOutput,
+      resultView: state.resultView
     };
     try {
       localStorage.setItem(preferencesStorageKey(storageOwnerKey()), JSON.stringify(value));
@@ -369,10 +366,6 @@
     } catch (_) {
       return;
     }
-  }
-
-  function activeJobStorageKey(userId) {
-    return `caption-active-job-v1:${userId}`;
   }
 
   function clearActiveJob() {
@@ -399,6 +392,50 @@
     }
   }
 
+  /* ---------- Theme ---------- */
+
+  function storedTheme() {
+    try {
+      const value = localStorage.getItem(THEME_KEY);
+      return value === "light" || value === "dark" ? value : "system";
+    } catch (_) {
+      return "system";
+    }
+  }
+
+  function applyTheme(mode) {
+    const root = document.documentElement;
+    if (mode === "light" || mode === "dark") root.dataset.theme = mode;
+    else delete root.dataset.theme;
+    elements.themeToggle.dataset.mode = mode;
+    elements.themeToggle.title = `外观：${THEME_LABELS[mode]}`;
+    elements.themeToggle.setAttribute("aria-label", `切换外观，当前${THEME_LABELS[mode]}`);
+    document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+      if (!meta.dataset.original) meta.dataset.original = meta.getAttribute("content") || "";
+      const forced = mode === "dark" ? "#07060d" : mode === "light" ? "#f6f4fb" : "";
+      meta.setAttribute("content", forced || meta.dataset.original);
+    });
+  }
+
+  function cycleTheme() {
+    const next = THEME_MODES[(THEME_MODES.indexOf(storedTheme()) + 1) % THEME_MODES.length];
+    try {
+      if (next === "system") localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, next);
+    } catch (_) {
+      /* the choice still applies to this page */
+    }
+    const apply = () => applyTheme(next);
+    if (window.FX && typeof window.FX.themeTransition === "function") {
+      window.FX.themeTransition(apply, elements.themeToggle);
+    } else {
+      apply();
+    }
+    showToast(`外观：${THEME_LABELS[next]}`, false);
+  }
+
+  /* ---------- Active job restore ---------- */
+
   function restoreForm(payload) {
     if (!payload) return;
     setSelectedOperation(payload.kind === "media" ? payload.media_type : "subtitle");
@@ -422,7 +459,6 @@
     if (!payload.input) return;
     elements.input.value = payload.input;
     if (payload.kind !== "media") elements.allowPlatformAi.checked = payload.allow_platform_ai !== false;
-    elements.useCookie.checked = Boolean(payload.use_cookie);
     if (payload.kind !== "media") setSelectedSource(payload.source || "auto");
     updatePlatformDetect();
     schedulePageLookup();
@@ -455,9 +491,12 @@
     pollJob();
   }
 
+  /* ---------- Account ---------- */
+
   async function apiFetch(url, options) {
     const response = await fetch(url, options);
-    if (response.status === 401 && state.user) {
+    if (response.status === 401) {
+      clearActiveJob();
       window.location.replace("/login");
     }
     return response;
@@ -466,11 +505,8 @@
   function formatAccountDate(timestamp) {
     const value = Number(timestamp || 0);
     if (!value) return "首次登录";
-    return new Intl.DateTimeFormat("zh-CN", {
-      year: "numeric",
-      month: "short",
-      day: "numeric"
-    }).format(new Date(value * 1000));
+    return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" })
+      .format(new Date(value * 1000));
   }
 
   function setAccountMenu(open) {
@@ -480,34 +516,41 @@
   }
 
   function applyAccessState() {
-    const isGuest = !state.user;
-    state.guest = isGuest;
-    elements.accountArea.hidden = isGuest;
-    elements.guestLoginButton.hidden = !isGuest;
-    elements.guestAccessBanner.hidden = !isGuest;
-    elements.railSubtitleAccess.hidden = !isGuest;
-    if (isGuest && selectedOperation() === "subtitle") {
-      setSelectedOperation("video");
-    }
+    elements.accountArea.hidden = !state.user;
+    elements.adminLink.hidden = !state.user || !state.user.is_admin;
+    document.body.classList.toggle("is-owner", Boolean(state.user && state.user.is_admin));
     syncInputMode();
   }
 
-  function setPasswordDialog(open) {
-    const visible = Boolean(open);
-    if (visible && elements.passwordDialog.hidden) state.dialogReturnFocus = elements.accountTrigger;
-    elements.passwordDialog.hidden = !visible;
+  function formatReset(seconds) {
+    const value = Math.max(0, Number(seconds || 0));
+    if (value >= 3600) return `${Math.floor(value / 3600)} 小时后重置`;
+    return `${Math.max(1, Math.ceil(value / 60))} 分钟后重置`;
+  }
+
+  function renderQuota(quota) {
+    const data = quota || {};
+    const limit = Number(data.limit || 0);
+    const used = Math.max(0, Number(data.used || 0));
+    elements.accountQuota.hidden = false;
+    if (!limit) {
+      elements.accountQuotaLabel.textContent = `今日已提交 ${used} 个任务 · 不限次数`;
+      elements.accountQuotaBar.style.setProperty("--quota", "0");
+      elements.accountQuota.classList.remove("low");
+      return;
+    }
+    const ratio = Math.min(1, used / limit);
+    elements.accountQuotaLabel.textContent = `今日 ${used} / ${limit} 次 · ${formatReset(data.resets_in)}`;
+    elements.accountQuotaBar.style.setProperty("--quota", ratio.toFixed(3));
+    elements.accountQuota.classList.toggle("low", limit - used <= Math.max(1, Math.round(limit * 0.15)));
+  }
+
+  function syncBodyLock() {
     document.body.classList.toggle(
       "dialog-open",
-      visible || !elements.cloudConfirmDialog.hidden
+      !elements.cloudConfirmDialog.hidden
     );
-    if (visible) {
-      setAccountMenu(false);
-      elements.passwordError.textContent = "";
-      elements.passwordForm.reset();
-      requestAnimationFrame(() => { if (!elements.passwordDialog.hidden) elements.currentPassword.focus(); });
-    } else {
-      restoreDialogFocus();
-    }
+    document.body.classList.toggle("drawer-open", !elements.historyDrawer.hidden);
   }
 
   function setCloudConfirmDialog(open, resetMode) {
@@ -517,10 +560,7 @@
         ? document.activeElement : elements.extractButton;
     }
     elements.cloudConfirmDialog.hidden = !visible;
-    document.body.classList.toggle(
-      "dialog-open",
-      visible || !elements.passwordDialog.hidden
-    );
+    syncBodyLock();
     if (!visible) {
       state.pendingCloudAction = null;
       elements.cloudConfirmCheck.checked = false;
@@ -550,11 +590,6 @@
       action();
       return;
     }
-    if (!state.user) {
-      showToast("云端识别需要先登录。", true);
-      window.location.assign("/login");
-      return;
-    }
     state.pendingCloudAction = action;
     setCloudConfirmDialog(true, false);
   }
@@ -566,7 +601,7 @@
     elements.cloudConfirmDialog.hidden = true;
     elements.cloudConfirmCheck.checked = false;
     elements.submitCloudConfirm.disabled = true;
-    document.body.classList.toggle("dialog-open", !elements.passwordDialog.hidden);
+    syncBodyLock();
     restoreDialogFocus();
     action();
   }
@@ -582,26 +617,30 @@
       const response = await fetch("/api/auth/me", { cache: "no-store" });
       const data = await response.json().catch(() => ({}));
       if (response.status === 401 || !data.user) {
-        state.user = null;
-        applyAccessState();
-        loadPreferences("guest");
-        removeLegacyHistory("guest");
-        state.history = [];
-        renderHistory();
-        resumeActiveJob();
+        clearActiveJob();
+        window.location.replace("/login");
         return false;
       }
       if (!response.ok) throw new Error(String(response.status));
       state.user = data.user;
       applyAccessState();
-      elements.accountName.textContent = data.user.username;
-      const initial = String(data.user.username || "?").charAt(0).toUpperCase();
+      const label = data.user.label || data.user.username || "成员";
+      elements.accountName.textContent = label;
+      const initial = Array.from(String(label))[0].toUpperCase();
       elements.accountAvatar.textContent = initial;
       elements.accountAvatarLarge.textContent = initial;
-      elements.accountPopoverName.textContent = data.user.username;
-      elements.accountCreatedAt.textContent = `${formatAccountDate(data.user.created_at)} 加入`;
+      elements.accountPopoverName.textContent = label;
+      elements.accountCreatedAt.textContent = data.user.is_admin
+        ? "站长 · 拥有全部权限"
+        : `${formatAccountDate(data.user.created_at)} 获得邀请`;
       const sessions = Math.max(1, Number(data.user.active_sessions || 1));
-      elements.accountSessionSummary.textContent = `当前有 ${sessions} 个有效登录会话`;
+      const devices = Math.max(sessions, Number(data.user.max_devices || sessions));
+      elements.accountSessionSummary.textContent = `已在 ${sessions} / ${devices} 台设备上验证`;
+      elements.accountCode.textContent = data.user.code_hint
+        ? `激活码 ···${data.user.code_hint}${data.user.code_expires_at
+          ? ` · ${formatAccountDate(data.user.code_expires_at)} 到期` : " · 长期有效"}`
+        : "";
+      renderQuota(data.user.quota);
       elements.accountTrigger.disabled = false;
       elements.accountArea.setAttribute("aria-busy", "false");
       loadPreferences(data.user.id);
@@ -631,7 +670,7 @@
   }
 
   async function logoutAllDevices() {
-    if (!window.confirm("确定退出全部设备吗？完成后需要重新登录。")) return;
+    if (!window.confirm("确定退出全部设备吗？之后每台设备都要重新输入激活码。")) return;
     elements.logoutAllDevices.disabled = true;
     try {
       const response = await apiFetch("/api/auth/logout-all", { method: "POST" });
@@ -645,52 +684,7 @@
     }
   }
 
-  async function changeAccountPassword(event) {
-    event.preventDefault();
-    const currentPassword = elements.currentPassword.value;
-    const newPassword = elements.newPassword.value;
-    if (!currentPassword) {
-      elements.passwordError.textContent = "请输入当前密码。";
-      elements.currentPassword.focus();
-      return;
-    }
-    if (newPassword.length < 8) {
-      elements.passwordError.textContent = "新密码至少需要 8 个字符。";
-      elements.newPassword.focus();
-      return;
-    }
-    if (newPassword !== elements.confirmNewPassword.value) {
-      elements.passwordError.textContent = "两次输入的新密码不一致。";
-      elements.confirmNewPassword.focus();
-      return;
-    }
-    elements.submitPassword.disabled = true;
-    elements.submitPassword.textContent = "正在更新";
-    elements.passwordError.textContent = "";
-    try {
-      const response = await apiFetch("/api/auth/change-password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          current_password: currentPassword,
-          new_password: newPassword
-        })
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        elements.passwordError.textContent = friendlyError(data, response.status);
-        return;
-      }
-      setPasswordDialog(false);
-      showToast("密码已更新，其他设备已退出。", false);
-      await loadAccount();
-    } catch (_) {
-      elements.passwordError.textContent = "无法连接账号服务，请稍后重试。";
-    } finally {
-      elements.submitPassword.disabled = false;
-      elements.submitPassword.textContent = "更新密码";
-    }
-  }
+  /* ---------- Form state ---------- */
 
   function selectedSource() {
     const selected = elements.form.querySelector('input[name="source"]:checked');
@@ -720,6 +714,12 @@
     return selected ? selected.value : "link";
   }
 
+  function uploadsEnabled() {
+    return !state.capabilities
+      || !state.capabilities.uploads
+      || state.capabilities.uploads.enabled !== false;
+  }
+
   function setMobileView(view) {
     const next = view === "result" ? "result" : "compose";
     state.mobileView = next;
@@ -737,66 +737,432 @@
     elements.toggleWrap.title = state.wrapOutput ? "关闭自动换行" : "开启自动换行";
   }
 
-  function toggleRawVersion() {
-    if (!state.current || state.current.kind !== "subtitle" || !state.current.rawContent) return;
-    state.current.showingRaw = !state.current.showingRaw;
-    elements.toggleRaw.setAttribute("aria-pressed", String(state.current.showingRaw));
-    elements.toggleRaw.textContent = state.current.showingRaw ? "整理版" : "原始版";
-    elements.resultSearch.value = "";
-    renderOutputContent();
-    updateOutputStats();
+  function updateSubmitLabel() {
+    if (state.busy) return;
+    const operation = selectedOperation();
+    const unavailable = operation !== "subtitle" && !state.mediaEnabled;
+    elements.extractButton.disabled = unavailable;
+    elements.taskHeading.textContent = operation === "video"
+      ? "提取视频"
+      : operation === "audio" ? "提取音频" : "提取字幕";
+    elements.extractButtonLabel.textContent = unavailable
+      ? "当前暂不可用"
+      : operation === "video"
+        ? "提取视频"
+        : operation === "audio"
+          ? "提取音频"
+          : selectedInputMode() === "upload" ? "开始识别" : "开始提取";
   }
 
-  function renderOutputContent() {
-    const content = currentDisplayedContent();
-    const query = elements.resultSearch.value.trim();
+  function syncInputMode() {
+    updateSettingsSummary();
+    const operation = selectedOperation();
+    const mediaMode = operation !== "subtitle";
+    document.body.dataset.operation = operation;
+    const linkRadio = elements.form.querySelector('input[name="input-mode"][value="link"]');
+    const uploadRadio = elements.form.querySelector('input[name="input-mode"][value="upload"]');
+    if (mediaMode && uploadRadio.checked) linkRadio.checked = true;
+    const uploadMode = !mediaMode && selectedInputMode() === "upload";
+    const canUpload = uploadsEnabled();
+    elements.inputModeGroup.hidden = mediaMode;
+    elements.linkInputPanel.hidden = uploadMode;
+    elements.uploadInputPanel.hidden = !uploadMode;
+    elements.sourceFieldGroup.hidden = uploadMode || mediaMode;
+    elements.subtitleFormatGrid.hidden = mediaMode;
+    elements.privacyNote.hidden = mediaMode;
+    elements.platformAiRow.hidden = uploadMode || mediaMode || elements.embeddedSubtitles.checked;
+    elements.input.required = !uploadMode;
+    elements.input.disabled = state.busy;
+    elements.paste.disabled = state.busy;
+    elements.clearInput.disabled = state.busy;
+    elements.newTask.disabled = state.busy;
+    elements.format.disabled = state.busy;
+    elements.lang.disabled = state.busy;
+    elements.forceRefresh.disabled = state.busy;
+    elements.clearInput.title = "清空输入";
+    uploadRadio.disabled = state.busy || mediaMode || !canUpload;
+    linkRadio.disabled = state.busy;
+    elements.videoFile.disabled = state.busy || !canUpload;
+    elements.form.querySelectorAll('input[name="operation"]').forEach((radio) => {
+      radio.disabled = state.busy || (radio.value !== "subtitle" && !state.mediaEnabled);
+    });
+    elements.forceRefreshLabel.textContent = mediaMode ? "重新获取平台信息" : "忽略已有结果";
+    elements.forceRefreshHint.textContent = mediaMode ? "不复用已有的视频解析信息" : "重新下载并处理视频";
+    syncPrecisionOptions();
+    updateSubmitLabel();
+    updatePlatformNotice();
+    syncEmptyState();
+  }
+
+  function syncEmptyState() {
+    if (state.current || state.busy || ["error", "cancelled", "expired"].includes(elements.resultPane.dataset.state)) return;
+    const operation = selectedOperation();
+    const label = operation === "video" ? "视频" : operation === "audio" ? "音频" : "字幕";
+    elements.idleTitle.textContent = `尚无${label}`;
+    elements.idleFormat.textContent = operation === "video"
+      ? "MP4" : operation === "audio" ? "MP3" : elements.format.value.toUpperCase();
+    elements.idleDetail.textContent = "等待提交任务";
+    elements.resultTitle.textContent = `${label}结果`;
+  }
+
+  function resetResult() {
+    state.current = null;
+    state.currentPayload = null;
+    elements.resultPane.dataset.state = "idle";
+    elements.resultActions.hidden = true;
+    elements.statusPanel.hidden = true;
+    elements.outputShell.hidden = true;
+    elements.mediaResult.hidden = true;
+    elements.metadataStrip.hidden = true;
+    elements.notice.hidden = true;
+    elements.resultExpiry.hidden = true;
+    elements.retryTask.hidden = true;
     elements.output.textContent = "";
-    elements.searchCount.textContent = "";
-    if (!query || !content) {
-      elements.output.textContent = content;
+    elements.segmentList.textContent = "";
+    elements.resultKicker.textContent = "任务结果";
+    elements.idleOutput.hidden = false;
+    elements.idleOutput.classList.remove("processing");
+    syncEmptyState();
+    renderHistory();
+  }
+
+  function setInputMode(value) {
+    const radio = elements.form.querySelector(`input[name="input-mode"][value="${value}"]`);
+    if (radio && !radio.disabled) radio.checked = true;
+    syncInputMode();
+  }
+
+  function setSelectedSource(value) {
+    const radio = elements.form.querySelector(`input[name="source"][value="${value}"]`);
+    if (radio) radio.checked = true;
+  }
+
+  function setSelectedAsrMode(value) {
+    const radio = elements.form.querySelector(`input[name="asr-mode"][value="${value}"]`);
+    if (radio) radio.checked = true;
+  }
+
+  function setSelectedOperation(value) {
+    const radio = elements.form.querySelector(`input[name="operation"][value="${value}"]`);
+    if (radio && !radio.disabled) radio.checked = true;
+    syncInputMode();
+  }
+
+  function isLocalAsrReady() {
+    if (!state.capabilities) return true;
+    return Boolean(state.capabilities.features && state.capabilities.features.local_processing);
+  }
+
+  function updateSettingsSummary() {
+    elements.settingsSummary.hidden = selectedOperation() !== "subtitle";
+    const language = elements.lang.options[elements.lang.selectedIndex];
+    elements.settingsSummary.textContent = `${language ? language.textContent : "中文"} · ${elements.format.value.toUpperCase()}`;
+  }
+
+  function syncPrecisionOptions() {
+    const subtitleMode = selectedOperation() === "subtitle";
+    const videoSubtitleReady = !state.capabilities
+      || !state.capabilities.features
+      || state.capabilities.features.embedded_subtitles !== false;
+    elements.embeddedSubtitles.disabled = state.busy || !subtitleMode || !videoSubtitleReady;
+    const embedded = subtitleMode && selectedEmbeddedSubtitles();
+    if (embedded) setSelectedSource("auto");
+    const officialOnly = subtitleMode && selectedInputMode() === "link" && selectedSource() === "official";
+    if (officialOnly) setSelectedAsrMode("auto");
+    elements.qualityFieldGroup.hidden = !subtitleMode || officialOnly;
+    elements.embeddedSubtitleRow.hidden = !subtitleMode;
+    const localReady = isLocalAsrReady();
+    const cloudReady = Boolean(
+      state.capabilities && state.capabilities.features && state.capabilities.features.cloud_enhancement
+    );
+    const autoBackend = state.capabilities && state.capabilities.asr_modes && state.capabilities.asr_modes.auto
+      ? state.capabilities.asr_modes.auto.processing
+      : null;
+    const autoReady = !state.capabilities
+      || Boolean(state.capabilities.asr_modes && state.capabilities.asr_modes.auto && state.capabilities.asr_modes.auto.available);
+    const autoUsesLocal = !state.capabilities || autoBackend === "local";
+    const autoRadio = elements.form.querySelector('input[name="asr-mode"][value="auto"]');
+    elements.asrAutoTitle.textContent = autoUsesLocal ? "本地均衡" : "自动识别";
+    elements.asrAutoDetail.textContent = autoUsesLocal ? "默认 · 兼顾速度与准确率" : "智能选择可用服务";
+    elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
+      const unavailable = radio.value === "auto" ? !autoReady : !cloudReady;
+      radio.disabled = state.busy || !subtitleMode || unavailable;
+    });
+    if (state.capabilities && selectedAsrMode() !== "auto" && !cloudReady && autoRadio && !autoRadio.disabled) {
+      autoRadio.checked = true;
+    }
+    elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
+      radio.disabled = state.busy || embedded;
+    });
+    elements.allowPlatformAi.disabled = state.busy || embedded;
+    elements.hotwords.disabled = state.busy || !subtitleMode;
+    elements.hotwordsRow.hidden = !subtitleMode;
+    const currentMode = selectedAsrMode();
+    const cloudSelected = currentMode === "high_accuracy" || currentMode === "economy";
+    elements.cloudSelectionLabel.textContent = currentMode === "high_accuracy"
+      ? "千问 ASR · 已选择" : currentMode === "economy" ? "Paraformer · 已选择" : "云端增强";
+    if (elements.cloudModeZone.dataset.selectedMode !== currentMode) {
+      elements.cloudModeZone.open = cloudSelected;
+      elements.cloudModeZone.dataset.selectedMode = currentMode;
+    }
+    elements.cloudRoutingNote.textContent = cloudReady
+      ? "按音频时长消耗站点额度，提交前需确认。"
+      : "云端服务暂不可用，基础识别仍可单独使用。";
+    elements.cloudModeZone.classList.toggle("selected", cloudSelected);
+    const currentModeReady = currentMode === "auto" ? autoReady : cloudReady;
+    elements.qualityCaption.textContent = !currentModeReady
+      ? "当前识别服务暂不可用，平台已有字幕仍可正常提取"
+      : embedded
+        ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
+        : currentMode === "economy"
+          ? "平台字幕优先；没有字幕时发送临时音频至 Paraformer"
+          : currentMode === "high_accuracy"
+            ? "平台字幕优先；没有字幕时发送临时音频至千问 ASR"
+            : autoUsesLocal
+              ? "先提取平台字幕，没有字幕时在本站内部均衡识别"
+              : "先提取平台字幕，没有字幕时使用当前可用识别服务";
+    if (currentModeReady && !embedded && (selectedInputMode() === "upload" || selectedSource() === "asr")) {
+      elements.qualityCaption.textContent = cloudSelected
+        ? "直接使用所选云端模型识别音轨"
+        : autoUsesLocal ? "使用本地模型识别音轨" : "使用当前可用服务识别音轨";
+    }
+    elements.privacyNote.textContent = !currentModeReady
+      ? "平台字幕提取不受影响；需要语音识别时请稍后重试。"
+      : currentMode === "auto" && localReady
+        ? "基础模式在本站内部完成语音识别，不会把音频发送给第三方云端。临时媒体会在任务结束后自动删除。"
+        : "云端高级模式会把临时音频发送至阿里云百炼处理；任务完成后会清理本站临时副本。";
+    elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
+  }
+
+  /* ---------- Platform detection ---------- */
+
+  function detectPlatform(value) {
+    if (/(?:^|\.)?(?:douyin\.com|iesdouyin\.com)\//i.test(value)) return "douyin";
+    if (/(BV[0-9A-Za-z]{8,}|(?:bilibili\.com|b23\.tv)\/)/i.test(value)) return "bilibili";
+    return "unknown";
+  }
+
+  function platformLabel(platform) {
+    if (platform === "douyin") return "抖音";
+    if (platform === "bilibili") return "B站";
+    if (platform === "upload") return "本地视频";
+    return "视频平台";
+  }
+
+  function bilibiliStatus() {
+    const statuses = state.capabilities && state.capabilities.platform_status;
+    const status = statuses && statuses.bilibili;
+    return status && typeof status === "object" ? status : { state: "ok" };
+  }
+
+  function markBilibiliLimited(message) {
+    if (!state.capabilities) state.capabilities = {};
+    state.capabilities.platform_status = Object.assign({}, state.capabilities.platform_status, {
+      bilibili: { state: "limited", message: message || errorMessages.platform_blocked }
+    });
+    updatePlatformNotice();
+    updatePlatformHealth();
+  }
+
+  function updatePlatformNotice() {
+    const limited = bilibiliStatus().state === "limited";
+    const platform = detectPlatform(elements.input.value.trim());
+    const show = limited && platform === "bilibili" && selectedInputMode() === "link";
+    elements.platformNotice.hidden = !show;
+    if (!show) return;
+    elements.platformNoticeTitle.textContent = "B站暂时限制了本站访问";
+    elements.platformNoticeDetail.textContent = selectedOperation() === "subtitle" && uploadsEnabled()
+      ? "可以先把视频保存到本地，再改用上传文件识别；也可以稍后再试。"
+      : "这通常是平台的临时风控，请稍后再试。";
+    elements.platformNoticeAction.hidden = !(selectedOperation() === "subtitle" && uploadsEnabled() && !state.busy);
+  }
+
+  function updatePlatformHealth() {
+    const limited = bilibiliStatus().state === "limited";
+    elements.bilibiliChip.classList.toggle("limited", limited);
+    elements.bilibiliChip.title = limited ? "B站暂时限制了本站访问" : "B站可用";
+    setHealthValue(elements.healthBilibili, limited ? "暂时受限" : "可用", limited ? "warn" : "");
+  }
+
+  function formatBytes(value) {
+    const bytes = Math.max(0, Number(value || 0));
+    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  function setUploadFile(file) {
+    state.uploadFile = file || null;
+    elements.videoFile.value = "";
+    elements.uploadError.textContent = "";
+    elements.uploadDropzone.classList.toggle("selected", Boolean(file));
+    elements.uploadFileTitle.textContent = file ? file.name : "选择视频文件";
+    elements.uploadFileDetail.textContent = file ? formatBytes(file.size) : "点击选择，或拖放到此处";
+  }
+
+  function clearUnavailableUploadSelection() {
+    if (state.currentPayload && state.currentPayload.kind === "upload" && !state.uploadFile) setUploadFile(null);
+  }
+
+  function validateUpload() {
+    const file = state.uploadFile;
+    let message = "";
+    if (!file) {
+      message = "请先选择视频文件。";
+    } else if (!file.size) {
+      message = "选择的视频文件为空。";
+    } else if (file.size > state.uploadMaxBytes) {
+      message = `视频文件不能超过 ${formatBytes(state.uploadMaxBytes)}。`;
+    } else if (state.uploadExtensions.length) {
+      const suffix = file.name.includes(".") ? `.${file.name.split(".").pop().toLowerCase()}` : "";
+      if (!state.uploadExtensions.includes(suffix)) message = "暂不支持这种视频格式。";
+    }
+    elements.uploadError.textContent = message;
+    return !message;
+  }
+
+  function updatePlatformDetect() {
+    const platform = detectPlatform(elements.input.value.trim());
+    const label = platform === "unknown" ? "等待识别平台" : `已识别为${platformLabel(platform)}`;
+    elements.platformDetect.className = `platform-detect ${platform}`;
+    elements.platformDetect.querySelector("span").textContent = label;
+    if (document.body.dataset.platform !== platform) {
+      document.body.dataset.platform = platform;
+      fx("platform", { platform });
+    }
+    updatePlatformNotice();
+    return platform;
+  }
+
+  function hidePageSelector() {
+    elements.pageSelectorRow.hidden = true;
+    elements.pageSelect.textContent = "";
+    state.biliBaseUrl = "";
+  }
+
+  function schedulePageLookup() {
+    state.pageLookupVersion += 1;
+    if (state.pageLookupTimer) clearTimeout(state.pageLookupTimer);
+    if (detectPlatform(elements.input.value.trim()) !== "bilibili") {
+      hidePageSelector();
       return;
     }
-
-    const source = content.toLocaleLowerCase();
-    const needle = query.toLocaleLowerCase();
-    let cursor = 0;
-    let count = 0;
-    while (cursor < source.length) {
-      const index = source.indexOf(needle, cursor);
-      if (index < 0) break;
-      count += 1;
-      cursor = index + Math.max(needle.length, 1);
-    }
-
-    cursor = 0;
-    let highlighted = 0;
-    while (cursor < content.length && highlighted < 200) {
-      const index = source.indexOf(needle, cursor);
-      if (index < 0) break;
-      elements.output.appendChild(document.createTextNode(content.slice(cursor, index)));
-      const mark = document.createElement("mark");
-      mark.textContent = content.slice(index, index + needle.length);
-      elements.output.appendChild(mark);
-      cursor = index + Math.max(needle.length, 1);
-      highlighted += 1;
-    }
-    elements.output.appendChild(document.createTextNode(content.slice(cursor)));
-    elements.searchCount.textContent = count ? `${count} 处` : "未找到";
-    const firstMatch = elements.output.querySelector("mark");
-    if (firstMatch) firstMatch.scrollIntoView({ block: "center" });
+    state.pageLookupTimer = setTimeout(loadBilibiliPages, 450);
   }
 
-  function currentDisplayedContent() {
-    if (!state.current || state.current.kind !== "subtitle") return "";
-    return state.current.showingRaw && state.current.rawContent
-      ? state.current.rawContent
-      : state.current.content;
+  async function loadBilibiliPages() {
+    state.pageLookupTimer = null;
+    const version = ++state.pageLookupVersion;
+    const input = elements.input.value.trim();
+    if (detectPlatform(input) !== "bilibili") {
+      hidePageSelector();
+      return;
+    }
+    const params = new URLSearchParams({ input });
+    try {
+      const response = await apiFetch(`/api/bilibili/pages?${params.toString()}`, { cache: "no-store" });
+      const data = await response.json().catch(() => ({}));
+      if (version !== state.pageLookupVersion || elements.input.value.trim() !== input) return;
+      const detail = errorDetail(data);
+      if (!response.ok && detail && detail.code === "platform_blocked") markBilibiliLimited(detail.message);
+      if (!response.ok || !Array.isArray(data.pages) || data.pages.length <= 1) {
+        hidePageSelector();
+        return;
+      }
+      elements.pageSelect.textContent = "";
+      data.pages.forEach((page, index) => {
+        const option = document.createElement("option");
+        option.value = String(page.page || index + 1);
+        option.textContent = `P${page.page || index + 1} · ${page.title || "未命名分段"}`;
+        elements.pageSelect.appendChild(option);
+      });
+      elements.pageSelect.value = String(data.current_page || 1);
+      state.biliBaseUrl = data.base_url || "";
+      elements.pageSelectorRow.hidden = false;
+    } catch (_) {
+      if (version === state.pageLookupVersion && elements.input.value.trim() === input) hidePageSelector();
+    }
   }
 
-  function updateOutputStats() {
-    const content = currentDisplayedContent();
-    const lineCount = content ? content.split("\n").filter(Boolean).length : 0;
-    elements.outputStats.textContent = `${lineCount} 行 · ${content.length.toLocaleString("zh-CN")} 字符`;
+  function buildPayload(overrides) {
+    const operation = selectedOperation();
+    const payload = operation === "subtitle"
+      ? {
+          input: elements.input.value.trim(),
+          source: selectedSource(),
+          format: elements.format.value,
+          lang: elements.lang.value || null,
+          hotwords: elements.hotwords.value.trim() || null,
+          quality: selectedQuality(),
+          asr_mode: selectedAsrMode(),
+          cloud_consent: false,
+          embedded_subtitles: selectedEmbeddedSubtitles(),
+          allow_platform_ai: elements.allowPlatformAi.checked,
+          force_refresh: elements.forceRefresh.checked
+        }
+      : {
+          kind: "media",
+          input: elements.input.value.trim(),
+          media_type: operation,
+          force_refresh: elements.forceRefresh.checked
+        };
+    return Object.assign(payload, overrides || {});
+  }
+
+  function validateInput() {
+    const value = elements.input.value.trim();
+    const platform = detectPlatform(value);
+    let message = "";
+    if (!value) message = "请输入视频链接或 BV 号。";
+    else if (platform === "unknown") message = "没有识别到 B站或抖音视频链接。";
+    elements.input.classList.toggle("invalid", Boolean(message));
+    elements.input.setAttribute("aria-invalid", String(Boolean(message)));
+    elements.inputError.textContent = message;
+    updatePlatformDetect();
+    return !message;
+  }
+
+  /* ---------- Busy state and status ---------- */
+
+  function stopPolling() {
+    if (state.pollTimer) clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+    if (state.pollController) state.pollController.abort();
+    state.pollController = null;
+    state.pollFailures = 0;
+    state.pollPaused = false;
+  }
+
+  function formatClock(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(totalSeconds));
+    if (seconds < 60) return `${seconds} 秒`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes} 分 ${String(seconds % 60).padStart(2, "0")} 秒`;
+  }
+
+  function setBusy(busy, startedAt) {
+    if (state.busy !== busy) fx("busy", { busy });
+    state.busy = busy;
+    elements.extractButton.disabled = busy;
+    elements.extractButton.classList.toggle("loading", busy);
+    elements.extractButtonLabel.textContent = busy ? "任务处理中" : "";
+    elements.resultActions.hidden = busy || !state.current;
+    elements.retryAccurate.hidden = busy || elements.retryAccurate.hidden;
+    elements.copyResult.hidden = Boolean(state.current && state.current.kind === "media");
+    syncInputMode();
+    renderHistory();
+    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
+    state.elapsedTimer = null;
+    if (!busy) {
+      elements.statusElapsed.textContent = "";
+      return;
+    }
+    state.startedAt = Number(startedAt || Date.now());
+    const updateElapsed = () => {
+      elements.statusElapsed.textContent = `已用时 ${formatClock((Date.now() - state.startedAt) / 1000)}`;
+    };
+    updateElapsed();
+    state.elapsedTimer = setInterval(updateElapsed, 1000);
   }
 
   function updateStageTrack(stage, progress, status) {
@@ -830,455 +1196,18 @@
     let current = stageGroups[stage];
     if (!current) {
       const numericProgress = Number(progress);
-      current = numericProgress >= 85
-        ? "render"
-        : numericProgress >= 45
-          ? "recognize"
+      current = numericProgress >= 85 ? "render"
+        : numericProgress >= 45 ? "recognize"
           : numericProgress >= 12 ? "fetch" : "prepare";
     }
     const currentIndex = order.indexOf(current);
+    fx("stage", { stage: current, progress: Number(progress) || 0, status: status || "processing" });
     elements.stageTrack.querySelectorAll("li").forEach((item) => {
       const index = order.indexOf(item.dataset.stage);
       item.classList.toggle("done", index >= 0 && index < currentIndex);
       item.classList.toggle("active", index === currentIndex);
     });
     elements.stageTrack.hidden = !["queued", "running", "processing"].includes(status || "processing");
-  }
-
-  function updateSubmitLabel() {
-    if (state.busy) return;
-    const operation = selectedOperation();
-    const unavailable = operation !== "subtitle" && !state.mediaEnabled;
-    elements.extractButton.disabled = unavailable;
-    elements.taskHeading.textContent = operation === "video"
-      ? "提取视频"
-      : operation === "audio" ? "提取音频" : "提取字幕";
-    elements.extractButtonLabel.textContent = unavailable
-      ? "当前暂不可用"
-      : operation === "video"
-        ? state.guest ? "免登录提取视频" : "提取视频"
-        : operation === "audio"
-          ? state.guest ? "免登录提取音频" : "提取音频"
-          : selectedInputMode() === "upload" ? "开始识别" : "开始提取";
-  }
-
-  function syncRailNavigation() {
-    const operation = selectedOperation();
-    [elements.railSubtitle, elements.railVideo, elements.railAudio].forEach((button) => {
-      const selected = button.dataset.operation === operation;
-      button.classList.toggle("active", selected);
-      button.setAttribute("aria-current", selected ? "page" : "false");
-      button.disabled = state.busy
-        || (button.dataset.operation === "subtitle" && state.guest)
-        || (button.dataset.operation !== "subtitle" && !state.mediaEnabled);
-    });
-  }
-
-  function syncInputMode() {
-    updateSettingsSummary();
-    let operation = selectedOperation();
-    if (state.guest && operation === "subtitle") {
-      const videoRadio = elements.form.querySelector('input[name="operation"][value="video"]');
-      if (videoRadio) videoRadio.checked = true;
-      operation = "video";
-    }
-    const mediaMode = operation !== "subtitle";
-    document.body.dataset.operation = operation;
-    const linkRadio = elements.form.querySelector('input[name="input-mode"][value="link"]');
-    const uploadRadio = elements.form.querySelector('input[name="input-mode"][value="upload"]');
-    if (mediaMode && uploadRadio.checked) linkRadio.checked = true;
-    const uploadMode = !mediaMode && selectedInputMode() === "upload";
-    const uploadsEnabled = !state.guest && (!state.capabilities
-      || !state.capabilities.uploads
-      || state.capabilities.uploads.enabled !== false);
-    elements.inputModeGroup.hidden = mediaMode;
-    elements.linkInputPanel.hidden = uploadMode;
-    elements.uploadInputPanel.hidden = !uploadMode;
-    elements.sourceFieldGroup.hidden = uploadMode || mediaMode;
-    elements.subtitleFormatGrid.hidden = mediaMode;
-    elements.privacyNote.hidden = mediaMode;
-    elements.platformAiRow.hidden = uploadMode || mediaMode || elements.embeddedSubtitles.checked;
-    const cookieReady = Boolean(
-      state.capabilities
-      && state.capabilities.features
-      && state.capabilities.features.bilibili_cookie
-    );
-    elements.cookieRow.hidden = state.guest || uploadMode || !cookieReady;
-    elements.input.required = !uploadMode;
-    elements.input.disabled = state.busy;
-    elements.paste.disabled = state.busy;
-    elements.clearInput.disabled = state.busy;
-    elements.format.disabled = state.busy;
-    elements.lang.disabled = state.busy;
-    elements.forceRefresh.disabled = state.busy;
-    elements.clearInput.title = uploadMode ? "清除视频" : "清空输入";
-    uploadRadio.disabled = state.busy || state.guest || mediaMode || !uploadsEnabled;
-    linkRadio.disabled = state.busy;
-    elements.videoFile.disabled = state.busy || !uploadsEnabled;
-    elements.form.querySelectorAll('input[name="operation"]').forEach((radio) => {
-      radio.disabled = state.busy
-        || (radio.value === "subtitle" && state.guest)
-        || (radio.value !== "subtitle" && !state.mediaEnabled);
-    });
-    syncRailNavigation();
-    elements.forceRefreshLabel.textContent = mediaMode ? "重新获取平台信息" : "忽略已有结果";
-    elements.forceRefreshHint.textContent = mediaMode ? "不复用已有的视频解析信息" : "重新下载并处理视频";
-    syncPrecisionOptions();
-    updateSubmitLabel();
-    syncEmptyState();
-  }
-
-  function syncEmptyState() {
-    if (state.current || state.busy || ["error", "cancelled", "expired"].includes(elements.resultPane.dataset.state)) return;
-    const operation = selectedOperation();
-    const label = operation === "video" ? "视频" : operation === "audio" ? "音频" : "字幕";
-    elements.idleTitle.textContent = `尚无${label}`;
-    elements.idleFormat.textContent = operation === "video" ? "MP4" : operation === "audio" ? "MP3" : elements.format.value.toUpperCase();
-    elements.idleDetail.textContent = "等待提交任务";
-    elements.resultTitle.textContent = `${label}结果`;
-  }
-
-  function resetResult() {
-    state.current = null;
-    state.currentPayload = null;
-    elements.resultPane.dataset.state = "idle";
-    elements.resultActions.hidden = true;
-    elements.statusPanel.hidden = true;
-    elements.outputShell.hidden = true;
-    elements.mediaResult.hidden = true;
-    elements.metadataStrip.hidden = true;
-    elements.notice.hidden = true;
-    elements.resultExpiry.hidden = true;
-    elements.retryTask.hidden = true;
-    elements.output.textContent = "";
-    elements.resultKicker.textContent = "任务结果";
-    elements.idleOutput.hidden = false;
-    elements.idleOutput.classList.remove("processing");
-    syncEmptyState();
-    renderHistory();
-  }
-
-  function setInputMode(value) {
-    const radio = elements.form.querySelector(`input[name="input-mode"][value="${value}"]`);
-    if (radio && !radio.disabled) radio.checked = true;
-    syncInputMode();
-  }
-
-  function setSelectedSource(value) {
-    const radio = elements.form.querySelector(`input[name="source"][value="${value}"]`);
-    if (radio) radio.checked = true;
-  }
-
-  function setSelectedAsrMode(value) {
-    const radio = elements.form.querySelector(`input[name="asr-mode"][value="${value}"]`);
-    if (radio) radio.checked = true;
-  }
-
-  function isLocalAsrReady() {
-    if (!state.capabilities) return true;
-    return Boolean(
-      state.capabilities.features
-      && state.capabilities.features.local_processing
-    );
-  }
-
-  function updateSettingsSummary() {
-    elements.settingsSummary.hidden = selectedOperation() !== "subtitle";
-    const language = elements.lang.options[elements.lang.selectedIndex];
-    elements.settingsSummary.textContent = `${language ? language.textContent : "中文"} · ${elements.format.value.toUpperCase()}`;
-  }
-
-  function syncPrecisionOptions() {
-    const subtitleMode = selectedOperation() === "subtitle";
-    const videoSubtitleReady = !state.capabilities
-      || !state.capabilities.features
-      || state.capabilities.features.embedded_subtitles !== false;
-    elements.embeddedSubtitles.disabled = state.busy || !subtitleMode || !videoSubtitleReady;
-    const embedded = subtitleMode && selectedEmbeddedSubtitles();
-    if (embedded) {
-      setSelectedSource("auto");
-    }
-    const officialOnly = subtitleMode && selectedInputMode() === "link" && selectedSource() === "official";
-    if (officialOnly) setSelectedAsrMode("auto");
-    elements.qualityFieldGroup.hidden = !subtitleMode || officialOnly;
-    elements.embeddedSubtitleRow.hidden = !subtitleMode;
-    const localReady = isLocalAsrReady();
-    const cloudReady = Boolean(
-      state.capabilities
-      && state.capabilities.features
-      && state.capabilities.features.cloud_enhancement
-    );
-    const autoBackend = state.capabilities
-      && state.capabilities.asr_modes
-      && state.capabilities.asr_modes.auto
-      ? state.capabilities.asr_modes.auto.processing
-      : null;
-    const autoReady = !state.capabilities
-      || Boolean(state.capabilities.asr_modes && state.capabilities.asr_modes.auto.available);
-    const autoUsesLocal = !state.capabilities || autoBackend === "local";
-    const autoRadio = elements.form.querySelector('input[name="asr-mode"][value="auto"]');
-    elements.asrAutoTitle.textContent = autoUsesLocal ? "本地均衡" : "自动识别";
-    elements.asrAutoDetail.textContent = autoUsesLocal
-      ? "默认 · 兼顾速度与准确率"
-      : "智能选择可用服务";
-    elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
-      const unavailable = radio.value === "auto"
-        ? !autoReady
-        : !cloudReady;
-      radio.disabled = state.busy || !subtitleMode || unavailable;
-    });
-    if (
-      state.capabilities
-      && selectedAsrMode() !== "auto"
-      && !cloudReady
-      && autoRadio
-      && !autoRadio.disabled
-    ) {
-      autoRadio.checked = true;
-    }
-    elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
-      radio.disabled = state.busy || embedded;
-    });
-    elements.allowPlatformAi.disabled = state.busy || embedded;
-    elements.hotwords.disabled = state.busy || !subtitleMode;
-    elements.hotwordsRow.hidden = !subtitleMode;
-    const currentMode = selectedAsrMode();
-    const cloudSelected = currentMode === "high_accuracy" || currentMode === "economy";
-    elements.cloudSelectionLabel.textContent = currentMode === "high_accuracy"
-      ? "千问 ASR · 已选择" : currentMode === "economy" ? "Paraformer · 已选择" : "云端增强";
-    if (elements.cloudModeZone.dataset.selectedMode !== currentMode) {
-      elements.cloudModeZone.open = cloudSelected;
-      elements.cloudModeZone.dataset.selectedMode = currentMode;
-    }
-    elements.cloudRoutingNote.textContent = cloudReady
-      ? "按音频时长消耗站点额度，提交前需确认。"
-      : "云端服务暂不可用，基础识别仍可单独使用。";
-    elements.cloudModeZone.classList.toggle(
-      "selected",
-      currentMode === "high_accuracy" || currentMode === "economy"
-    );
-    const currentModeReady = currentMode === "auto" ? autoReady : cloudReady;
-    elements.qualityCaption.textContent = !currentModeReady
-      ? "当前识别服务暂不可用，平台已有字幕仍可正常提取"
-      : embedded
-        ? "会下载视频并优先识别内嵌或烧录在画面中的字幕"
-        : currentMode === "economy"
-          ? "平台字幕优先；没有字幕时发送临时音频至 Paraformer"
-          : currentMode === "high_accuracy"
-            ? "平台字幕优先；没有字幕时发送临时音频至千问 ASR"
-            : autoUsesLocal
-              ? "先提取平台字幕，没有字幕时在本站内部均衡识别"
-              : "先提取平台字幕，没有字幕时使用当前可用识别服务";
-    if (currentModeReady && !embedded && (selectedInputMode() === "upload" || selectedSource() === "asr")) {
-      elements.qualityCaption.textContent = cloudSelected
-        ? "直接使用所选云端模型识别音轨"
-        : autoUsesLocal ? "使用本地模型识别音轨" : "使用当前可用服务识别音轨";
-    }
-    elements.privacyNote.textContent = !currentModeReady
-      ? "平台字幕提取不受影响；需要语音识别时请稍后重试。"
-      : currentMode === "auto" && localReady
-        ? "基础模式在本站内部完成语音识别，不会把音频发送给第三方云端。临时媒体会在任务结束后自动删除。"
-        : "云端高级模式会把临时音频发送至阿里云百炼处理；任务完成后会清理本站临时副本。";
-    elements.platformAiRow.hidden = !subtitleMode || selectedInputMode() === "upload" || embedded;
-  }
-
-  function setSelectedOperation(value) {
-    const radio = elements.form.querySelector(`input[name="operation"][value="${value}"]`);
-    if (radio && !radio.disabled) radio.checked = true;
-    syncInputMode();
-  }
-
-  function detectPlatform(value) {
-    if (/(?:^|\.)?(?:douyin\.com|iesdouyin\.com)\//i.test(value)) return "douyin";
-    if (/(BV[0-9A-Za-z]{8,}|(?:bilibili\.com|b23\.tv)\/)/i.test(value)) return "bilibili";
-    return "unknown";
-  }
-
-  function platformLabel(platform) {
-    if (platform === "douyin") return "抖音";
-    if (platform === "bilibili") return "B站";
-    if (platform === "upload") return "本地视频";
-    return "视频平台";
-  }
-
-  function formatBytes(value) {
-    const bytes = Math.max(0, Number(value || 0));
-    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
-
-  function setUploadFile(file) {
-    state.uploadFile = file || null;
-    elements.videoFile.value = "";
-    elements.uploadError.textContent = "";
-    elements.uploadDropzone.classList.toggle("selected", Boolean(file));
-    elements.uploadFileTitle.textContent = file ? file.name : "选择视频";
-    elements.uploadFileDetail.textContent = file ? formatBytes(file.size) : "或拖放到这里";
-  }
-
-  function clearUnavailableUploadSelection() {
-    if (state.currentPayload && state.currentPayload.kind === "upload" && !state.uploadFile) {
-      setUploadFile(null);
-    }
-  }
-
-  function validateUpload() {
-    const file = state.uploadFile;
-    let message = "";
-    if (!file) {
-      message = "请先选择视频文件。";
-    } else if (!file.size) {
-      message = "选择的视频文件为空。";
-    } else if (file.size > state.uploadMaxBytes) {
-      message = `视频文件不能超过 ${formatBytes(state.uploadMaxBytes)}。`;
-    } else if (state.uploadExtensions.length) {
-      const suffix = file.name.includes(".") ? `.${file.name.split(".").pop().toLowerCase()}` : "";
-      if (!state.uploadExtensions.includes(suffix)) message = "暂不支持这种视频格式。";
-    }
-    elements.uploadError.textContent = message;
-    return !message;
-  }
-
-  function updatePlatformDetect() {
-    const platform = detectPlatform(elements.input.value.trim());
-    const label = platform === "unknown" ? "等待识别平台" : `已识别为${platformLabel(platform)}`;
-    elements.platformDetect.className = `platform-detect ${platform}`;
-    elements.platformDetect.querySelector("span").textContent = label;
-    return platform;
-  }
-
-  function hidePageSelector() {
-    elements.pageSelectorRow.hidden = true;
-    elements.pageSelect.textContent = "";
-    state.biliBaseUrl = "";
-  }
-
-  function schedulePageLookup() {
-    state.pageLookupVersion += 1;
-    if (state.pageLookupTimer) clearTimeout(state.pageLookupTimer);
-    if (detectPlatform(elements.input.value.trim()) !== "bilibili") {
-      hidePageSelector();
-      return;
-    }
-    state.pageLookupTimer = setTimeout(loadBilibiliPages, 450);
-  }
-
-  async function loadBilibiliPages() {
-    state.pageLookupTimer = null;
-    const version = ++state.pageLookupVersion;
-    const input = elements.input.value.trim();
-    if (detectPlatform(input) !== "bilibili") {
-      hidePageSelector();
-      return;
-    }
-    const params = new URLSearchParams({
-      input,
-      use_cookie: String(elements.useCookie.checked)
-    });
-    try {
-      const response = await apiFetch(`/api/bilibili/pages?${params.toString()}`, {
-        cache: "no-store"
-      });
-      const data = await response.json().catch(() => ({}));
-      if (version !== state.pageLookupVersion || elements.input.value.trim() !== input) return;
-      if (!response.ok || !Array.isArray(data.pages)) {
-        hidePageSelector();
-        return;
-      }
-      if (data.pages.length <= 1) {
-        hidePageSelector();
-        return;
-      }
-      elements.pageSelect.textContent = "";
-      data.pages.forEach((page, index) => {
-        const option = document.createElement("option");
-        option.value = String(page.page || index + 1);
-        option.textContent = `P${page.page || index + 1} · ${page.title || "未命名分段"}`;
-        elements.pageSelect.appendChild(option);
-      });
-      elements.pageSelect.value = String(data.current_page || 1);
-      state.biliBaseUrl = data.base_url || "";
-      elements.pageSelectorRow.hidden = false;
-    } catch (_) {
-      if (version === state.pageLookupVersion && elements.input.value.trim() === input) hidePageSelector();
-    }
-  }
-
-  function buildPayload(overrides) {
-    const operation = selectedOperation();
-    const payload = operation === "subtitle"
-      ? {
-          input: elements.input.value.trim(),
-          source: selectedSource(),
-          format: elements.format.value,
-          lang: elements.lang.value || null,
-          hotwords: elements.hotwords.value.trim() || null,
-          quality: selectedQuality(),
-          asr_mode: selectedAsrMode(),
-          cloud_consent: false,
-          embedded_subtitles: selectedEmbeddedSubtitles(),
-          use_cookie: elements.useCookie.checked,
-          allow_platform_ai: elements.allowPlatformAi.checked,
-          force_refresh: elements.forceRefresh.checked
-        }
-      : {
-          kind: "media",
-          input: elements.input.value.trim(),
-          media_type: operation,
-          use_cookie: elements.useCookie.checked,
-          force_refresh: elements.forceRefresh.checked
-        };
-    return Object.assign(payload, overrides || {});
-  }
-
-  function validateInput() {
-    const value = elements.input.value.trim();
-    const platform = detectPlatform(value);
-    let message = "";
-    if (!value) {
-      message = "请输入视频链接或 BV 号。";
-    } else if (platform === "unknown") {
-      message = "没有识别到 B站或抖音视频链接。";
-    }
-    elements.input.classList.toggle("invalid", Boolean(message));
-    elements.inputError.textContent = message;
-    updatePlatformDetect();
-    return !message;
-  }
-
-  function stopPolling() {
-    if (state.pollTimer) clearTimeout(state.pollTimer);
-    state.pollTimer = null;
-    if (state.pollController) state.pollController.abort();
-    state.pollController = null;
-    state.pollFailures = 0;
-    state.pollPaused = false;
-  }
-
-  function setBusy(busy, startedAt) {
-    state.busy = busy;
-    elements.extractButton.disabled = busy;
-    elements.extractButton.classList.toggle("loading", busy);
-    elements.extractButtonLabel.textContent = busy ? "任务处理中" : "";
-    elements.resultActions.hidden = busy || !state.current;
-    elements.retryAccurate.hidden = busy || elements.retryAccurate.hidden;
-    elements.copyResult.hidden = Boolean(state.current && state.current.kind === "media");
-    syncInputMode();
-    renderHistory();
-    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
-    state.elapsedTimer = null;
-    if (!busy) {
-      elements.statusElapsed.textContent = "";
-      return;
-    }
-    state.startedAt = Number(startedAt || Date.now());
-    const updateElapsed = () => {
-      const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
-      elements.statusElapsed.textContent = `已用时 ${elapsed} 秒`;
-    };
-    updateElapsed();
-    state.elapsedTimer = setInterval(updateElapsed, 1000);
   }
 
   function showStatus(kind, title, detail, progress, mark) {
@@ -1309,13 +1238,10 @@
     elements.outputShell.hidden = true;
     elements.mediaResult.hidden = true;
     elements.idleOutput.hidden = ["error", "reconnecting"].includes(kind);
-    elements.idleOutput.classList.toggle(
-      "processing",
-      ["queued", "processing"].includes(kind)
-    );
+    elements.idleOutput.classList.toggle("processing", ["queued", "processing"].includes(kind));
     if (["queued", "processing"].includes(kind)) {
       elements.idleTitle.textContent = kind === "queued" ? "等待处理" : "正在生成结果";
-      elements.idleDetail.textContent = "任务会在后台继续";
+      elements.idleDetail.textContent = "可以离开页面，任务会在后台继续";
     }
     elements.metadataStrip.hidden = true;
     elements.notice.hidden = true;
@@ -1334,9 +1260,7 @@
     const code = detail && typeof detail === "object" ? detail.code : "";
     if (code && errorMessages[code]) return errorMessages[code];
     if (reason && errorMessages[reason]) return errorMessages[reason];
-    if (status === 401) return state.guest
-      ? "访客会话已失效，请刷新页面后重新提取。"
-      : "访问凭据已失效，请重新登录。";
+    if (status === 401) return "访问凭据已失效，请重新输入激活码。";
     if (status === 413) return "视频或音频文件超过当前大小限制。";
     if (status === 415) return "暂不支持这种视频格式。";
     if (status === 429) return "请求过于频繁或任务队列已满，请稍后再试。";
@@ -1357,11 +1281,22 @@
     return `${minutes}:${String(secs).padStart(2, "0")}`;
   }
 
+  function formatTimestamp(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds || 0)));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    const mmss = `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+    return hours ? `${hours}:${mmss}` : mmss;
+  }
+
   function formatElapsed(seconds) {
     const value = Number(seconds || 0);
     if (value < 0.1) return `${Math.max(1, Math.round(value * 1000))} ms`;
     return `${value.toFixed(value < 10 ? 2 : 1)} 秒`;
   }
+
+  /* ---------- Result rendering ---------- */
 
   function addChip(label, className) {
     const chip = document.createElement("span");
@@ -1372,7 +1307,7 @@
 
   function renderMetadata(meta) {
     elements.metadataStrip.textContent = "";
-    addChip(platformLabel(meta.platform), meta.platform || "");
+    addChip(platformLabel(meta.platform), ["bilibili", "douyin", "upload"].includes(meta.platform) ? meta.platform : "");
     if (meta.media_type) {
       addChip(meta.media_type === "audio" ? "MP3 音频" : "视频文件", meta.media_type === "audio" ? "asr" : "");
     } else {
@@ -1388,8 +1323,8 @@
         asrMode === "economy" ? "" : "asr"
       );
     }
-    if (meta.track_source_type === "embedded_text") addChip("内嵌字幕", "cache");
-    if (meta.track_source_type === "burned_in_ocr") addChip("画面字幕", "asr");
+    if (meta.track_source_type === "embedded_text" && meta.source !== "embedded_text") addChip("内嵌字幕", "cache");
+    if (meta.track_source_type === "burned_in_ocr" && meta.source !== "ocr_video") addChip("画面字幕", "asr");
     if (meta.cache_hit) addChip("已命中缓存", "cache");
     if (meta.duration) addChip(`时长 ${formatDuration(meta.duration)}`);
     if (meta.entry_count) addChip(`${meta.entry_count} 条`);
@@ -1408,28 +1343,177 @@
     if (meta.ocr_fallback_to_asr || meta.ocr_fallback || meta.fallback_from === "ocr") {
       return "画面未识别到稳定字幕，本次已自动改用精确语音识别。";
     }
-    if (meta.platform === "upload") {
-      return "识别完成，临时视频已自动删除。";
-    }
+    if (meta.platform === "upload") return "识别完成，临时视频已自动删除。";
     if (meta.source === "asr_local" && meta.requested_source === "auto") {
       return `未找到可用的${platformLabel(meta.platform)}字幕，本次已使用本地语音识别。`;
     }
     if (meta.source === "asr_aliyun" && meta.requested_source === "auto") {
       return `未找到可用的${platformLabel(meta.platform)}字幕，本次已使用阿里云百炼语音识别。`;
     }
-    if (meta.track_source_type === "platform_ai") {
-      return `本次使用了${platformLabel(meta.platform)}平台自动字幕。`;
-    }
+    if (meta.track_source_type === "platform_ai") return `本次使用了${platformLabel(meta.platform)}平台自动字幕。`;
     return "";
   }
 
   function shouldOfferAccurateRetry(meta, payload) {
     if (!payload || !payload.input || payload.kind === "upload" || payload.kind === "media") return false;
+    if (!state.capabilities || !state.capabilities.features || !state.capabilities.features.cloud_enhancement) return false;
     if (payload.quality === "fast") return true;
     if (meta.track_source_type === "platform_ai") return true;
     if (meta.quality_warning) return true;
     if (Number(meta.low_confidence_segment_ratio || 0) >= 0.25) return true;
     return Number(meta.repeated_segment_ratio || 0) >= 0.1;
+  }
+
+  function normalizeSegments(items) {
+    if (!Array.isArray(items)) return [];
+    return items.filter((item) => item && typeof item.text === "string" && item.text.trim())
+      .map((item) => ({ start: Number(item.start) || 0, end: Number(item.end) || 0, text: item.text }));
+  }
+
+  function currentDisplayedContent() {
+    if (!state.current || state.current.kind !== "subtitle") return "";
+    return state.current.showingRaw && state.current.rawContent ? state.current.rawContent : state.current.content;
+  }
+
+  function displayedSegments() {
+    if (!state.current || state.current.kind !== "subtitle") return [];
+    return state.current.showingRaw && state.current.rawContent
+      ? state.current.rawSegments
+      : state.current.segments;
+  }
+
+  function activeResultView() {
+    return state.resultView === "segments" && displayedSegments().length ? "segments" : "source";
+  }
+
+  function countMatches(source, needle) {
+    let cursor = 0;
+    let count = 0;
+    while (cursor < source.length) {
+      const index = source.indexOf(needle, cursor);
+      if (index < 0) break;
+      count += 1;
+      cursor = index + Math.max(needle.length, 1);
+    }
+    return count;
+  }
+
+  function appendHighlighted(container, text, needle, budget) {
+    if (!needle) {
+      container.textContent = text;
+      return budget;
+    }
+    const source = text.toLocaleLowerCase();
+    let cursor = 0;
+    while (cursor < text.length && budget > 0) {
+      const index = source.indexOf(needle, cursor);
+      if (index < 0) break;
+      container.appendChild(document.createTextNode(text.slice(cursor, index)));
+      const mark = document.createElement("mark");
+      mark.textContent = text.slice(index, index + needle.length);
+      container.appendChild(mark);
+      cursor = index + Math.max(needle.length, 1);
+      budget -= 1;
+    }
+    container.appendChild(document.createTextNode(text.slice(cursor)));
+    return budget;
+  }
+
+  function renderSegments(needle) {
+    const segments = displayedSegments();
+    const fragment = document.createDocumentFragment();
+    let budget = 200;
+    let matches = 0;
+    let firstMatch = null;
+    segments.forEach((segment, index) => {
+      const item = document.createElement("li");
+      item.className = "segment";
+      const time = document.createElement("button");
+      time.type = "button";
+      time.className = "segment-time";
+      time.dataset.index = String(index);
+      time.textContent = formatTimestamp(segment.start);
+      time.title = "复制这一句";
+      const text = document.createElement("p");
+      text.className = "segment-text";
+      if (needle) {
+        const found = countMatches(segment.text.toLocaleLowerCase(), needle);
+        if (found) {
+          matches += found;
+          item.classList.add("match");
+          if (!firstMatch) firstMatch = item;
+        }
+      }
+      budget = appendHighlighted(text, segment.text, needle, budget);
+      item.append(time, text);
+      fragment.appendChild(item);
+    });
+    elements.segmentList.textContent = "";
+    elements.segmentList.appendChild(fragment);
+    fx("segments", { segments, list: elements.segmentList, timeline: elements.segmentTimeline, needle });
+    return { matches, firstMatch };
+  }
+
+  function renderOutputContent() {
+    const view = activeResultView();
+    const content = currentDisplayedContent();
+    const query = elements.resultSearch.value.trim();
+    const needle = query.toLocaleLowerCase();
+    elements.viewSegments.setAttribute("aria-pressed", String(view === "segments"));
+    elements.viewSource.setAttribute("aria-pressed", String(view === "source"));
+    elements.viewSegments.disabled = !displayedSegments().length;
+    elements.segmentList.hidden = view !== "segments";
+    elements.segmentTimeline.hidden = view !== "segments";
+    elements.output.hidden = view !== "source";
+    elements.toggleWrap.hidden = view !== "source";
+    elements.searchCount.textContent = "";
+    elements.output.textContent = "";
+    if (view === "segments") {
+      elements.output.textContent = content;
+      const { matches, firstMatch } = renderSegments(query ? needle : "");
+      if (query) elements.searchCount.textContent = matches ? `${matches} 处` : "未找到";
+      if (firstMatch) firstMatch.scrollIntoView({ block: "center" });
+      return;
+    }
+    elements.segmentList.textContent = "";
+    if (!query || !content) {
+      elements.output.textContent = content;
+      return;
+    }
+    const count = countMatches(content.toLocaleLowerCase(), needle);
+    appendHighlighted(elements.output, content, needle, 200);
+    elements.searchCount.textContent = count ? `${count} 处` : "未找到";
+    const firstMark = elements.output.querySelector("mark");
+    if (firstMark) firstMark.scrollIntoView({ block: "center" });
+  }
+
+  function updateOutputStats() {
+    if (activeResultView() === "segments") {
+      const segments = displayedSegments();
+      const characters = segments.reduce((total, segment) => total + segment.text.length, 0);
+      elements.outputStats.textContent = `${segments.length} 句 · ${characters.toLocaleString("zh-CN")} 字`;
+      return;
+    }
+    const content = currentDisplayedContent();
+    const lineCount = content ? content.split("\n").filter(Boolean).length : 0;
+    elements.outputStats.textContent = `${lineCount} 行 · ${content.length.toLocaleString("zh-CN")} 字符`;
+  }
+
+  function setResultView(view) {
+    state.resultView = view === "source" ? "source" : "segments";
+    savePreferences();
+    renderOutputContent();
+    updateOutputStats();
+  }
+
+  function toggleRawVersion() {
+    if (!state.current || state.current.kind !== "subtitle" || !state.current.rawContent) return;
+    state.current.showingRaw = !state.current.showingRaw;
+    elements.toggleRaw.setAttribute("aria-pressed", String(state.current.showingRaw));
+    elements.toggleRaw.textContent = state.current.showingRaw ? "整理版" : "原始版";
+    elements.resultSearch.value = "";
+    renderOutputContent();
+    updateOutputStats();
   }
 
   function renderResult(data, payload, jobId, expiresAt) {
@@ -1446,26 +1530,27 @@
       expiresAt: Number(expiresAt || 0),
       content: data.content || "",
       rawContent: data.raw_content || "",
+      segments: normalizeSegments(data.segments),
+      rawSegments: normalizeSegments(data.raw_segments),
       showingRaw: false,
       filename: data.filename || `video_subtitle.${data.format || "txt"}`,
       contentType: data.content_type || "text/plain;charset=utf-8",
-      format: data.format || payload.format,
+      format: data.format || payload.format || "txt",
       metadata: data.metadata || {},
       input: payload.input || payload.filename || ""
     };
     const meta = state.current.metadata;
     elements.resultKicker.textContent = `${platformLabel(meta.platform)}字幕 · ${meta.id || "已完成"}`;
     elements.resultTitle.textContent = meta.title || "提取完成";
+    elements.resultTitle.title = meta.title || "";
     elements.statusPanel.hidden = true;
     elements.queueBadge.hidden = true;
     elements.cancelJob.hidden = true;
     renderMetadata(meta);
-
     const notice = friendlyNotice(meta);
     elements.notice.textContent = notice;
     elements.notice.hidden = !notice;
     elements.resultSearch.value = "";
-    renderOutputContent();
     applyWrapPreference();
     elements.outputFormat.textContent = state.current.format.toUpperCase();
     elements.resultFormat.value = state.current.format === "md" ? "markdown" : state.current.format;
@@ -1473,11 +1558,12 @@
     elements.downloadResult.disabled = false;
     elements.toggleRaw.disabled = false;
     elements.outputShell.removeAttribute("aria-busy");
-    updateOutputStats();
     elements.toggleRaw.hidden = !state.current.rawContent;
     elements.toggleRaw.setAttribute("aria-pressed", "false");
     elements.toggleRaw.textContent = "原始版";
     elements.outputShell.hidden = false;
+    renderOutputContent();
+    updateOutputStats();
     elements.mediaResult.hidden = true;
     elements.idleOutput.hidden = true;
     elements.copyResult.hidden = false;
@@ -1505,6 +1591,7 @@
     const meta = state.current.metadata;
     elements.resultKicker.textContent = `${platformLabel(meta.platform)}${state.current.mediaType === "audio" ? "音频" : "视频"} · ${meta.id || "已完成"}`;
     elements.resultTitle.textContent = meta.title || "提取完成";
+    elements.resultTitle.title = meta.title || "";
     elements.statusPanel.hidden = true;
     elements.queueBadge.hidden = true;
     elements.cancelJob.hidden = true;
@@ -1537,6 +1624,7 @@
     if (current.expiresAt * 1000 <= Date.now()) {
       state.current = null;
       elements.output.textContent = "";
+      elements.segmentList.textContent = "";
       elements.resultActions.hidden = true;
       showStatus("expired", "结果已过期", "已超过保留时间，请重新提交任务。", NaN, "!");
       elements.idleOutput.hidden = true;
@@ -1552,6 +1640,8 @@
     elements.resultExpiry.hidden = false;
   }
 
+  /* ---------- History drawer ---------- */
+
   async function loadHistory() {
     if (!state.user) return;
     if (state.historyController) state.historyController.abort();
@@ -1564,7 +1654,7 @@
       const data = await response.json();
       if (!response.ok || !Array.isArray(data.jobs)) throw new Error("history_unavailable");
       if (state.historyController !== controller) return;
-      state.history = data.jobs.filter(item => item && typeof item.id === "string"
+      state.history = data.jobs.filter((item) => item && typeof item.id === "string"
         && typeof item.status === "string" && Number.isFinite(Number(item.created_at)));
       state.retentionSeconds = Number(data.retention_seconds) > 0 ? Number(data.retention_seconds) : 86400;
       state.historyError = false;
@@ -1581,10 +1671,15 @@
     }
   }
 
-  function setHistoryDialog(open) {
-    elements.historyDialog.hidden = !open;
-    document.body.classList.toggle("dialog-open", open);
-    if (open) {
+  function setHistoryDrawer(open) {
+    const visible = Boolean(open);
+    if (visible === !elements.historyDrawer.hidden) return;
+    elements.historyDrawer.hidden = !visible;
+    elements.openHistory.setAttribute("aria-expanded", String(visible));
+    syncBodyLock();
+    if (visible) {
+      setAccountMenu(false);
+      setHealthPopover(false);
       loadHistory();
       elements.closeHistory.focus();
     } else if (elements.openHistory.getClientRects().length) {
@@ -1604,13 +1699,13 @@
       const job = await response.json();
       if (!response.ok) {
         if (response.status === 404 || response.status === 410) {
-          state.history = state.history.filter(entry => entry.id !== item.id);
+          state.history = state.history.filter((entry) => entry.id !== item.id);
           throw new Error("这条记录已过期，当前结果未被覆盖。");
         }
         throw new Error("暂时无法读取记录，请稍后重试。");
       }
       if (!validJobSnapshot(job)) throw new Error("记录暂不可用，请稍后重试。");
-      setHistoryDialog(false);
+      setHistoryDrawer(false);
       state.currentPayload = { kind: item.kind, media_type: item.media_type };
       state.current = null;
       if (["queued", "running"].includes(job.status)) {
@@ -1633,48 +1728,54 @@
   }
 
   function renderHistory() {
-    elements.recentList.textContent = "";
-    elements.historyDialogList.textContent = "";
-    elements.recentSection.hidden = !state.user;
+    const container = elements.historyList;
+    container.textContent = "";
     elements.openHistory.hidden = !state.user;
-    const caption = `字幕最多保留 ${Math.round(state.retentionSeconds / 3600)} 小时`;
+    const caption = `字幕最多保留 ${Math.round(state.retentionSeconds / 3600)} 小时，可直接重新打开`;
     elements.historyCaption.textContent = state.historyError ? "记录暂不可用，可刷新重试" : caption;
-    elements.historyDialogCaption.textContent = elements.historyCaption.textContent;
-    state.history = state.history.filter(item => !item.expires_at || item.expires_at * 1000 > Date.now());
+    state.history = state.history.filter((item) => !item.expires_at || item.expires_at * 1000 > Date.now());
+    elements.historyCount.textContent = String(state.history.length);
+    elements.historyCount.hidden = !state.history.length;
     const labels = { queued: "排队中", running: "处理中", completed: "已完成", failed: "未完成", cancelled: "已取消" };
-    for (const container of [elements.recentList, elements.historyDialogList]) {
-      if (!state.history.length) {
-        const empty = document.createElement("p");
-        empty.className = "history-empty";
-        empty.textContent = state.historyError ? "暂时无法读取记录" : "暂无近期任务";
-        container.append(empty);
-      }
-      state.history.forEach((item) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "recent-item";
-        button.setAttribute("aria-current", String(item.id === (state.current && state.current.resultJobId || state.jobId)));
-        button.disabled = state.busy;
-        button.title = item.title || "视频任务";
-        const platform = document.createElement("span");
-        platform.className = `recent-platform ${["bilibili", "douyin", "upload"].includes(item.platform) ? item.platform : "upload"}`;
-        platform.textContent = item.kind === "media" ? (item.media_type === "audio" ? "音频" : "视频") : "字幕";
-        const title = document.createElement("span");
-        title.className = "recent-title";
-        title.textContent = item.title;
-        const detail = document.createElement("span");
-        detail.className = "recent-detail";
-        detail.textContent = `${labels[item.status] || "未完成"} · ${new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(Number(item.created_at || 0) * 1000))}`;
-        button.append(platform, title, detail);
-        button.addEventListener("click", () => openHistoryItem(item));
-        container.appendChild(button);
-      });
+    if (!state.history.length) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = state.historyError ? "暂时无法读取记录" : "暂无近期任务";
+      container.append(empty);
+      return;
     }
+    const activeId = state.current && state.current.resultJobId || state.jobId;
+    state.history.forEach((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `recent-item ${["failed", "cancelled"].includes(item.status) ? item.status : ""}`.trim();
+      button.setAttribute("aria-current", String(item.id === activeId));
+      button.disabled = state.busy;
+      button.title = item.title || "视频任务";
+      const platform = document.createElement("span");
+      platform.className = `recent-platform ${["bilibili", "douyin", "upload"].includes(item.platform) ? item.platform : "upload"}`;
+      platform.textContent = item.kind === "media" ? (item.media_type === "audio" ? "音频" : "视频") : "字幕";
+      const title = document.createElement("span");
+      title.className = "recent-title";
+      title.textContent = item.title || "视频任务";
+      const detail = document.createElement("span");
+      detail.className = "recent-detail";
+      const time = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" })
+        .format(new Date(Number(item.created_at || 0) * 1000));
+      detail.textContent = `${labels[item.status] || "未完成"} · ${platformLabel(item.platform)} · ${time}`;
+      button.append(platform, title, detail);
+      button.addEventListener("click", () => openHistoryItem(item));
+      container.appendChild(button);
+    });
   }
+
+  /* ---------- Jobs ---------- */
 
   function finishWithError(value, status) {
     stopPolling();
     const message = friendlyError(value, status || 0);
+    const detail = errorDetail(value);
+    if (detail && detail.code === "platform_blocked") markBilibiliLimited(detail.message);
     clearActiveJob();
     state.jobId = null;
     state.current = null;
@@ -1686,6 +1787,7 @@
     elements.cancelJob.hidden = true;
     clearUnavailableUploadSelection();
     showStatus("error", "未能完成任务", message, NaN, "!");
+    fx("failed", { message });
     setBusy(false);
     setMobileView("result");
     showToast(message, true);
@@ -1724,6 +1826,7 @@
       clearActiveJob();
       state.jobId = null;
       renderResult(job.result || {}, state.currentPayload, job.id, job.expires_at);
+      if (state.current) fx("complete", { kind: state.current.kind });
       clearUnavailableUploadSelection();
       setBusy(false);
       updateResultExpiry();
@@ -1745,9 +1848,7 @@
       loadHistory();
       return;
     }
-    if (job.status === "failed") {
-      finishWithError(job.error || {}, Number(job.error_status || 500));
-    }
+    if (job.status === "failed") finishWithError(job.error || {}, Number(job.error_status || 500));
   }
 
   function validJobSnapshot(job) {
@@ -1811,7 +1912,7 @@
       if (state.pollController === controller) state.pollController = null;
       if (state.jobId === jobId && state.busy && !state.pollPaused) {
         const delay = state.pollFailures ? Math.min(30000, 1000 * 2 ** state.pollFailures)
-          : document.hidden ? 8000 : 1800;
+          : document.hidden ? 8000 : 1500;
         state.pollTimer = setTimeout(pollJob, Math.max(delay, retryDelay));
       }
     }
@@ -1839,9 +1940,10 @@
     elements.toggleRaw.disabled = true;
     elements.outputShell.setAttribute("aria-busy", "true");
     try {
-      const response = await apiFetch(`/api/jobs/${encodeURIComponent(current.resultJobId)}/result?format=${encodeURIComponent(format)}`, {
-        cache: "no-store", signal: controller.signal
-      });
+      const response = await apiFetch(
+        `/api/jobs/${encodeURIComponent(current.resultJobId)}/result?format=${encodeURIComponent(format)}`,
+        { cache: "no-store", signal: controller.signal }
+      );
       const data = await response.json().catch(() => ({}));
       updateResultExpiry();
       if (state.current !== current) return;
@@ -1856,6 +1958,9 @@
       if (!current.rawContent) current.showingRaw = false;
       elements.outputFormat.textContent = current.format.toUpperCase();
       elements.resultSearch.value = "";
+      if (activeResultView() === "segments") {
+        showToast(`复制与下载将使用 ${elements.resultFormat.selectedOptions[0].textContent} 格式`, false);
+      }
       renderOutputContent();
       updateOutputStats();
     } catch (_) {
@@ -2060,6 +2165,8 @@
     }
   }
 
+  /* ---------- Result actions ---------- */
+
   function showToast(message, error) {
     if (state.toastTimer) clearTimeout(state.toastTimer);
     elements.toast.textContent = message;
@@ -2068,23 +2175,34 @@
     state.toastTimer = setTimeout(() => elements.toast.classList.remove("visible"), 2600);
   }
 
-  async function copyResult() {
-    updateResultExpiry();
-    if (!state.current || state.current.kind === "media") return;
-    const content = currentDisplayedContent();
+  async function writeClipboard(text) {
     try {
-      await navigator.clipboard.writeText(content);
+      await navigator.clipboard.writeText(text);
     } catch (_) {
       const helper = document.createElement("textarea");
-      helper.value = content;
-      helper.style.position = "fixed";
-      helper.style.opacity = "0";
+      helper.value = text;
+      helper.setAttribute("readonly", "");
+      helper.className = "visually-hidden";
       document.body.appendChild(helper);
       helper.select();
       document.execCommand("copy");
       helper.remove();
     }
+  }
+
+  async function copyResult() {
+    updateResultExpiry();
+    if (!state.current || state.current.kind === "media") return;
+    await writeClipboard(currentDisplayedContent());
     showToast("已复制全部字幕", false);
+  }
+
+  async function copySegment(index) {
+    updateResultExpiry();
+    const segment = displayedSegments()[index];
+    if (!segment) return;
+    await writeClipboard(segment.text);
+    showToast(`已复制 ${formatTimestamp(segment.start)} 这一句`, false);
   }
 
   function downloadResult() {
@@ -2155,6 +2273,28 @@
     }
   }
 
+  function startNewTask() {
+    if (state.busy) {
+      showToast("当前任务完成后即可新建任务。", true);
+      return;
+    }
+    setSelectedOperation("subtitle");
+    setInputMode("link");
+    elements.input.value = "";
+    elements.inputError.textContent = "";
+    elements.input.classList.remove("invalid");
+    elements.input.removeAttribute("aria-invalid");
+    elements.forceRefresh.checked = false;
+    setUploadFile(null);
+    resetResult();
+    hidePageSelector();
+    updatePlatformDetect();
+    setMobileView("compose");
+    elements.input.focus();
+  }
+
+  /* ---------- Service health ---------- */
+
   function setHealthValue(element, text, level) {
     element.textContent = text;
     element.classList.toggle("warn", level === "warn");
@@ -2177,75 +2317,44 @@
       if (!healthResponse.ok) throw new Error(String(healthResponse.status));
       const health = await healthResponse.json();
       if (health.status !== "ok") throw new Error("unhealthy");
-      const configEndpoint = state.user ? "/api/client-config" : "/api/public-config";
-      const configResponse = state.user
-        ? await apiFetch(configEndpoint, { cache: "no-store", signal: controller.signal })
-        : await fetch(configEndpoint, { cache: "no-store", signal: controller.signal });
+      const configResponse = await apiFetch("/api/client-config", { cache: "no-store", signal: controller.signal });
       if (!configResponse.ok) throw new Error(String(configResponse.status));
       state.capabilities = await configResponse.json();
       const features = state.capabilities.features || {};
       const platforms = state.capabilities.platforms || {};
-      const isGuest = !state.user;
-      elements.serviceState.className = "service-state online";
-      elements.serviceLabel.textContent = "服务在线";
-      elements.healthSummary.textContent = "已连接";
-      setHealthValue(
-        elements.healthLocal,
-        isGuest ? "登录后可用" : features.local_processing ? "可用" : "暂不可用",
-        isGuest || features.local_processing ? "" : "warn"
-      );
-      setHealthValue(
-        elements.healthCloud,
-        isGuest ? "登录后可用" : features.cloud_enhancement ? "可选" : "未启用",
-        isGuest || features.cloud_enhancement ? "" : "warn"
-      );
-      const filesReady = isGuest
-        ? Boolean(features.guest_media)
-        : Boolean(features.uploads && features.media);
-      setHealthValue(
-        elements.healthFiles,
-        filesReady ? isGuest ? "免登录可用" : "可用" : "部分受限",
-        filesReady ? "" : "warn"
-      );
+      const bilibiliLimited = bilibiliStatus().state === "limited";
+      elements.serviceState.className = `service-state ${bilibiliLimited ? "degraded" : "online"}`;
+      elements.serviceLabel.textContent = bilibiliLimited ? "部分受限" : "服务在线";
+      elements.healthSummary.textContent = bilibiliLimited ? "B站暂时受限" : "全部正常";
+      setHealthValue(elements.healthDouyin, platforms.douyin === false ? "暂不可用" : "可用", platforms.douyin === false ? "warn" : "");
+      setHealthValue(elements.healthLocal, features.local_processing ? "可用" : "暂不可用",
+        features.local_processing ? "" : "warn");
+      setHealthValue(elements.healthCloud, features.cloud_enhancement ? "可选" : "未启用",
+        features.cloud_enhancement ? "" : "warn");
+      const filesReady = Boolean(features.uploads && features.media);
+      setHealthValue(elements.healthFiles, filesReady ? "可用" : "部分受限", filesReady ? "" : "warn");
       elements.bilibiliChip.classList.toggle("unavailable", platforms.bilibili === false);
-      elements.douyinChip.classList.toggle(
-        "unavailable",
-        platforms.douyin === false
-      );
-      const uploads = isGuest ? {} : state.capabilities.uploads || {};
-      const uploadsEnabled = !isGuest && uploads.enabled !== false;
-      if (!isGuest) {
-        state.uploadMaxBytes = Number(uploads.max_bytes || state.uploadMaxBytes);
-        state.uploadExtensions = Array.isArray(uploads.allowed_extensions) ? uploads.allowed_extensions : [];
-        elements.uploadLimit.textContent = `最大 ${formatBytes(state.uploadMaxBytes)}`;
-      } else {
-        const guestMedia = state.capabilities.guest_media || {};
-        elements.uploadLimit.textContent = "登录后可上传";
-        elements.guestAccessBanner.querySelector("strong").textContent = guestMedia.enabled
-          ? `免登录可提取视频或音频，最长 ${Math.max(1, Math.round(Number(guestMedia.max_duration_seconds || 0) / 60))} 分钟`
-          : "免登录媒体提取暂不可用";
-      }
-      elements.uploadChip.classList.toggle(
-        "unavailable",
-        !uploadsEnabled || platforms.upload === false
-      );
-      const media = isGuest
-        ? state.capabilities.guest_media || {}
-        : state.capabilities.media || {};
-      state.mediaEnabled = media.enabled !== false && (!isGuest || features.guest_media === true);
-      if (!state.busy && !state.mediaEnabled && !isGuest && selectedOperation() !== "subtitle") {
+      elements.douyinChip.classList.toggle("unavailable", platforms.douyin === false);
+      updatePlatformHealth();
+      const uploads = state.capabilities.uploads || {};
+      const canUpload = uploads.enabled !== false;
+      state.uploadMaxBytes = Number(uploads.max_bytes || state.uploadMaxBytes);
+      state.uploadExtensions = Array.isArray(uploads.allowed_extensions) ? uploads.allowed_extensions : [];
+      elements.uploadLimit.textContent = `最大 ${formatBytes(state.uploadMaxBytes)}`;
+      elements.uploadChip.classList.toggle("unavailable", !canUpload || platforms.upload === false);
+      const media = state.capabilities.media || {};
+      state.mediaEnabled = media.enabled !== false;
+      if (!state.busy && !state.mediaEnabled && selectedOperation() !== "subtitle") {
         setSelectedOperation("subtitle");
       }
-      if (!state.busy && !uploadsEnabled && selectedInputMode() === "upload") setInputMode("link");
+      if (!state.busy && !canUpload && selectedInputMode() === "upload") setInputMode("link");
       else syncInputMode();
-      elements.loginSection.hidden = isGuest || !features.bilibili_qr_login;
     } catch (_) {
       elements.serviceState.className = "service-state offline";
       elements.serviceLabel.textContent = "服务异常";
       elements.healthSummary.textContent = "连接失败";
-      setHealthValue(elements.healthLocal, "无法读取", "error");
-      setHealthValue(elements.healthCloud, "无法读取", "error");
-      setHealthValue(elements.healthFiles, "无法读取", "error");
+      [elements.healthBilibili, elements.healthDouyin, elements.healthLocal, elements.healthCloud, elements.healthFiles]
+        .forEach((element) => setHealthValue(element, "无法读取", "error"));
       elements.bilibiliChip.classList.add("unavailable");
       elements.douyinChip.classList.add("unavailable");
       elements.uploadChip.classList.add("unavailable");
@@ -2257,50 +2366,7 @@
     }
   }
 
-  function stopLoginPolling() {
-    if (state.loginPollTimer) clearInterval(state.loginPollTimer);
-    state.loginPollTimer = null;
-  }
-
-  async function pollLogin(key) {
-    const response = await apiFetch(`/api/login/poll?qrcode_key=${encodeURIComponent(key)}`);
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      stopLoginPolling();
-      elements.loginStatus.textContent = data.detail || "登录轮询失败";
-      return;
-    }
-    if (data.status === "success") {
-      stopLoginPolling();
-      elements.qrImage.style.display = "none";
-      elements.loginStatus.textContent = "登录态已保存。";
-      loadHealth();
-    } else if (data.status === "waiting_confirm") {
-      elements.loginStatus.textContent = "已扫码，等待手机确认。";
-    } else if (data.status === "expired") {
-      stopLoginPolling();
-      elements.qrImage.style.display = "none";
-      elements.loginStatus.textContent = "二维码已过期。";
-    } else {
-      elements.loginStatus.textContent = "等待扫码。";
-    }
-  }
-
-  async function startLogin() {
-    stopLoginPolling();
-    elements.qrImage.style.display = "none";
-    elements.loginStatus.textContent = "正在生成二维码...";
-    const response = await apiFetch("/api/login/qrcode", { method: "POST" });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      elements.loginStatus.textContent = data.detail || "二维码生成失败";
-      return;
-    }
-    elements.qrImage.src = data.qr_svg_data_url;
-    elements.qrImage.style.display = "block";
-    elements.loginStatus.textContent = "等待扫码。";
-    state.loginPollTimer = setInterval(() => pollLogin(data.qrcode_key), 2000);
-  }
+  /* ---------- Submission ---------- */
 
   function submitCurrentForm() {
     if (state.busy) return;
@@ -2312,10 +2378,7 @@
     const action = selectedInputMode() === "upload"
       ? () => runUpload(true)
       : () => runExtraction({ cloud_consent: true });
-    if (
-      selectedOperation() === "subtitle"
-      && ["high_accuracy", "economy"].includes(selectedAsrMode())
-    ) {
+    if (selectedOperation() === "subtitle" && ["high_accuracy", "economy"].includes(selectedAsrMode())) {
       requestCloudConfirmation(action);
       return;
     }
@@ -2323,66 +2386,27 @@
     else runExtraction();
   }
 
+  /* ---------- Event wiring ---------- */
+
   elements.form.addEventListener("submit", (event) => {
     event.preventDefault();
     submitCurrentForm();
   });
-  elements.form.querySelectorAll('input[name="input-mode"]').forEach((radio) => {
+  elements.form.querySelectorAll('input[name="input-mode"], input[name="operation"]').forEach((radio) => {
     radio.addEventListener("change", () => {
       syncInputMode();
       savePreferences();
     });
   });
-  elements.form.querySelectorAll('input[name="operation"]').forEach((radio) => {
-    radio.addEventListener("change", () => {
-      syncInputMode();
-      savePreferences();
-    });
-  });
-  [elements.railSubtitle, elements.railVideo, elements.railAudio].forEach((button) => {
-    button.addEventListener("click", () => {
-      if (state.busy || button.disabled) return;
-      setSelectedOperation(button.dataset.operation || "subtitle");
-      setMobileView("compose");
-      elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
-      savePreferences();
-    });
-  });
-  elements.railNewTask.addEventListener("click", () => {
-    if (state.busy) {
-      showToast("当前任务完成后即可新建任务。", true);
-      return;
-    }
-    setSelectedOperation(state.guest ? "video" : "subtitle");
-    setInputMode("link");
-    elements.input.value = "";
-    elements.inputError.textContent = "";
-    elements.input.classList.remove("invalid");
-    elements.forceRefresh.checked = false;
-    setUploadFile(null);
-    resetResult();
-    hidePageSelector();
-    updatePlatformDetect();
-    setMobileView("compose");
-    elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
-    elements.input.focus();
-  });
-  elements.form.querySelectorAll('input[name="asr-mode"]').forEach((radio) => {
+  elements.form.querySelectorAll('input[name="asr-mode"], input[name="source"]').forEach((radio) => {
     radio.addEventListener("change", () => {
       syncPrecisionOptions();
       savePreferences();
     });
   });
-  elements.form.querySelectorAll('input[name="source"]').forEach((radio) => {
-    radio.addEventListener("change", () => {
-      syncPrecisionOptions();
-      savePreferences();
-    });
-  });
+  elements.newTask.addEventListener("click", startNewTask);
   elements.embeddedSubtitles.addEventListener("change", () => {
-    if (elements.embeddedSubtitles.checked) {
-      setSelectedSource("auto");
-    }
+    if (elements.embeddedSubtitles.checked) setSelectedSource("auto");
     syncInputMode();
     savePreferences();
   });
@@ -2420,16 +2444,18 @@
   });
   elements.paste.addEventListener("click", pasteInput);
   elements.clearInput.addEventListener("click", () => {
-    if (selectedInputMode() === "upload") {
-      setUploadFile(null);
-      return;
-    }
     elements.input.value = "";
     elements.inputError.textContent = "";
     elements.input.classList.remove("invalid");
+    elements.input.removeAttribute("aria-invalid");
     updatePlatformDetect();
     hidePageSelector();
     elements.input.focus();
+  });
+  elements.platformNoticeAction.addEventListener("click", () => {
+    setInputMode("upload");
+    savePreferences();
+    elements.videoFile.focus();
   });
   elements.copyResult.addEventListener("click", copyResult);
   elements.downloadResult.addEventListener("click", downloadResult);
@@ -2440,7 +2466,7 @@
       return;
     }
     setMobileView("compose");
-    elements.composerPane.scrollTo({ top: 0, behavior: "smooth" });
+    elements.composerPane.scrollIntoView({ block: "start", behavior: "smooth" });
     if (selectedInputMode() === "link") elements.input.focus();
     else elements.videoFile.focus();
   });
@@ -2452,10 +2478,6 @@
   elements.resultFormat.addEventListener("change", changeResultFormat);
   elements.lang.addEventListener("change", savePreferences);
   elements.allowPlatformAi.addEventListener("change", savePreferences);
-  elements.useCookie.addEventListener("change", () => {
-    savePreferences();
-    schedulePageLookup();
-  });
   elements.pageSelect.addEventListener("change", () => {
     if (!state.biliBaseUrl) return;
     elements.input.value = `${state.biliBaseUrl}?p=${encodeURIComponent(elements.pageSelect.value)}`;
@@ -2465,6 +2487,12 @@
     clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(renderOutputContent, 120);
   });
+  elements.viewSegments.addEventListener("click", () => setResultView("segments"));
+  elements.viewSource.addEventListener("click", () => setResultView("source"));
+  elements.segmentList.addEventListener("click", (event) => {
+    const button = event.target.closest(".segment-time");
+    if (button) copySegment(Number(button.dataset.index));
+  });
   elements.toggleRaw.addEventListener("click", toggleRawVersion);
   elements.toggleWrap.addEventListener("click", () => {
     state.wrapOutput = !state.wrapOutput;
@@ -2473,20 +2501,10 @@
   });
   elements.mobileCompose.addEventListener("click", () => setMobileView("compose"));
   elements.mobileResult.addEventListener("click", () => setMobileView("result"));
-  elements.healthTrigger.addEventListener("click", () => {
-    setHealthPopover(elements.healthPopover.hidden);
-  });
-  elements.accountTrigger.addEventListener("click", () => {
-    setAccountMenu(elements.accountPopover.hidden);
-  });
-  elements.openPasswordDialog.addEventListener("click", () => setPasswordDialog(true));
-  elements.closePasswordDialog.addEventListener("click", () => setPasswordDialog(false));
-  elements.cancelPasswordDialog.addEventListener("click", () => setPasswordDialog(false));
-  elements.passwordForm.addEventListener("submit", changeAccountPassword);
+  elements.healthTrigger.addEventListener("click", () => setHealthPopover(elements.healthPopover.hidden));
+  elements.themeToggle.addEventListener("click", cycleTheme);
+  elements.accountTrigger.addEventListener("click", () => setAccountMenu(elements.accountPopover.hidden));
   elements.logoutAllDevices.addEventListener("click", logoutAllDevices);
-  elements.passwordDialog.addEventListener("click", (event) => {
-    if (event.target === elements.passwordDialog) setPasswordDialog(false);
-  });
   elements.cloudConfirmCheck.addEventListener("change", () => {
     elements.submitCloudConfirm.disabled = !elements.cloudConfirmCheck.checked;
   });
@@ -2496,18 +2514,19 @@
   elements.cloudConfirmDialog.addEventListener("click", (event) => {
     if (event.target === elements.cloudConfirmDialog) setCloudConfirmDialog(false, false);
   });
+  elements.openHistory.addEventListener("click", () => setHistoryDrawer(elements.historyDrawer.hidden));
+  elements.closeHistory.addEventListener("click", () => setHistoryDrawer(false));
+  elements.refreshHistory.addEventListener("click", loadHistory);
+  elements.historyDrawer.addEventListener("click", (event) => {
+    if (event.target === elements.historyDrawer) setHistoryDrawer(false);
+  });
   document.addEventListener("click", (event) => {
-    if (!elements.healthPopover.hidden && !event.target.closest(".health-menu")) {
-      setHealthPopover(false);
-    }
-    if (!elements.accountPopover.hidden && !event.target.closest(".account-area")) {
-      setAccountMenu(false);
-    }
+    if (!elements.healthPopover.hidden && !event.target.closest(".health-menu")) setHealthPopover(false);
+    if (!elements.accountPopover.hidden && !event.target.closest(".account-area")) setAccountMenu(false);
   });
   document.addEventListener("keydown", (event) => {
     const dialog = !elements.cloudConfirmDialog.hidden ? elements.cloudConfirmDialog
-      : !elements.passwordDialog.hidden ? elements.passwordDialog
-      : !elements.historyDialog.hidden ? elements.historyDialog : null;
+      : !elements.historyDrawer.hidden ? elements.historyDrawer : null;
     if (event.key === "Tab" && dialog) {
       const controls = Array.from(dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]'))
         .filter((element) => element.getClientRects().length > 0);
@@ -2523,37 +2542,40 @@
     if (event.key !== "Escape") return;
     setHealthPopover(false);
     setAccountMenu(false);
-    if (!elements.passwordDialog.hidden) setPasswordDialog(false);
     if (!elements.cloudConfirmDialog.hidden) setCloudConfirmDialog(false, false);
-    if (!elements.historyDialog.hidden) setHistoryDialog(false);
+    if (!elements.historyDrawer.hidden) setHistoryDrawer(false);
   });
-  elements.refreshHistory.addEventListener("click", loadHistory);
-  elements.retryHistory.addEventListener("click", loadHistory);
-  elements.openHistory.addEventListener("click", () => setHistoryDialog(true));
-  elements.closeHistory.addEventListener("click", () => setHistoryDialog(false));
-  elements.historyDialog.addEventListener("click", event => {
-    if (event.target === elements.historyDialog) setHistoryDialog(false);
-  });
-  elements.loginStart.addEventListener("click", startLogin);
   elements.logoutAccount.addEventListener("click", logoutAccount);
   window.addEventListener("online", reconnectJob);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) { updateResultExpiry(); loadHistory(); }
+    if (!document.hidden) {
+      updateResultExpiry();
+      loadHistory();
+    }
     if (!document.hidden && !state.pollPaused) reconnectJob();
   });
 
   async function initializeApp() {
+    applyTheme(storedTheme());
+    const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+    if (!/mac|iphone|ipad/i.test(platform)) $("shortcut-modifier").textContent = "Ctrl";
     renderHistory();
     applyWrapPreference();
     setMobileView("compose");
     updatePlatformDetect();
     syncInputMode();
-    await loadAccount();
+    if (!await loadAccount()) return;
     await loadHealth();
     requestAnimationFrame(() => document.body.classList.add("app-ready"));
+    fx("ready", { owner: Boolean(state.user && state.user.is_admin) });
   }
 
   initializeApp();
   setInterval(loadHealth, 30000);
-  setInterval(() => { if (!document.hidden) { updateResultExpiry(); renderHistory(); } }, 30000);
+  setInterval(() => {
+    if (!document.hidden) {
+      updateResultExpiry();
+      renderHistory();
+    }
+  }, 30000);
 })();

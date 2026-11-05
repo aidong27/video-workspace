@@ -32,7 +32,7 @@ def test_application_connectors_close_and_preserve_settings(tmp_path, monkeypatc
         monthly_limit_seconds=100, user_daily_limit_seconds=100,
     )
     for _ in range(3):
-        with auth._connect() as connection:
+        with auth.connect() as connection:
             assert connection.row_factory == sqlite3.Row
             assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         with pytest.raises(sqlite3.ProgrammingError):
